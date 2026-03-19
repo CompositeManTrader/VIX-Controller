@@ -732,21 +732,24 @@ with tab1:
 
         with col2:
             m1_label = contracts[0]['label'] if contracts else "M1"
+            m1_display = f"{m1_price:.2f}" if m1_price else "N/A"
             st.markdown(f"""
             <div class="metric-card">
                 <div class="label">M1 ({m1_label})</div>
-                <div class="value neutral">{m1_price:.2f if m1_price else 'N/A'}</div>
+                <div class="value neutral">{m1_display}</div>
                 <div class="label">{contracts[0].get('days_to_exp', '?')} DTE</div>
             </div>
             """, unsafe_allow_html=True)
 
         with col3:
             m2_label = contracts[1]['label'] if len(contracts) > 1 else "M2"
+            m2_display = f"{m2_price:.2f}" if m2_price else "N/A"
+            m2_dte = contracts[1].get('days_to_exp', '?') if len(contracts) > 1 else '?'
             st.markdown(f"""
             <div class="metric-card">
                 <div class="label">M2 ({m2_label})</div>
-                <div class="value neutral">{m2_price:.2f if m2_price else 'N/A'}</div>
-                <div class="label">{contracts[1].get('days_to_exp', '?') if len(contracts) > 1 else '?'} DTE</div>
+                <div class="value neutral">{m2_display}</div>
+                <div class="label">{m2_dte} DTE</div>
             </div>
             """, unsafe_allow_html=True)
 
