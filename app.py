@@ -10,7 +10,7 @@ import numpy as np
 import plotly.graph_objects as go
 import yfinance as yf
 from datetime import datetime, timedelta, date
-import requests, io, time, warnings, json
+import requests, io, time, warnings, json, re
 from bs4 import BeautifulSoup
 
 warnings.filterwarnings("ignore")
@@ -148,21 +148,139 @@ def _safe_int(v):
     except (ValueError, TypeError):
         return 0
 
+MONTHLY_VX_RE = re.compile(r"^VX/[FGHJKMNQUVXZ]\d{1,2}$")
+
+def _is_monthly_vx(symbol: str) -> bool:
+    return bool(MONTHLY_VX_RE.fullmatch(str(symbol).strip().upper()))
+
+def _normalize_quote_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    rename = {}
+    for c in out.columns:
+        cs = str(c).strip().lower()
+        if "symbol" in cs:
+            rename[c] = "symbol"
+        elif "expiration" in cs:
+            rename[c] = "expiration"
+        elif cs in {"last", "last price"} or ("last" in cs and "price" in cs):
+            rename[c] = "last"
+        elif "change" in cs:
+            rename[c] = "change"
+        elif cs == "high" or cs.startswith("high"):
+            rename[c] = "high"
+        elif cs == "low" or cs.startswith("low"):
+            rename[c] = "low"
+        elif "settle" in cs:
+            rename[c] = "settlement"
+        elif "volume" in cs:
+            rename[c] = "volume"
+    return out.rename(columns=rename)
+
+
+def _parse_product_page_tables(html: str):
+    results = {}
+    raw_rows = []
+    try:
+        for df in pd.read_html(io.StringIO(html)):
+            df = _normalize_quote_columns(df)
+            cols = set(df.columns)
+            if not {"symbol", "expiration", "settlement"}.issubset(cols):
+                continue
+            for _, row in df.iterrows():
+                symbol = str(row.get("symbol", "")).strip().upper()
+                if not _is_monthly_vx(symbol):
+                    continue
+                item = dict(
+                    price=_safe_float(row.get("last")) or _safe_float(row.get("settlement")),
+                    last=_safe_float(row.get("last")),
+                    settlement=_safe_float(row.get("settlement")),
+                    change=_safe_float(row.get("change")),
+                    high=_safe_float(row.get("high")) or None,
+                    low=_safe_float(row.get("low")) or None,
+                    vol=_safe_int(row.get("volume")),
+                    expiration=str(row.get("expiration", "")).strip(),
+                    src="CBOE_PRODUCT_PAGE",
+                )
+                results[symbol] = item
+                raw_rows.append(row.to_dict())
+            if results:
+                break
+    except Exception:
+        pass
+    return results, raw_rows
+
+
+def _parse_product_page_text(html: str):
+    results = {}
+    raw_rows = []
+    soup = BeautifulSoup(html, "html.parser")
+    text_blob = soup.get_text("\n", strip=True)
+    lines = [ln.strip() for ln in text_blob.splitlines() if ln.strip()]
+    row_re = re.compile(r'^(VX(?:\d+)?/[FGHJKMNQUVXZ]\d{1,2})\s+(\d{2}/\d{2}/\d{4})(.*)$')
+
+    for ln in lines:
+        m = row_re.match(ln)
+        if not m:
+            continue
+        symbol, expiration, tail = m.groups()
+        symbol = symbol.upper()
+        if not _is_monthly_vx(symbol):
+            continue
+
+        numeric = re.findall(r'-?\d+(?:,\d{3})*(?:\.\d+)?', tail)
+        last = change = high = low = settlement = volume = None
+
+        if tail and ' ' in tail.strip():
+            toks = [t for t in re.split(r'\s+', tail.strip()) if t]
+            vals = [None if t in {'-', '--', '—', 'N/A'} else t for t in toks]
+            if len(vals) >= 1: last = vals[0]
+            if len(vals) >= 2: change = vals[1]
+            if len(vals) >= 3: high = vals[2]
+            if len(vals) >= 4: low = vals[3]
+            if len(vals) >= 5: settlement = vals[4]
+            if len(vals) >= 6: volume = vals[5]
+        else:
+            if len(numeric) == 1:
+                settlement = numeric[0]
+            elif len(numeric) == 2:
+                last, settlement = numeric
+            elif len(numeric) >= 3:
+                last = numeric[0]
+                change = numeric[1]
+                settlement = numeric[-2] if len(numeric) >= 4 else numeric[-1]
+                volume = numeric[-1] if settlement != numeric[-1] else None
+
+        item = dict(
+            price=_safe_float(last) or _safe_float(settlement),
+            last=_safe_float(last),
+            settlement=_safe_float(settlement),
+            change=_safe_float(change),
+            high=_safe_float(high) or None,
+            low=_safe_float(low) or None,
+            vol=_safe_int(volume),
+            expiration=expiration,
+            src="CBOE_PRODUCT_PAGE_TEXT",
+        )
+        results[symbol] = item
+        raw_rows.append({"symbol": symbol, "expiration": expiration, "raw": ln})
+    return results, raw_rows
+
+
 @st.cache_data(ttl=55)
 def fetch_cboe_delayed_quotes():
     """
-    Scrape VX futures from CBOE delayed quotes page.
-    Targets table index 4 which contains VX/ monthly contracts.
-    Confirmed structure: SYMBOL | EXPIRATION | LAST | CHANGE | HIGH | LOW | SETTLEMENT | VOLUME
-    Falls back to Yahoo Finance if scraping fails.
+    Primary source: Cboe VIX futures product page market-data block.
+    We parse the official Cboe page first and keep only standard monthly VX contracts,
+    excluding weeklies like VX12/H6. If the product page is sparse, we fall back to
+    the daily settlement page and finally to Yahoo Finance.
     """
     results = {}
     raw_rows = []
     source_used = None
 
-    # ── Strategy 1: Web scraping CBOE page ──
-    CBOE_URL = "https://www.cboe.com/delayed_quotes/futures/future_quotes"
-    scrape_headers = {
+    product_url = "https://www.cboe.com/en/tradable-products/vix/vix-futures/"
+    settlement_url = "https://www.cboe.com/us/futures/market_statistics/settlement/"
+    headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -170,75 +288,55 @@ def fetch_cboe_delayed_quotes():
         ),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
         "Referer": "https://www.cboe.com/",
-        "Connection": "keep-alive",
         "Cache-Control": "no-cache",
     }
 
+    session = requests.Session()
+    session.headers.update(headers)
+
     try:
-        session = requests.Session()
-        session.headers.update(scrape_headers)
-        resp = session.get(CBOE_URL, timeout=25)
-
-        if resp.status_code == 200:
-            soup = BeautifulSoup(resp.text, "html.parser")
-            tables = soup.find_all("table")
-
-            # Find the VX table: look for any table that has VX/ in its rows
-            vx_table = None
-            for tbl in tables:
-                if tbl.find(string=lambda t: t and "VX/" in t):
-                    vx_table = tbl
-                    break
-
-            if vx_table:
-                # Parse headers
-                headers_row = vx_table.find("thead")
-                col_names = []
-                if headers_row:
-                    col_names = [th.get_text(strip=True).upper()
-                                 for th in headers_row.find_all("th")]
-
-                # Expected: SYMBOL EXPIRATION LAST CHANGE HIGH LOW SETTLEMENT VOLUME
-                # Map by position (confirmed from DevTools output)
-                IDX = {"SYMBOL": 0, "EXPIRATION": 1, "LAST": 2, "CHANGE": 3,
-                       "HIGH": 4, "LOW": 5, "SETTLEMENT": 6, "VOLUME": 7}
-
-                tbody = vx_table.find("tbody")
-                if tbody:
-                    for tr in tbody.find_all("tr"):
-                        cells = [td.get_text(strip=True) for td in tr.find_all("td")]
-                        if len(cells) < 7:
-                            continue
-                        symbol = cells[IDX["SYMBOL"]]
-                        # Only monthly VX contracts: exactly "VX/XX" pattern
-                        if not symbol.startswith("VX/"):
-                            continue
-                        # Filter weeklys: monthly symbols are VX/J6, VX/K6 etc (2 char suffix)
-                        suffix = symbol.replace("VX/", "")
-                        if len(suffix) != 2:
-                            continue
-
-                        raw_rows.append(cells)
-                        results[symbol] = dict(
-                            price=_safe_float(cells[IDX["LAST"]]) or _safe_float(cells[IDX["SETTLEMENT"]]),
-                            last=_safe_float(cells[IDX["LAST"]]),
-                            settlement=_safe_float(cells[IDX["SETTLEMENT"]]),
-                            change=_safe_float(cells[IDX["CHANGE"]]),
-                            high=_safe_float(cells[IDX["HIGH"]]) or None,
-                            low=_safe_float(cells[IDX["LOW"]]) or None,
-                            vol=_safe_int(cells[IDX["VOLUME"]]),
-                            expiration=cells[IDX["EXPIRATION"]],
-                            src="CBOE_SCRAPE",
-                        )
-                if results:
-                    source_used = "CBOE_SCRAPE"
-
+        resp = session.get(product_url, timeout=25)
+        resp.raise_for_status()
+        results, raw_rows = _parse_product_page_tables(resp.text)
+        if not results:
+            results, raw_rows = _parse_product_page_text(resp.text)
+        if results:
+            source_used = next(iter(results.values())).get("src", "CBOE_PRODUCT_PAGE")
     except Exception as e:
-        st.sidebar.warning(f"Scraping CBOE: {e}")
+        st.sidebar.warning(f"CBOE product page: {e}")
 
-    # ── Strategy 2: Yahoo Finance fallback ──
+    if not results:
+        try:
+            resp = session.get(settlement_url, timeout=25)
+            resp.raise_for_status()
+            for df in pd.read_html(io.StringIO(resp.text)):
+                cols = [str(c).strip().lower() for c in df.columns]
+                if not any("symbol" in c for c in cols) or not any("settlement" in c for c in cols):
+                    continue
+                df = _normalize_quote_columns(df)
+                for _, row in df.iterrows():
+                    symbol = str(row.get("symbol", "")).strip().upper()
+                    if not _is_monthly_vx(symbol):
+                        continue
+                    results[symbol] = dict(
+                        price=_safe_float(row.get("settlement")),
+                        last=0.0,
+                        settlement=_safe_float(row.get("settlement")),
+                        change=0.0,
+                        high=None,
+                        low=None,
+                        vol=0,
+                        expiration=str(row.get("expiration", "")).strip(),
+                        src="CBOE_SETTLEMENT_PAGE",
+                    )
+                    raw_rows.append(row.to_dict())
+                if results:
+                    source_used = "CBOE_SETTLEMENT_PAGE"
+                    break
+        except Exception as e:
+            st.sidebar.warning(f"CBOE settlement page: {e}")
+
     if not results:
         try:
             contracts = monthly_contracts()
@@ -248,7 +346,7 @@ def fetch_cboe_delayed_quotes():
                     h = yf.Ticker(yf_sym).history(period="5d")
                     if not h.empty:
                         price = round(float(h['Close'].iloc[-1]), 4)
-                        prev  = round(float(h['Close'].iloc[-2]), 4) if len(h) > 1 else price
+                        prev = round(float(h['Close'].iloc[-2]), 4) if len(h) > 1 else price
                         results[c['symbol']] = dict(
                             price=price,
                             last=price,
@@ -274,18 +372,6 @@ def fetch_cboe_delayed_quotes():
     return results, raw_rows
 
 
-def _safe_float(v):
-    try:
-        f = float(v)
-        return round(f, 4) if f != 0 else 0.0
-    except (ValueError, TypeError):
-        return 0.0
-
-def _safe_int(v):
-    try:
-        return int(float(v))
-    except (ValueError, TypeError):
-        return 0
 
 @st.cache_data(ttl=55)
 def fetch_etps():
@@ -541,7 +627,7 @@ st.markdown(f"""
 <div class="hdr">
     <div class="logo">VIX CONTROLLER</div>
     <div class="sub">
-        {now_str} &nbsp;·&nbsp; Auto-refresh in {next_refresh}s &nbsp;·&nbsp; Source: CBOE Settlement + Yahoo Finance
+        {now_str} &nbsp;·&nbsp; Auto-refresh in {next_refresh}s &nbsp;·&nbsp; Source: CBOE VIX futures page + Yahoo Finance
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -718,7 +804,7 @@ with tab1:
         """)
 
     found = len(prices)
-    st.caption(f"Contratos cargados: {found}/{N_MONTHS} · Solo mensuales (sin weeklys) · Fuente: CBOE CDN Settlement CSVs")
+    st.caption(f"Contratos cargados: {found}/{N_MONTHS} · Solo mensuales (sin weeklys) · Fuente: CBOE VIX futures page")
 
 
 # ━━━━━━━━━━━━━━━━━ TAB 2: MONITOR OPERATIVO ━━━━━━━━━━━━━━━
