@@ -135,47 +135,94 @@ def fetch_vix_spot():
     return None
 
 @st.cache_data(ttl=55)
-def fetch_cboe_contracts(contracts_json):
-    """Fetch settlement prices from CBOE CDN individual contract CSVs."""
-    contracts = json.loads(contracts_json)
+def fetch_cboe_delayed_quotes():
+    """
+    Fetch VX futures from CBOE Delayed Quotes JSON API.
+    This is the same data shown at: https://www.cboe.com/delayed_quotes/futures/future_quotes
+    Returns only MONTHLY contracts (filters out weeklys).
+    """
+    url = "https://cdn.cboe.com/api/global/delayed_quotes/futures/VX.json"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json",
+        "Referer": "https://www.cboe.com/delayed_quotes/futures/future_quotes",
+    }
     results = {}
-    for c in contracts:
-        url = f"https://cdn.cboe.com/data/us/futures/market_statistics/historical_data/products/csv/VX/{c['cboe_sym']}.csv"
-        try:
-            r = requests.get(url, timeout=12,
-                             headers={"User-Agent": "Mozilla/5.0"})
-            if r.status_code == 200 and len(r.text) > 100:
-                df = pd.read_csv(io.StringIO(r.text))
-                if df.empty:
-                    continue
-                last = df.iloc[-1]
-                price = None
-                for col in ['Settle', 'Close', 'Last']:
-                    if col in df.columns and pd.notna(last.get(col)) and float(last[col]) > 0:
-                        price = round(float(last[col]), 2)
-                        break
-                if price:
-                    prev = None
-                    if len(df) > 1:
-                        prev_row = df.iloc[-2]
-                        for col in ['Settle', 'Close', 'Last']:
-                            if col in df.columns and pd.notna(prev_row.get(col)) and float(prev_row[col]) > 0:
-                                prev = round(float(prev_row[col]), 2)
-                                break
-                    # Get volume and OI from last row
-                    vol = int(last.get('Total Volume', last.get('Volume', 0))) if 'Total Volume' in df.columns or 'Volume' in df.columns else 0
-                    oi = int(last.get('Open Interest', 0)) if 'Open Interest' in df.columns else 0
-                    hi = round(float(last.get('High', 0)), 2) if 'High' in df.columns and pd.notna(last.get('High')) else None
-                    lo = round(float(last.get('Low', 0)), 2) if 'Low' in df.columns and pd.notna(last.get('Low')) else None
-                    trade_date = str(last.get('Trade Date', ''))
+    raw_rows = []
+    try:
+        r = requests.get(url, timeout=15, headers=headers)
+        if r.status_code != 200:
+            return results, raw_rows
 
-                    results[c['symbol']] = dict(
-                        price=price, prev=prev, vol=vol, oi=oi,
-                        high=hi, low=lo, trade_date=trade_date, src='CBOE'
-                    )
-        except:
-            continue
-    return results
+        data = r.json()
+
+        # The JSON structure has a "data" key with list of contract objects
+        rows = data.get("data", [])
+        if not rows:
+            # Try alternate structures
+            if isinstance(data, list):
+                rows = data
+            elif "options" in data:
+                rows = data.get("options", [])
+
+        for row in rows:
+            symbol = row.get("symbol", "")
+
+            # ── FILTER: only monthly contracts ──
+            # Monthly: VX/J6, VX/K6 etc. — symbol starts with "VX/" and has NO digits before "/"
+            # Weekly:  VX12/H6, VX13/J6 etc. — has digits between "VX" and "/"
+            # Rule: after removing "VX", the part before "/" should be empty (monthly)
+            parts = symbol.split("/")
+            if len(parts) != 2:
+                continue
+            prefix = parts[0]  # e.g. "VX" for monthly, "VX12" for weekly
+            if prefix != "VX":
+                continue  # Skip weeklys (VX12, VX13, VX14, VX16, VX17, etc.)
+
+            # Parse fields
+            expiration = row.get("expiration", "")
+            last_price = _safe_float(row.get("last", row.get("last_price", 0)))
+            change = _safe_float(row.get("change", 0))
+            high = _safe_float(row.get("high", 0))
+            low = _safe_float(row.get("low", 0))
+            settlement = _safe_float(row.get("settlement", row.get("settle", row.get("prev_settle", 0))))
+            volume = _safe_int(row.get("volume", row.get("total_volume", 0)))
+
+            # Use LAST if available, otherwise Settlement
+            price = last_price if last_price and last_price > 0 else settlement
+
+            if price and price > 0:
+                results[symbol] = dict(
+                    price=price,
+                    last=last_price,
+                    settlement=settlement,
+                    change=change,
+                    high=high if high and high > 0 else None,
+                    low=low if low and low > 0 else None,
+                    vol=volume,
+                    expiration=expiration,
+                    src='CBOE',
+                )
+                raw_rows.append(row)
+
+    except Exception as e:
+        st.sidebar.error(f"CBOE API error: {e}")
+
+    return results, raw_rows
+
+
+def _safe_float(v):
+    try:
+        f = float(v)
+        return round(f, 4) if f != 0 else 0.0
+    except (ValueError, TypeError):
+        return 0.0
+
+def _safe_int(v):
+    try:
+        return int(float(v))
+    except (ValueError, TypeError):
+        return 0
 
 @st.cache_data(ttl=55)
 def fetch_etps():
@@ -251,8 +298,18 @@ def build_term_chart(vix_spot, contracts, fdata, show_prev=True):
         xlbl.append(c['label'])
         xpos.append(i)
         s = c['symbol']
-        yt.append(fdata[s]['price'] if s in fdata else None)
-        yp.append(fdata[s].get('prev') if s in fdata else None)
+        if s in fdata:
+            d = fdata[s]
+            last = d.get('last', 0)
+            settle = d.get('settlement', 0)
+            p = last if last and last > 0 else settle
+            yt.append(p if p and p > 0 else None)
+            # Previous close = price - change (if change available)
+            chg = d.get('change', 0)
+            yp.append(round(p - chg, 4) if p and chg else None)
+        else:
+            yt.append(None)
+            yp.append(None)
 
     vx = [x for x, y in zip(xpos, yt) if y]; vy = [y for y in yt if y]
 
@@ -444,15 +501,25 @@ with st.sidebar:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 contracts = monthly_contracts(n=N_MONTHS)
 vix_spot = fetch_vix_spot()
-fdata = fetch_cboe_contracts(json.dumps(contracts, default=str))
+fdata, raw_cboe = fetch_cboe_delayed_quotes()
 etps = fetch_etps()
 
-# Collect prices in order
-prices = []  # list of (label, price, prev_price)
+# Match CBOE data to our contracts by symbol (VX/J6 etc.)
+# Also enrich contracts with CBOE data
 for c in contracts:
     s = c['symbol']
     if s in fdata:
-        prices.append((c['code'], c['label'], fdata[s]['price'], fdata[s].get('prev')))
+        c['_data'] = fdata[s]
+
+# Collect prices in order (use LAST if >0, else Settlement)
+prices = []
+for c in contracts:
+    s = c['symbol']
+    if s in fdata:
+        d = fdata[s]
+        p = d['last'] if d.get('last') and d['last'] > 0 else d.get('settlement', 0)
+        settle = d.get('settlement', 0)
+        prices.append((c['code'], c['label'], p, settle))
 
 m1p = prices[0][2] if prices else None
 m2p = prices[1][2] if len(prices) > 1 else None
@@ -544,31 +611,36 @@ with tab1:
             s = c['symbol']
             if s in fdata:
                 d = fdata[s]
-                p = d['price']
-                chg = round(p - d['prev'], 2) if d.get('prev') else None
+                last_p = d.get('last', 0)
+                settle = d.get('settlement', 0)
+                p = last_p if last_p and last_p > 0 else settle
+                chg = d.get('change', 0)
                 ct = cpct(prev_p, p)
-                chg_c = "color:var(--g)" if chg and chg >= 0 else "color:var(--r)" if chg else ""
+                chg_c = "color:var(--g)" if chg and chg > 0 else "color:var(--r)" if chg and chg < 0 else ""
                 ct_c = "color:var(--g)" if ct and ct >= 0 else "color:var(--r)" if ct else ""
-                chg_s = f"{chg:+.3f}" if chg is not None else "—"
+                chg_s = f"{chg:+.3f}" if chg else "—"
                 ct_s = fp(ct) if ct is not None else "—"
                 hi_s = f"{d['high']:.2f}" if d.get('high') and d['high'] > 0 else "—"
                 lo_s = f"{d['low']:.2f}" if d.get('low') and d['low'] > 0 else "—"
+                last_s = f"{last_p:.2f}" if last_p and last_p > 0 else "—"
+                settle_s = f"{settle:.4f}" if settle and settle > 0 else "—"
+                exp_s = d.get('expiration', c['exp'].strftime('%m/%d/%Y'))
                 rows += f"""<tr>
                     <td style="color:var(--b);font-weight:600">{c['symbol']}</td>
-                    <td>{c['exp'].strftime('%m/%d/%Y')}</td>
-                    <td style="font-weight:600">{p:.4f}</td>
+                    <td>{exp_s}</td>
+                    <td style="font-weight:600">{last_s}</td>
                     <td style="{chg_c}">{chg_s}</td>
                     <td>{hi_s}</td><td>{lo_s}</td>
+                    <td>{settle_s}</td>
                     <td style="{ct_c}">{ct_s}</td>
-                    <td>{c['dte']}</td>
                     <td>{d.get('vol',0):,}</td>
                 </tr>"""
                 prev_p = p
 
         st.markdown(f"""
         <table class="dtbl">
-            <thead><tr><th>Symbol</th><th>Expiration</th><th>Settlement</th><th>Change</th>
-            <th>High</th><th>Low</th><th>Contango</th><th>DTE</th><th>Volume</th></tr></thead>
+            <thead><tr><th>Symbol</th><th>Expiration</th><th>Last</th><th>Change</th>
+            <th>High</th><th>Low</th><th>Settlement</th><th>Contango</th><th>Volume</th></tr></thead>
             <tbody>{rows}</tbody>
         </table>""", unsafe_allow_html=True)
 
