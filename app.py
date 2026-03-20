@@ -1,425 +1,769 @@
 import io
 import re
 from datetime import date, datetime, timedelta
+from typing import Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
 import yfinance as yf
+from bs4 import BeautifulSoup
 
-st.set_page_config(page_title="VIX Futures Term Structure", page_icon="📈", layout="wide")
+st.set_page_config(
+    page_title="VX Term Structure Monitor",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
-# =========================
-# Styling
-# =========================
+# =========================================================
+# STYLING
+# =========================================================
 st.markdown(
     """
-    <style>
-    .stApp { background: #f6f3ea; }
-    .block-container { max-width: 1100px; padding-top: 1rem; padding-bottom: 2rem; }
-    h1, h2, h3, p, div, span, label { color: #2b2b2b; }
-    .small-subtitle { text-align:center; color:#6b6b6b; font-size:0.95rem; margin-top:-0.6rem; }
-    .mini-note { text-align:center; color:#5674a6; font-size:0.9rem; margin-top:0.1rem; }
-    .panel {
-        background: #f8f5ee;
-        border: 1px solid #b7ab91;
-        border-radius: 2px;
-        padding: 0.5rem 0.75rem;
+<style>
+    :root {
+        --bg:#07111f;
+        --panel:#0c1829;
+        --panel-2:#0e2138;
+        --line:#1d3557;
+        --text:#e8eef8;
+        --muted:#90a4c3;
+        --accent:#4ea7ff;
+        --green:#38c172;
+        --red:#ff6b6b;
+        --amber:#e6b450;
     }
-    .metric-box {
-        border: 1px solid #b7ab91;
-        background: #fbf8f1;
-        padding: 0.5rem;
-        text-align: center;
-        border-radius: 2px;
+    .stApp {background: linear-gradient(180deg,#06101c 0%, #081524 100%);}
+    #MainMenu, footer, header {visibility:hidden;}
+    .block-container {max-width: 1380px; padding-top: 1.0rem; padding-bottom: 1rem;}
+    .topbar {
+        border-bottom: 1px solid rgba(78,167,255,0.18);
+        padding-bottom: 0.85rem;
+        margin-bottom: 1rem;
+        display:flex; justify-content:space-between; align-items:flex-end; gap:1rem;
     }
-    .metric-label { font-size: 0.8rem; color:#5f5f5f; }
-    .metric-value { font-size: 1.3rem; font-weight: 700; color:#1f5da6; }
-    .tiny { font-size: 0.8rem; color:#666; }
-    .tbl-wrap table { width:100%; border-collapse: collapse; }
-    .tbl-wrap td, .tbl-wrap th {
-        border: 1px solid #6c685c;
-        padding: 0.45rem 0.5rem;
-        text-align:center;
-        font-size:0.95rem;
-        background:#f8f5ee;
+    .brand {font-size: 2.0rem; font-weight: 700; color: var(--text); letter-spacing:-0.03em;}
+    .brand span {color: var(--accent);}
+    .subline {color: var(--muted); font-size: 0.86rem;}
+    .micro {color: var(--muted); font-size: 0.76rem;}
+    .kpi-grid {display:grid; grid-template-columns: repeat(6, minmax(140px,1fr)); gap: 0.7rem; margin: 0.6rem 0 1rem;}
+    .kpi-card {
+        background: linear-gradient(180deg, rgba(12,24,41,0.96) 0%, rgba(9,19,33,0.96) 100%);
+        border: 1px solid rgba(78,167,255,0.16);
+        border-radius: 14px; padding: 0.8rem 1rem; min-height: 92px;
+        box-shadow: 0 8px 22px rgba(0,0,0,0.18);
     }
-    .tbl-wrap th { background:#efe8d8; font-weight:700; }
-    </style>
-    """,
+    .kpi-label {color: var(--muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.12em;}
+    .kpi-value {color: var(--text); font-size: 1.55rem; font-weight: 700; margin-top: 0.25rem;}
+    .kpi-sub {color: var(--muted); font-size: 0.78rem; margin-top: 0.22rem;}
+    .pos {color: var(--green)!important;}
+    .neg {color: var(--red)!important;}
+    .warnbox {
+        background: rgba(230,180,80,0.12);
+        border: 1px solid rgba(230,180,80,0.28);
+        color: #f6d98f; border-radius: 12px; padding: 0.9rem 1rem; margin: 0.6rem 0 1rem;
+    }
+    .panel-title {font-size: 1rem; color: var(--text); font-weight: 700; margin-bottom: 0.2rem;}
+    .panel-sub {font-size: 0.78rem; color: var(--muted); margin-bottom: 0.8rem;}
+    .signal-box {
+        background: linear-gradient(180deg, rgba(12,24,41,0.96) 0%, rgba(9,19,33,0.96) 100%);
+        border:1px solid rgba(78,167,255,0.16); border-radius: 16px; padding:1rem 1rem 0.8rem;
+    }
+    .signal-banner {
+        border-radius: 14px; padding: 1rem 1.2rem; text-align:center; font-size: 2rem; font-weight:800;
+        margin-bottom: 0.8rem; letter-spacing: 0.06em;
+    }
+    .banner-long {background: rgba(56,193,114,0.14); color: #7ee2a6; border:1px solid rgba(56,193,114,0.30);}
+    .banner-cash {background: rgba(255,107,107,0.14); color: #ff9a9a; border:1px solid rgba(255,107,107,0.30);}
+    .rule-table {width:100%; border-collapse:collapse; font-size:0.84rem;}
+    .rule-table th, .rule-table td {padding: 0.52rem 0.55rem; border-bottom:1px solid rgba(144,164,195,0.12);}
+    .rule-table th {text-align:left; color:var(--muted); font-weight:600; font-size:0.76rem; text-transform:uppercase; letter-spacing:0.08em;}
+</style>
+""",
     unsafe_allow_html=True,
 )
 
-MONTH_MAP = {
-    "F": "Jan", "G": "Feb", "H": "Mar", "J": "Apr", "K": "May", "M": "Jun",
-    "N": "Jul", "Q": "Aug", "U": "Sep", "V": "Oct", "X": "Nov", "Z": "Dec"
-}
-MONTH_ORDER = {k: i for i, k in enumerate(["F", "G", "H", "J", "K", "M", "N", "Q", "U", "V", "X", "Z"], start=1)}
+# =========================================================
+# CONSTANTS / HELPERS
+# =========================================================
+MONTH_CODES = {1: "F", 2: "G", 3: "H", 4: "J", 5: "K", 6: "M", 7: "N", 8: "Q", 9: "U", 10: "V", 11: "X", 12: "Z"}
+MONTH_NAMES_SHORT = {1: "Jan", 2: "Feb", 3: "Mar", 4: "Apr", 5: "May", 6: "Jun", 7: "Jul", 8: "Aug", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dec"}
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"}
 
 
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    mapping = {}
-    for c in df.columns:
-        cl = str(c).strip().lower()
-        if "symbol" == cl or cl.endswith("symbol"):
-            mapping[c] = "Symbol"
-        elif "expiration" in cl:
-            mapping[c] = "Expiration"
-        elif cl in {"last", "last price", "last_price"}:
-            mapping[c] = "Last"
-        elif "settle" in cl:
-            mapping[c] = "Settle"
-        elif "open" == cl:
-            mapping[c] = "Open"
-        elif "high" == cl:
-            mapping[c] = "High"
-        elif "low" == cl:
-            mapping[c] = "Low"
-        elif "bid" == cl:
-            mapping[c] = "Bid"
-        elif "ask" == cl:
-            mapping[c] = "Ask"
-        elif "change" == cl:
-            mapping[c] = "Change"
-    return df.rename(columns=mapping)
+# ---------------- formatting ----------------
+def fmt_num(x: Optional[float], digits: int = 2, default: str = "—") -> str:
+    try:
+        if x is None or (isinstance(x, float) and np.isnan(x)):
+            return default
+        return f"{float(x):,.{digits}f}"
+    except Exception:
+        return default
 
 
-def monthly_contract_key(symbol: str):
-    if not isinstance(symbol, str):
-        return None
-    s = symbol.strip().upper()
-    # accepts VX/J6 and VX+VXT/J6; excludes VX12/H6 and VX+VXT01/F6
-    m = re.fullmatch(r"(?:VX|VX\+VXT)/([FGHJKMNQUVXZ])(\d{1,2})", s)
-    if not m:
-        return None
-    return m.group(1), m.group(2)
+def fmt_signed(x: Optional[float], digits: int = 2, suffix: str = "") -> str:
+    try:
+        if x is None or (isinstance(x, float) and np.isnan(x)):
+            return "—"
+        return f"{float(x):+,.{digits}f}{suffix}"
+    except Exception:
+        return "—"
 
 
-def month_label_from_symbol(symbol: str) -> str:
-    key = monthly_contract_key(symbol)
-    if not key:
-        return symbol
-    mon_code, yr = key
-    yr4 = 2000 + int(yr[-2:])
-    return f"{MONTH_MAP[mon_code]}"
+def value_class(x: Optional[float]) -> str:
+    try:
+        if x is None or (isinstance(x, float) and np.isnan(x)):
+            return ""
+        if float(x) > 0:
+            return "pos"
+        if float(x) < 0:
+            return "neg"
+        return ""
+    except Exception:
+        return ""
 
 
-def pretty_symbol(symbol: str) -> str:
-    key = monthly_contract_key(symbol)
-    if not key:
-        return symbol
-    mon_code, yr = key
-    return f"VX/{mon_code}{yr[-1]}" if len(yr) == 1 else f"VX/{mon_code}{yr}"
+def clean_numeric_series(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(
+        s.astype(str)
+        .str.replace(",", "", regex=False)
+        .str.replace("--", "", regex=False)
+        .str.replace("-", "", regex=False)
+        .str.strip(),
+        errors="coerce",
+    )
 
 
-def sort_monthly_df(df: pd.DataFrame) -> pd.DataFrame:
-    rows = []
-    for _, row in df.iterrows():
-        key = monthly_contract_key(row.get("Symbol"))
-        if key:
-            mon_code, yr = key
-            yr_num = 2000 + int(yr[-2:])
-            rows.append((yr_num, MONTH_ORDER[mon_code]))
-        else:
-            rows.append((9999, 99))
-    out = df.copy()
-    out[["_year", "_month_ord"]] = rows
-    out = out.sort_values(["_year", "_month_ord"]).drop(columns=["_year", "_month_ord"]).reset_index(drop=True)
+# ---------------- VX calendar ----------------
+def vix_futures_expiration(year: int, month: int) -> date:
+    """Wednesday 30 days before the 3rd Friday of the following month."""
+    next_month = month + 1
+    next_year = year
+    if next_month > 12:
+        next_month = 1
+        next_year += 1
+    first = date(next_year, next_month, 1)
+    days_to_friday = (4 - first.weekday()) % 7
+    third_friday = first + timedelta(days=days_to_friday + 14)
+    return third_friday - timedelta(days=30)
+
+
+def active_monthly_contracts(ref: Optional[date] = None, n: int = 8) -> List[dict]:
+    ref = ref or date.today()
+    out: List[dict] = []
+    month = ref.month
+    year = ref.year
+    for i in range(n + 6):
+        cm = ((month - 1 + i) % 12) + 1
+        cy = year + ((month - 1 + i) // 12)
+        exp = vix_futures_expiration(cy, cm)
+        if exp >= ref:
+            code = MONTH_CODES[cm]
+            out.append(
+                {
+                    "month": cm,
+                    "year": cy,
+                    "exp": exp,
+                    "dte": (exp - ref).days,
+                    "label": f"{MONTH_NAMES_SHORT[cm]} {str(cy)[-2:]}",
+                    "slash_symbol": f"VX/{code}{str(cy)[-1]}",
+                    "legacy_symbol": f"VX{code}{str(cy)[-2:]}",
+                }
+            )
+        if len(out) >= n:
+            break
     return out
 
 
-@st.cache_data(ttl=900)
-def fetch_settlement_for_date(target: date) -> pd.DataFrame:
-    url = f"https://www.cboe.com/us/futures/market_statistics/settlement/csv?dt={target:%Y-%m-%d}"
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "text/csv,application/octet-stream,text/plain,*/*",
-    }
-    r = requests.get(url, timeout=20, headers=headers)
-    r.raise_for_status()
-    text = r.text.strip()
-    if not text or "<!DOCTYPE" in text.upper() or "<HTML" in text.upper():
-        raise ValueError("El endpoint de settlement no devolvió CSV válido.")
-    df = pd.read_csv(io.StringIO(text))
-    if df.empty:
-        raise ValueError("CSV vacío.")
-    return normalize_columns(df)
+def is_monthly_cboe_symbol(symbol: str) -> bool:
+    if not isinstance(symbol, str):
+        return False
+    symbol = symbol.strip().upper()
+    return re.fullmatch(r"VX/[FGHJKMNQUVXZ]\d", symbol) is not None
 
 
-@st.cache_data(ttl=900)
-def fetch_latest_available_curve(lookback_days: int = 7):
-    errors = []
-    for i in range(lookback_days + 1):
-        d = date.today() - timedelta(days=i)
-        try:
-            df = fetch_settlement_for_date(d)
-            monthly = df[df["Symbol"].astype(str).map(monthly_contract_key).notna()].copy()
-            if monthly.empty:
-                errors.append(f"{d}: sin contratos mensuales")
-                continue
-            monthly = sort_monthly_df(monthly)
-            return d, monthly
-        except Exception as e:
-            errors.append(f"{d}: {e}")
-    raise ValueError("No se encontró settlement reciente de CBOE. " + " | ".join(errors[:3]))
+# =========================================================
+# CBOE FETCHERS
+# =========================================================
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    rename = {}
+    for c in df.columns:
+        cs = str(c).strip().lower()
+        if "symbol" in cs:
+            rename[c] = "symbol"
+        elif "expiration" in cs:
+            rename[c] = "expiration"
+        elif cs in {"last", "last price"} or "last price" in cs:
+            rename[c] = "last"
+        elif "change" in cs:
+            rename[c] = "change"
+        elif cs == "high" or cs.endswith(" high"):
+            rename[c] = "high"
+        elif cs == "low" or cs.endswith(" low"):
+            rename[c] = "low"
+        elif cs in {"settlement", "settle", "settlement price", "price", "daily settlement price"} or "settle" in cs:
+            rename[c] = "settlement"
+        elif "volume" in cs:
+            rename[c] = "volume"
+        elif cs in {"open", "opening price"}:
+            rename[c] = "open"
+        elif cs in {"close", "closing price"}:
+            rename[c] = "close"
+    return df.rename(columns=rename)
 
 
-@st.cache_data(ttl=600)
-def fetch_vix_spot():
+@st.cache_data(ttl=120)
+def fetch_cboe_live_table() -> pd.DataFrame:
+    """Get delayed VX market-data table from the Cboe VIX futures product page.
+    First tries HTML tables; then falls back to text parsing from page content.
+    """
+    url = "https://www.cboe.com/en/tradable-products/vix/vix-futures/"
+    resp = requests.get(url, headers=HEADERS, timeout=20)
+    resp.raise_for_status()
+    html = resp.text
+
+    # Attempt 1: pandas.read_html
     try:
-        h = yf.Ticker("^VIX").history(period="7d")
-        if h.empty:
+        tables = pd.read_html(io.StringIO(html))
+        for t in tables:
+            t = normalize_columns(t)
+            cols = set(t.columns)
+            if {"symbol", "expiration"}.issubset(cols):
+                if "symbol" in t.columns:
+                    t["symbol"] = t["symbol"].astype(str).str.strip()
+                    t = t[t["symbol"].apply(is_monthly_cboe_symbol)].copy()
+                    if not t.empty:
+                        for c in ["last", "change", "high", "low", "settlement", "volume"]:
+                            if c in t.columns:
+                                t[c] = clean_numeric_series(t[c])
+                        t["expiration"] = pd.to_datetime(t["expiration"], errors="coerce")
+                        return t
+    except Exception:
+        pass
+
+    # Attempt 2: parse visible text section
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text("\n", strip=True)
+    marker = "Symbol Expiration Last Price Change High Low Settlement Volume"
+    if marker not in text:
+        raise ValueError("No encontré la sección de market data de VIX futures en CBOE.")
+    section = text.split(marker, 1)[1]
+    lines = [ln.strip() for ln in section.splitlines() if ln.strip()]
+    rows = []
+    row_regex = re.compile(r"^(VX\d{0,2}/[FGHJKMNQUVXZ]\d)\s+(\d{2}/\d{2}/\d{4})(.*)$")
+    number_regex = re.compile(r"[-+]?\d+(?:\.\d+)?")
+
+    for line in lines:
+        if line.startswith("#") or line.startswith("The Next Generation"):
+            break
+        m = row_regex.match(line)
+        if not m:
+            continue
+        symbol, expiration, tail = m.groups()
+        if not is_monthly_cboe_symbol(symbol):
+            continue
+        nums = [float(x) for x in number_regex.findall(tail)]
+        row = {"symbol": symbol, "expiration": pd.to_datetime(expiration, errors="coerce")}
+        # Heuristic mapping. Most important fields are last and settlement.
+        if len(nums) >= 5:
+            row.update({"last": nums[0], "change": nums[1], "high": nums[2], "low": nums[3], "settlement": nums[4]})
+        elif len(nums) == 4:
+            row.update({"last": nums[0], "high": nums[1], "low": nums[2], "settlement": nums[3]})
+        elif len(nums) == 2:
+            row.update({"last": nums[0], "settlement": nums[1]})
+        elif len(nums) == 1:
+            row.update({"settlement": nums[0]})
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        raise ValueError("No se pudo parsear la curva live de CBOE.")
+    return df
+
+
+@st.cache_data(ttl=300)
+def fetch_contract_daily_history(expiration: str) -> pd.DataFrame:
+    url = f"https://cdn.cboe.com/data/us/futures/market_statistics/historical_data/products/csv/VX/VX_{expiration}.csv"
+    resp = requests.get(url, headers=HEADERS, timeout=20)
+    resp.raise_for_status()
+    df = pd.read_csv(io.StringIO(resp.text))
+    df = normalize_columns(df)
+    # Normalize common headers from product CSVs
+    extra_map = {}
+    for c in df.columns:
+        cs = str(c).strip().lower()
+        if cs == "trade date":
+            extra_map[c] = "trade_date"
+        elif cs == "open":
+            extra_map[c] = "open"
+        elif cs == "high":
+            extra_map[c] = "high"
+        elif cs == "low":
+            extra_map[c] = "low"
+        elif cs == "close":
+            extra_map[c] = "close"
+        elif cs in {"last", "last sale"}:
+            extra_map[c] = "last"
+        elif "settle" in cs or cs == "price":
+            extra_map[c] = "settlement"
+        elif "volume" in cs:
+            extra_map[c] = "volume"
+    df = df.rename(columns=extra_map)
+    if "trade_date" in df.columns:
+        df["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce")
+    for c in ["open", "high", "low", "close", "last", "settlement", "volume"]:
+        if c in df.columns:
+            df[c] = clean_numeric_series(df[c])
+    return df
+
+
+@st.cache_data(ttl=120)
+def fetch_vix_spot() -> Optional[dict]:
+    try:
+        ticker = yf.Ticker("^VIX")
+        hist = ticker.history(period="7d", auto_adjust=False)
+        if hist.empty:
             return None
-        close = h["Close"].dropna()
-        if close.empty:
-            return None
-        price = float(close.iloc[-1])
-        prev = float(close.iloc[-2]) if len(close) > 1 else None
-        return {"price": round(price, 2), "prev": round(prev, 2) if prev is not None else None}
+        latest = hist.iloc[-1]
+        prev_close = float(hist["Close"].iloc[-2]) if len(hist) > 1 else float(latest["Close"])
+        return {
+            "last": float(latest["Close"]),
+            "open": float(latest["Open"]),
+            "high": float(latest["High"]),
+            "low": float(latest["Low"]),
+            "close": float(latest["Close"]),
+            "prev_close": prev_close,
+            "change": float(latest["Close"]) - prev_close,
+            "pct_change": ((float(latest["Close"]) / prev_close) - 1) * 100 if prev_close else None,
+            "timestamp": hist.index[-1],
+        }
     except Exception:
         return None
 
 
-def choose_price_col(df: pd.DataFrame) -> str:
-    for c in ["Last", "Settle"]:
-        if c in df.columns:
-            return c
-    raise ValueError("No encontré columna Last/Settle en settlement de CBOE.")
+@st.cache_data(ttl=600)
+def build_monthly_curve(n_months: int = 8) -> pd.DataFrame:
+    contracts = active_monthly_contracts(n=n_months)
+    live = fetch_cboe_live_table()
+    live = normalize_columns(live)
+    if "symbol" not in live.columns:
+        raise ValueError("CBOE live table no trajo columna de símbolo.")
+    live["symbol"] = live["symbol"].astype(str).str.strip()
+    live = live[live["symbol"].apply(is_monthly_cboe_symbol)].copy()
+    if "expiration" in live.columns:
+        live["expiration"] = pd.to_datetime(live["expiration"], errors="coerce")
+
+    live_map = {row["symbol"]: row.to_dict() for _, row in live.iterrows()}
+
+    rows = []
+    for idx, c in enumerate(contracts, start=1):
+        hist_df = fetch_contract_daily_history(c["exp"].strftime("%Y-%m-%d"))
+        if hist_df.empty:
+            hist_row = {}
+        else:
+            hist_df = hist_df.sort_values("trade_date") if "trade_date" in hist_df.columns else hist_df
+            hist_row = hist_df.iloc[-1].to_dict()
+        lrow = live_map.get(c["slash_symbol"], {})
+
+        close_px = hist_row.get("close")
+        last_px = lrow.get("last")
+        if pd.isna(last_px) or last_px in (None, 0):
+            last_px = close_px
+        settlement_px = lrow.get("settlement") if pd.notna(lrow.get("settlement")) else hist_row.get("settlement")
+        open_px = hist_row.get("open")
+        high_px = hist_row.get("high")
+        low_px = hist_row.get("low")
+        prev_close = None
+        if isinstance(hist_df, pd.DataFrame) and not hist_df.empty and len(hist_df) >= 2 and "close" in hist_df.columns:
+            prev_close = hist_df["close"].iloc[-2]
+        change_px = None
+        if pd.notna(lrow.get("change")):
+            change_px = lrow.get("change")
+        elif pd.notna(last_px) and pd.notna(prev_close):
+            change_px = float(last_px) - float(prev_close)
+
+        rows.append(
+            {
+                "m": f"M{idx}",
+                "label": c["label"],
+                "symbol": c["slash_symbol"],
+                "expiration": c["exp"],
+                "dte": c["dte"],
+                "last": last_px,
+                "close": close_px,
+                "open": open_px,
+                "high": high_px,
+                "low": low_px,
+                "settlement": settlement_px,
+                "change": change_px,
+                "prev_close": prev_close,
+                "source_last": "CBOE product page" if pd.notna(lrow.get("last")) else "CBOE contract CSV fallback",
+                "source_ohlc": "CBOE contract CSV",
+            }
+        )
+
+    curve = pd.DataFrame(rows)
+    curve["term_price"] = curve["last"].where(curve["last"].notna(), curve["close"])
+    curve["contango_pct_vs_prev"] = (curve["term_price"] / curve["term_price"].shift(1) - 1) * 100
+    curve["difference_vs_prev"] = curve["term_price"] - curve["term_price"].shift(1)
+    return curve
 
 
-def clean_numeric(series: pd.Series) -> pd.Series:
-    return pd.to_numeric(series, errors="coerce")
+# =========================================================
+# STRATEGY
+# =========================================================
+@st.cache_data(ttl=300)
+def fetch_strategy_market_data(days: int = 320) -> pd.DataFrame:
+    end = datetime.now()
+    start = end - timedelta(days=days)
+    symbols = {"VXX": "VXX", "SVXY": "SVXY", "SVIX": "SVIX", "VIX": "^VIX", "SPY": "SPY"}
+    out = pd.DataFrame()
+    for alias, symbol in symbols.items():
+        df = yf.download(symbol, start=start, end=end, progress=False, auto_adjust=False)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        if df.empty:
+            continue
+        out[f"{alias}_Open"] = df["Open"]
+        out[f"{alias}_High"] = df["High"]
+        out[f"{alias}_Low"] = df["Low"]
+        out[f"{alias}_Close"] = df["Close"]
+    out = out.sort_index().dropna(subset=["VXX_Close"], how="any")
+    out["SMA20"] = out["VXX_Close"].rolling(20).mean()
+    out["STD20"] = out["VXX_Close"].rolling(20).std()
+    out["BB_Upper"] = out["SMA20"] + 2.0 * out["STD20"]
+    out["BB_Lower"] = out["SMA20"] - 2.0 * out["STD20"]
+
+    clean = out.dropna(subset=["SMA20", "BB_Upper"]).copy()
+    pos = 0
+    state = []
+    for _, row in clean.iterrows():
+        p = row["VXX_Close"]
+        sma = row["SMA20"]
+        upper = row["BB_Upper"]
+        if pos == 0 and p < sma:
+            pos = 1
+        elif pos == 1 and p > upper:
+            pos = 0
+        state.append(pos)
+    clean["bb_sig"] = state
+    return clean
 
 
-def prepare_curve(df_today: pd.DataFrame, df_prev: pd.DataFrame | None = None) -> pd.DataFrame:
-    today = df_today.copy()
-    price_col = choose_price_col(today)
-    today[price_col] = clean_numeric(today[price_col])
-    for col in ["Open", "Bid", "Ask", "High", "Low", "Change", "Settle"]:
-        if col in today.columns:
-            today[col] = clean_numeric(today[col])
-    today = today[today[price_col].notna()].copy()
-    today = sort_monthly_df(today)
-    today["Month"] = today["Symbol"].map(month_label_from_symbol)
-    today["DisplaySymbol"] = today["Symbol"].map(pretty_symbol)
-    today["LastDisplay"] = today[price_col].round(3)
-    today["Price"] = today[price_col].round(3)
+def build_strategy_snapshot(curve: pd.DataFrame) -> dict:
+    data = fetch_strategy_market_data()
+    last = data.iloc[-1]
+    prev = data.iloc[-2] if len(data) >= 2 else last
+    m1 = curve.iloc[0]
+    m2 = curve.iloc[1] if len(curve) > 1 else None
 
-    if df_prev is not None and not df_prev.empty:
-        prev = df_prev.copy()
-        prev_col = choose_price_col(prev)
-        prev[prev_col] = clean_numeric(prev[prev_col])
-        prev = prev[prev["Symbol"].astype(str).map(monthly_contract_key).notna()].copy()
-        prev = prev[["Symbol", prev_col]].rename(columns={prev_col: "PreviousClose"})
-        today = today.merge(prev, on="Symbol", how="left")
-    else:
-        today["PreviousClose"] = pd.NA
+    contango_pct = None
+    in_contango = False
+    if m2 is not None and pd.notna(m1["term_price"]) and pd.notna(m2["term_price"]):
+        contango_pct = (float(m2["term_price"]) / float(m1["term_price"]) - 1) * 100
+        in_contango = float(m2["term_price"]) > float(m1["term_price"])
 
-    return today.reset_index(drop=True)
+    bb_sig = int(last["bb_sig"])
+    vxx_below_sma = float(last["VXX_Close"]) < float(last["SMA20"])
+    vxx_above_upper = float(last["VXX_Close"]) > float(last["BB_Upper"])
+    final_signal = int(bb_sig and in_contango)
 
+    exec_date = pd.Timestamp(data.index[-1]).to_pydatetime().date() + timedelta(days=1)
+    while exec_date.weekday() >= 5:
+        exec_date += timedelta(days=1)
 
-def calc_term_metrics(curve: pd.DataFrame):
-    px = curve["Price"].tolist()
-    diffs = [None]
-    contango = [None]
-    for i in range(1, len(px)):
-        diff = px[i] - px[i - 1] if pd.notna(px[i]) and pd.notna(px[i - 1]) else None
-        diffs.append(diff)
-        contango.append((diff / px[i - 1] * 100) if diff is not None and px[i - 1] else None)
-    return diffs, contango
-
-
-
-
-def fmt_num(x, digits=2, suffix=""):
-    try:
-        if x is None or pd.isna(x):
-            return "N/A"
-        return f"{float(x):.{digits}f}{suffix}"
-    except Exception:
-        return "N/A"
+    return {
+        "data": data,
+        "last": last,
+        "prev": prev,
+        "m1": m1,
+        "m2": m2,
+        "contango_pct": contango_pct,
+        "in_contango": in_contango,
+        "bb_sig": bb_sig,
+        "final_signal": final_signal,
+        "vxx_below_sma": vxx_below_sma,
+        "vxx_above_upper": vxx_above_upper,
+        "pct_to_sma": (float(last["VXX_Close"]) / float(last["SMA20"]) - 1) * 100,
+        "pct_to_upper": (float(last["VXX_Close"]) / float(last["BB_Upper"]) - 1) * 100,
+        "exec_date": exec_date,
+    }
 
 
-def build_chart(curve: pd.DataFrame, spot: dict | None):
-    x = curve["Month"].tolist()
-    y = curve["Price"].tolist()
-    prev = curve["PreviousClose"].tolist() if "PreviousClose" in curve.columns else [None] * len(curve)
+# =========================================================
+# CHARTS
+# =========================================================
 
+def build_term_structure_chart(curve: pd.DataFrame, spot: Optional[dict]) -> go.Figure:
     fig = go.Figure()
+    x = curve["label"].tolist()
+
     fig.add_trace(
         go.Scatter(
             x=x,
-            y=y,
+            y=curve["term_price"],
             mode="lines+markers+text",
-            name="Last",
-            line=dict(color="#35a7ff", width=3, shape="spline"),
-            marker=dict(size=8, color="#35a7ff"),
-            text=[f"{v:.3f}" if pd.notna(v) else "" for v in y],
+            text=[fmt_num(v, 2) for v in curve["term_price"]],
             textposition="top center",
-            textfont=dict(color="#000000", size=13),
-            hovertemplate="%{x}: %{y:.3f}<extra>Last</extra>",
+            name="Last / Term Price",
+            line=dict(color="#39a0ff", width=3.2, shape="spline"),
+            marker=dict(size=8, color="#39a0ff"),
+            hovertemplate="<b>%{x}</b><br>Term Price: %{y:.2f}<extra></extra>",
         )
     )
 
-    if any(pd.notna(v) for v in prev):
-        fig.add_trace(
-            go.Scatter(
-                x=x,
-                y=prev,
-                mode="lines+markers",
-                name="Previous Close",
-                line=dict(color="#707070", width=1.5, dash="dot"),
-                marker=dict(size=5, color="#707070"),
-                hovertemplate="%{x}: %{y:.3f}<extra>Previous Close</extra>",
+    series_meta = [
+        ("close", "Close", "#A8B3C7", "dot"),
+        ("open", "Open", "#F2C14E", "dot"),
+        ("high", "High", "#4CD7A2", "dot"),
+        ("low", "Low", "#FF7F7F", "dot"),
+    ]
+    for col, name, color, dash in series_meta:
+        if col in curve.columns and curve[col].notna().any():
+            fig.add_trace(
+                go.Scatter(
+                    x=x,
+                    y=curve[col],
+                    mode="lines+markers",
+                    name=name,
+                    line=dict(color=color, width=1.6, dash=dash),
+                    marker=dict(size=5, color=color),
+                    visible="legendonly" if name != "Close" else True,
+                    hovertemplate=f"<b>%{{x}}</b><br>{name}: %{{y:.2f}}<extra></extra>",
+                )
             )
-        )
 
-    if spot and spot.get("price") is not None:
+    if spot and spot.get("last") is not None:
         fig.add_hline(
-            y=spot["price"],
+            y=float(spot["last"]),
+            line_width=2,
+            line_color="#6DD36F",
             line_dash="dash",
-            line_color="#2f8f2f",
-            line_width=3,
-            annotation_text=f"{spot['price']:.2f}",
+            annotation_text=f"VIX Spot {spot['last']:.2f}",
             annotation_position="top right",
-            annotation_font_color="#000",
+            annotation_font_color="#6DD36F",
         )
-        fig.add_trace(
-            go.Scatter(
-                x=[x[0], x[-1]],
-                y=[spot["price"], spot["price"]],
-                mode="lines",
-                name="VIX Index",
-                line=dict(color="#2f8f2f", width=3, dash="dash"),
-                hoverinfo="skip",
-                showlegend=True,
-            )
-        )
-
-    y_all = [v for v in y if pd.notna(v)]
-    if spot and spot.get("price") is not None:
-        y_all.append(spot["price"])
-    ymin = min(y_all) - 0.2
-    ymax = max(y_all) + 0.25
 
     fig.update_layout(
-        title=dict(text="VIX Futures Term Structure", x=0.5, xanchor="center", font=dict(size=22, color="#1f2f50")),
-        paper_bgcolor="#f8f5ee",
-        plot_bgcolor="#f8f5ee",
-        margin=dict(l=70, r=40, t=70, b=60),
+        title=dict(text="VIX Futures Term Structure", x=0.5, font=dict(size=26, color="#F3F7FF")),
+        paper_bgcolor="#081321",
+        plot_bgcolor="#0A182A",
+        font=dict(color="#E6EEF9"),
         height=560,
-        legend=dict(x=1.01, y=1.0, bgcolor="rgba(0,0,0,0)", borderwidth=0, font=dict(size=13)),
-        xaxis=dict(title="Future Month", showgrid=False, tickfont=dict(size=14, color="#2b2b2b")),
+        margin=dict(l=40, r=30, t=80, b=55),
+        legend=dict(
+            orientation="v",
+            yanchor="top",
+            y=1,
+            xanchor="left",
+            x=1.01,
+            bgcolor="rgba(8,19,33,0.7)",
+            bordercolor="rgba(61,165,255,0.15)",
+            borderwidth=1,
+        ),
+        xaxis=dict(
+            title="Future Month",
+            gridcolor="rgba(168,179,199,0.10)",
+            zeroline=False,
+            showline=True,
+            linecolor="rgba(168,179,199,0.18)",
+        ),
         yaxis=dict(
             title="Volatility",
-            range=[ymin, ymax],
-            tick0=round(ymin * 4) / 4,
-            dtick=0.05,
-            gridcolor="#d4d1c9",
+            gridcolor="rgba(168,179,199,0.10)",
             zeroline=False,
-            tickfont=dict(size=14, color="#2b2b2b"),
+            showline=True,
+            linecolor="rgba(168,179,199,0.18)",
         ),
         hovermode="x unified",
     )
     return fig
 
 
-# =========================
-# UI / Data load
-# =========================
-header_cols = st.columns([8, 1])
-with header_cols[0]:
-    st.markdown("<h1 style='text-align:center; margin-bottom:0;'>VIX Futures Term Structure</h1>", unsafe_allow_html=True)
-    st.markdown("<div class='small-subtitle'>Source: CBOE Delayed Quotes</div>", unsafe_allow_html=True)
-    st.markdown("<div class='mini-note'>vixcentral.com</div>", unsafe_allow_html=True)
-with header_cols[1]:
-    with st.popover("☰"):
-        months_to_show = st.slider("Meses a mostrar", 4, 9, 8)
-        show_prev = st.checkbox("Mostrar previous close", True)
-        hist_mode = st.checkbox("Usar fecha histórica")
-        target_date = st.date_input("Fecha", value=date.today()) if hist_mode else None
+def build_vxx_timing_chart(strategy: dict) -> go.Figure:
+    data = strategy["data"].tail(120).copy()
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=data.index, y=data["VXX_Close"], mode="lines", name="VXX Close", line=dict(color="#4ea7ff", width=2.4)))
+    fig.add_trace(go.Scatter(x=data.index, y=data["SMA20"], mode="lines", name="SMA20", line=dict(color="#c0cad8", width=1.5)))
+    fig.add_trace(go.Scatter(x=data.index, y=data["BB_Upper"], mode="lines", name="BB Upper", line=dict(color="#ff8a80", width=1.4, dash="dot")))
+    fig.add_trace(go.Scatter(x=data.index, y=data["BB_Lower"], mode="lines", name="BB Lower", line=dict(color="#56d364", width=1.2, dash="dot")))
+    fig.update_layout(
+        height=420,
+        paper_bgcolor="#0b1728",
+        plot_bgcolor="#0b1728",
+        font=dict(color="#d7e4f5"),
+        margin=dict(l=30, r=20, t=45, b=30),
+        title=dict(text="VXX Timing Model — Bollinger Bands (20, 2σ)", x=0.5),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        xaxis=dict(gridcolor="rgba(144,164,195,0.08)"),
+        yaxis=dict(gridcolor="rgba(144,164,195,0.08)", title="Price"),
+        hovermode="x unified",
+    )
+    return fig
+
+
+# =========================================================
+# UI
+# =========================================================
+curve_error = None
+spot_error = None
+strategy_error = None
+curve = None
+spot = None
+strategy = None
 
 try:
-    asof, df_today_raw = fetch_latest_available_curve(lookback_days=10) if not hist_mode else (target_date, fetch_settlement_for_date(target_date))
-    df_today_raw = df_today_raw[df_today_raw["Symbol"].astype(str).map(monthly_contract_key).notna()].copy()
-
-    prev_df = None
-    if show_prev:
-        for i in range(1, 6):
-            try:
-                prev_df = fetch_settlement_for_date(asof - timedelta(days=i))
-                break
-            except Exception:
-                continue
-
-    curve = prepare_curve(df_today_raw, prev_df).head(months_to_show)
-    if curve.empty:
-        raise ValueError("CBOE no devolvió contratos mensuales utilizables.")
-
-    spot = fetch_vix_spot()
-    diffs, contango = calc_term_metrics(curve)
-
-    mcols = st.columns(5)
-    m1 = curve.iloc[0]["Price"] if len(curve) >= 1 else None
-    m2 = curve.iloc[1]["Price"] if len(curve) >= 2 else None
-    with mcols[0]:
-        st.markdown(f"<div class='metric-box'><div class='metric-label'>VIX Spot</div><div class='metric-value'>{fmt_num(spot['price'] if spot else None, 2)}</div></div>", unsafe_allow_html=True)
-    with mcols[1]:
-        st.markdown(f"<div class='metric-box'><div class='metric-label'>M1</div><div class='metric-value'>{fmt_num(m1, 2)}</div></div>", unsafe_allow_html=True)
-    with mcols[2]:
-        st.markdown(f"<div class='metric-box'><div class='metric-label'>M2</div><div class='metric-value'>{fmt_num(m2, 2)}</div></div>", unsafe_allow_html=True)
-    with mcols[3]:
-        spread = (m2 - m1) if (m1 is not None and m2 is not None) else None
-        st.markdown(f"<div class='metric-box'><div class='metric-label'>Difference</div><div class='metric-value'>{fmt_num(spread, 2)}</div></div>", unsafe_allow_html=True)
-    with mcols[4]:
-        c12 = contango[1] if len(contango) > 1 else None
-        st.markdown(f"<div class='metric-box'><div class='metric-label'>% Contango</div><div class='metric-value'>{fmt_num(c12, 2, '%')}</div></div>", unsafe_allow_html=True)
-
-    fig = build_chart(curve, spot)
-    st.plotly_chart(fig, use_container_width=True)
-
-    info = []
-    info.append(f"Curva con settlement CBOE de {asof:%Y-%m-%d}")
-    if prev_df is not None:
-        info.append("previous close cargado")
-    if spot:
-        info.append("VIX spot vía Yahoo")
-    st.caption(" · ".join(info))
-
-    # main table style matching screenshot
-    idx_headers = list(range(1, len(curve) + 1))
-    cont_cells = ["—"] + [f"{v:.2f}%" if v is not None else "—" for v in contango[1:]]
-    diff_cells = ["—"] + [f"{v:.2f}" if v is not None else "—" for v in diffs[1:]]
-
-    contango_html = "<div class='tbl-wrap'><table><tr><th>% Contango</th>"
-    for i in idx_headers:
-        contango_html += f"<th>{i}</th>"
-    contango_html += "</tr><tr><td></td>"
-    for val in cont_cells:
-        contango_html += f"<td>{val}</td>"
-    contango_html += "</tr><tr><th>Difference</th>"
-    for i in idx_headers:
-        contango_html += f"<th>{i}</th>"
-    contango_html += "</tr><tr><td></td>"
-    for val in diff_cells:
-        contango_html += f"<td>{val}</td>"
-    contango_html += "</tr></table></div>"
-    st.markdown(contango_html, unsafe_allow_html=True)
-
-    # month 7 to 4 block, like screenshot
-    if len(curve) >= 7:
-        c74 = ((curve.iloc[6]["Price"] - curve.iloc[3]["Price"]) / curve.iloc[3]["Price"] * 100) if curve.iloc[3]["Price"] else None
-        d74 = curve.iloc[6]["Price"] - curve.iloc[3]["Price"]
-        mini_html = "<div class='tbl-wrap' style='width: 300px; margin-top: 10px;'><table>"
-        mini_html += "<tr><th>Month 7 to 4 contango</th>"
-        mini_html += f"<td>{c74:.2f}%</td><td>{d74:.2f}</td></tr></table></div>"
-        st.markdown(mini_html, unsafe_allow_html=True)
-
-    with st.expander("Ver tabla de contratos"):
-        show_cols = [c for c in ["DisplaySymbol", "Month", "Price", "PreviousClose", "Open", "Bid", "Ask", "High", "Low", "Change", "Expiration"] if c in curve.columns]
-        st.dataframe(curve[show_cols], use_container_width=True, hide_index=True)
-
+    curve = build_monthly_curve(n_months=8)
 except Exception as e:
-    st.error("No se pudo cargar la curva mensual de VIX desde CBOE.")
-    st.caption(f"Detalle técnico: {e}")
+    curve_error = str(e)
+
+try:
+    spot = fetch_vix_spot()
+except Exception as e:
+    spot_error = str(e)
+
+if curve is not None:
+    try:
+        strategy = build_strategy_snapshot(curve)
+    except Exception as e:
+        strategy_error = str(e)
+
+now_txt = datetime.now().strftime("%B %d, %Y · %H:%M")
+st.markdown(
+    f"""
+<div class="topbar">
+    <div>
+        <div class="brand">VX <span>Term Structure Monitor</span></div>
+        <div class="subline">Institutional dashboard for monthly VIX futures curve, regime diagnostics and short-vol execution monitor.</div>
+    </div>
+    <div class="micro">{now_txt} · Monthly curve: CBOE official VX contract history CSVs · Settlement overlay: CBOE settlement CSV · Spot: Yahoo fallback</div>
+</div>
+""",
+    unsafe_allow_html=True,
+)
+
+if curve is not None:
+    m1 = curve.iloc[0]
+    m2 = curve.iloc[1] if len(curve) > 1 else None
+    spot_last = spot.get("last") if spot else None
+    m1m2_pct = ((float(m2['term_price']) / float(m1['term_price']) - 1) * 100) if m2 is not None and pd.notna(m1['term_price']) and pd.notna(m2['term_price']) else None
+    vix_m1 = (float(m1['term_price']) - float(spot_last)) if (spot_last is not None and pd.notna(m1['term_price'])) else None
+    total_curve = ((float(curve.iloc[-1]['term_price']) / float(m1['term_price']) - 1) * 100) if len(curve) > 1 and pd.notna(curve.iloc[-1]['term_price']) and pd.notna(m1['term_price']) else None
+
+    st.markdown(
+        f"""
+<div class="kpi-grid">
+  <div class="kpi-card"><div class="kpi-label">VIX Spot</div><div class="kpi-value">{fmt_num(spot_last)}</div><div class="kpi-sub {value_class(spot.get('change') if spot else None)}">{fmt_signed(spot.get('change') if spot else None)} ({fmt_signed(spot.get('pct_change') if spot else None, suffix='%')})</div></div>
+  <div class="kpi-card"><div class="kpi-label">M1 · {m1['dte']} DTE</div><div class="kpi-value">{fmt_num(m1['term_price'])}</div><div class="kpi-sub">{m1['symbol']} · Last source: {m1['source_last']}</div></div>
+  <div class="kpi-card"><div class="kpi-label">M2</div><div class="kpi-value">{fmt_num(m2['term_price'] if m2 is not None else None)}</div><div class="kpi-sub">{m2['symbol'] if m2 is not None else '—'}</div></div>
+  <div class="kpi-card"><div class="kpi-label">VIX ↔ M1 basis</div><div class="kpi-value {value_class(vix_m1)}">{fmt_signed(vix_m1)}</div><div class="kpi-sub">M1 minus spot</div></div>
+  <div class="kpi-card"><div class="kpi-label">M1 → M2 contango</div><div class="kpi-value {value_class(m1m2_pct)}">{fmt_signed(m1m2_pct, suffix='%')}</div><div class="kpi-sub">Positive = contango</div></div>
+  <div class="kpi-card"><div class="kpi-label">M1 → M8 total curve</div><div class="kpi-value {value_class(total_curve)}">{fmt_signed(total_curve, suffix='%')}</div><div class="kpi-sub">Back-end slope</div></div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+if curve_error:
+    st.markdown(f'<div class="warnbox"><b>No se pudo construir la curva mensual de VIX desde CBOE.</b><br>Detalle técnico: {curve_error}</div>', unsafe_allow_html=True)
+
+if spot_error:
+    st.markdown(f'<div class="warnbox"><b>No se pudo cargar VIX spot.</b><br>Detalle técnico: {spot_error}</div>', unsafe_allow_html=True)
+
+term_tab, strategy_tab, diag_tab = st.tabs(["Term Structure", "Strategy Monitor", "Raw Data & Diagnostics"])
+
+with term_tab:
+    if curve is not None:
+        col_chart, col_table = st.columns([2.0, 1.15], gap="large")
+        with col_chart:
+            st.plotly_chart(build_term_structure_chart(curve, spot), use_container_width=True)
+            table_contango = pd.DataFrame(
+                {
+                    "Month": curve["m"],
+                    "% Contango vs Prev": curve["contango_pct_vs_prev"].map(lambda x: fmt_signed(x, suffix="%")),
+                    "Difference vs Prev": curve["difference_vs_prev"].map(fmt_signed),
+                }
+            )
+            st.dataframe(table_contango, use_container_width=True, hide_index=True)
+        with col_table:
+            st.markdown('<div class="panel-title">Monthly VX quote panel</div><div class="panel-sub">M1, M2 and the full curve are built from the nearest monthly VX expirations. The displayed term price uses CBOE LAST first, then CLOSE, then SETTLEMENT. OHLC columns come from the official CBOE contract history files.</div>', unsafe_allow_html=True)
+            display = curve[["m", "label", "symbol", "expiration", "dte", "term_price", "last", "close", "open", "high", "low", "settlement", "change"]].copy()
+            display["expiration"] = pd.to_datetime(display["expiration"]).dt.strftime("%Y-%m-%d")
+            for c in ["term_price", "last", "close", "open", "high", "low", "settlement", "change"]:
+                display[c] = display[c].map(fmt_num if c != "change" else fmt_signed)
+            st.dataframe(display, use_container_width=True, hide_index=True, height=500)
+    else:
+        st.info("Sin curva disponible.")
+
+with strategy_tab:
+    if strategy is not None:
+        banner_class = "banner-long" if strategy["final_signal"] else "banner-cash"
+        banner_text = "LONG" if strategy["final_signal"] else "CASH"
+        st.markdown('<div class="panel-title">Short-vol operating monitor</div><div class="panel-sub">Rules adapted from your notebook: timing via Bollinger Bands on VXX, filtered by live M1/M2 contango from the current CBOE monthly curve.</div>', unsafe_allow_html=True)
+
+        left, right = st.columns([1.05, 1.65], gap="large")
+        with left:
+            st.markdown('<div class="signal-box">', unsafe_allow_html=True)
+            st.markdown(f'<div class="signal-banner {banner_class}">{banner_text}</div>', unsafe_allow_html=True)
+            rows_html = f"""
+            <table class="rule-table">
+                <thead><tr><th>Component</th><th>Reading</th><th>Status</th></tr></thead>
+                <tbody>
+                    <tr><td>BB Timing</td><td>VXX &lt; SMA20</td><td class="{'pos' if strategy['bb_sig'] else 'neg'}">{'LONG' if strategy['bb_sig'] else 'CASH'}</td></tr>
+                    <tr><td>Contango Filter</td><td>M2 &gt; M1</td><td class="{'pos' if strategy['in_contango'] else 'neg'}">{fmt_signed(strategy['contango_pct'], suffix='%')}</td></tr>
+                    <tr><td>Final Signal</td><td>BB × Contango</td><td class="{'pos' if strategy['final_signal'] else 'neg'}">{'LONG' if strategy['final_signal'] else 'CASH'}</td></tr>
+                    <tr><td>Execution</td><td>Next session</td><td>{strategy['exec_date'].strftime('%Y-%m-%d')}</td></tr>
+                </tbody>
+            </table>
+            """
+            st.markdown(rows_html, unsafe_allow_html=True)
+
+            s_last = strategy["last"]
+            detail = pd.DataFrame(
+                [
+                    ["VXX Close", fmt_num(s_last['VXX_Close'])],
+                    ["SMA20", fmt_num(s_last['SMA20'])],
+                    ["BB Upper", fmt_num(s_last['BB_Upper'])],
+                    ["Distance vs SMA", fmt_signed(strategy['pct_to_sma'], suffix='%')],
+                    ["Distance vs Upper BB", fmt_signed(strategy['pct_to_upper'], suffix='%')],
+                    ["M1", f"{strategy['m1']['symbol']} · {fmt_num(strategy['m1']['term_price'])}"],
+                    ["M2", f"{strategy['m2']['symbol']} · {fmt_num(strategy['m2']['term_price'])}" if strategy['m2'] is not None else "—"],
+                    ["SVXY Close", fmt_num(s_last['SVXY_Close'])],
+                    ["SVIX Close", fmt_num(s_last['SVIX_Close'])],
+                    ["SPY Close", fmt_num(s_last['SPY_Close'])],
+                ],
+                columns=["Metric", "Value"],
+            )
+            st.dataframe(detail, use_container_width=True, hide_index=True, height=360)
+            st.markdown('</div>', unsafe_allow_html=True)
+        with right:
+            st.plotly_chart(build_vxx_timing_chart(strategy), use_container_width=True)
+    else:
+        if strategy_error:
+            st.markdown(f'<div class="warnbox"><b>No se pudo construir el monitor operativo.</b><br>Detalle técnico: {strategy_error}</div>', unsafe_allow_html=True)
+        else:
+            st.info("Monitor operativo no disponible.")
+
+with diag_tab:
+    st.markdown('<div class="panel-title">Diagnostics</div><div class="panel-sub">Raw tables used by the dashboard. This section is useful for validating whether the monthly curve is being sourced and merged correctly.</div>', unsafe_allow_html=True)
+    d1, d2 = st.columns(2)
+    with d1:
+        try:
+            live_df = fetch_cboe_live_table().copy()
+            if "expiration" in live_df.columns:
+                live_df["expiration"] = pd.to_datetime(live_df["expiration"], errors="coerce").dt.strftime("%Y-%m-%d")
+            st.markdown("**CBOE live table (raw filtered monthly rows)**")
+            st.dataframe(live_df, use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.error(f"Live table error: {e}")
+    with d2:
+        if curve is not None:
+            st.markdown("**Merged monthly curve used by the app**")
+            dbg = curve.copy()
+            dbg["expiration"] = pd.to_datetime(dbg["expiration"]).dt.strftime("%Y-%m-%d")
+            st.dataframe(dbg, use_container_width=True, hide_index=True)
+
+st.caption("Monthly curve uses CBOE VX product page for delayed last/settlement when available and CBOE individual contract history CSVs for close, open, high and low. Strategy logic adapted from your uploaded Monitor_Operativo_v3 notebook.")
