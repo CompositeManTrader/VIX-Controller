@@ -138,75 +138,168 @@ def fetch_vix_spot():
 def fetch_cboe_delayed_quotes():
     """
     Fetch VX futures from CBOE Delayed Quotes JSON API.
-    This is the same data shown at: https://www.cboe.com/delayed_quotes/futures/future_quotes
+    Tries multiple endpoints/strategies before falling back to Yahoo Finance.
     Returns only MONTHLY contracts (filters out weeklys).
     """
-    url = "https://cdn.cboe.com/api/global/delayed_quotes/futures/VX.json"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json",
-        "Referer": "https://www.cboe.com/delayed_quotes/futures/future_quotes",
-    }
     results = {}
     raw_rows = []
-    try:
-        r = requests.get(url, timeout=15, headers=headers)
-        if r.status_code != 200:
-            return results, raw_rows
 
-        data = r.json()
+    # ── Strategy 1: CBOE CDN JSON (primary) ──
+    cboe_urls = [
+        "https://cdn.cboe.com/api/global/delayed_quotes/futures/VX.json",
+        "https://www.cboe.com/data/alphashares/futures/VX.json",
+        "https://cdn.cboe.com/api/global/futures/delayed_quotes/VX.json",
+    ]
+    headers_list = [
+        {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.cboe.com/delayed_quotes/futures/future_quotes",
+            "Origin": "https://www.cboe.com",
+        },
+        {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+            "Accept": "application/json",
+        },
+    ]
 
-        # The JSON structure has a "data" key with list of contract objects
-        rows = data.get("data", [])
-        if not rows:
-            # Try alternate structures
-            if isinstance(data, list):
-                rows = data
-            elif "options" in data:
-                rows = data.get("options", [])
-
-        for row in rows:
-            symbol = row.get("symbol", "")
-
-            # ── FILTER: only monthly contracts ──
-            # Monthly: VX/J6, VX/K6 etc. — symbol starts with "VX/" and has NO digits before "/"
-            # Weekly:  VX12/H6, VX13/J6 etc. — has digits between "VX" and "/"
-            # Rule: after removing "VX", the part before "/" should be empty (monthly)
-            parts = symbol.split("/")
-            if len(parts) != 2:
+    rows = []
+    source_used = None
+    for url in cboe_urls:
+        for headers in headers_list:
+            try:
+                session = requests.Session()
+                session.headers.update(headers)
+                r = session.get(url, timeout=20)
+                if r.status_code == 200:
+                    data = r.json()
+                    rows = data.get("data", [])
+                    if not rows:
+                        if isinstance(data, list):
+                            rows = data
+                        elif "options" in data:
+                            rows = data.get("options", [])
+                        elif "futures" in data:
+                            rows = data.get("futures", [])
+                    if rows:
+                        source_used = "CBOE"
+                        break
+            except Exception:
                 continue
-            prefix = parts[0]  # e.g. "VX" for monthly, "VX12" for weekly
-            if prefix != "VX":
-                continue  # Skip weeklys (VX12, VX13, VX14, VX16, VX17, etc.)
+        if rows:
+            break
 
-            # Parse fields
-            expiration = row.get("expiration", "")
-            last_price = _safe_float(row.get("last", row.get("last_price", 0)))
-            change = _safe_float(row.get("change", 0))
-            high = _safe_float(row.get("high", 0))
-            low = _safe_float(row.get("low", 0))
-            settlement = _safe_float(row.get("settlement", row.get("settle", row.get("prev_settle", 0))))
-            volume = _safe_int(row.get("volume", row.get("total_volume", 0)))
+    # ── Strategy 2: CBOE settlement CSVs per contract (fallback) ──
+    if not rows:
+        try:
+            contracts = monthly_contracts()
+            for c in contracts:
+                exp_str = c['exp'].strftime('%Y-%m-%d')
+                csv_url = f"https://cdn.cboe.com/data/us/futures/market_statistics/historical_data/products/csv/VX/VX_{exp_str}.csv"
+                try:
+                    r2 = requests.get(csv_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+                    if r2.status_code == 200:
+                        df_c = pd.read_csv(io.StringIO(r2.text))
+                        df_c.columns = [col.strip().lower() for col in df_c.columns]
+                        if not df_c.empty:
+                            last_row = df_c.iloc[-1]
+                            settle = _safe_float(last_row.get('settle', last_row.get('settlement', 0)))
+                            if settle > 0:
+                                rows.append({
+                                    "symbol": c['symbol'],
+                                    "expiration": exp_str,
+                                    "last": settle,
+                                    "settlement": settle,
+                                    "change": 0,
+                                    "high": _safe_float(last_row.get('high', 0)),
+                                    "low": _safe_float(last_row.get('low', 0)),
+                                    "volume": _safe_int(last_row.get('total_volume', last_row.get('volume', 0))),
+                                })
+                                source_used = "CBOE_CSV"
+                except Exception:
+                    continue
+        except Exception:
+            pass
 
-            # Use LAST if available, otherwise Settlement
-            price = last_price if last_price and last_price > 0 else settlement
+    # ── Strategy 3: Yahoo Finance VX futures (last resort) ──
+    if not rows:
+        try:
+            yf_symbols = {
+                "VX/J6": "/VXJ26",
+                "VX/K6": "/VXK26",
+                "VX/M6": "/VXM26",
+                "VX/N6": "/VXN26",
+                "VX/Q6": "/VXQ26",
+                "VX/U6": "/VXU26",
+                "VX/V6": "/VXV26",
+            }
+            contracts = monthly_contracts()
+            for c in contracts[:7]:
+                yf_sym = f"VX{MC[c['month']]}{str(c['year'])[-2:]}.CFE"
+                try:
+                    h = yf.Ticker(yf_sym).history(period="5d")
+                    if not h.empty:
+                        price = round(float(h['Close'].iloc[-1]), 4)
+                        prev  = round(float(h['Close'].iloc[-2]), 4) if len(h) > 1 else price
+                        rows.append({
+                            "symbol": c['symbol'],
+                            "expiration": c['exp'].strftime('%Y-%m-%d'),
+                            "last": price,
+                            "settlement": prev,
+                            "change": round(price - prev, 4),
+                            "high": round(float(h['High'].iloc[-1]), 4),
+                            "low": round(float(h['Low'].iloc[-1]), 4),
+                            "volume": int(h['Volume'].iloc[-1]) if 'Volume' in h.columns else 0,
+                        })
+                        source_used = "Yahoo"
+                except Exception:
+                    continue
+        except Exception:
+            pass
 
-            if price and price > 0:
-                results[symbol] = dict(
-                    price=price,
-                    last=last_price,
-                    settlement=settlement,
-                    change=change,
-                    high=high if high and high > 0 else None,
-                    low=low if low and low > 0 else None,
-                    vol=volume,
-                    expiration=expiration,
-                    src='CBOE',
-                )
-                raw_rows.append(row)
+    if source_used:
+        st.sidebar.success(f"✅ Datos obtenidos: {source_used}")
+    else:
+        st.sidebar.warning("⚠️ No se pudo conectar con CBOE ni Yahoo Finance")
 
-    except Exception as e:
-        st.sidebar.error(f"CBOE API error: {e}")
+    # ── Parse rows into results dict ──
+    for row in rows:
+        symbol = row.get("symbol", "")
+
+        # ── FILTER: only monthly contracts ──
+        parts = symbol.split("/")
+        if len(parts) != 2:
+            continue
+        prefix = parts[0]
+        if prefix != "VX":
+            continue  # Skip weeklys (VX12, VX13, etc.)
+
+        # Parse fields
+        expiration = row.get("expiration", "")
+        last_price = _safe_float(row.get("last", row.get("last_price", 0)))
+        change = _safe_float(row.get("change", 0))
+        high = _safe_float(row.get("high", 0))
+        low = _safe_float(row.get("low", 0))
+        settlement = _safe_float(row.get("settlement", row.get("settle", row.get("prev_settle", 0))))
+        volume = _safe_int(row.get("volume", row.get("total_volume", 0)))
+
+        # Use LAST if available, otherwise Settlement
+        price = last_price if last_price and last_price > 0 else settlement
+
+        if price and price > 0:
+            results[symbol] = dict(
+                price=price,
+                last=last_price,
+                settlement=settlement,
+                change=change,
+                high=high if high and high > 0 else None,
+                low=low if low and low > 0 else None,
+                vol=volume,
+                expiration=expiration,
+                src=source_used or 'CBOE',
+            )
+            raw_rows.append(row)
 
     return results, raw_rows
 
@@ -645,8 +738,14 @@ with tab1:
         </table>""", unsafe_allow_html=True)
 
     if not prices:
-        st.warning("⚠️ No se pudieron obtener precios de futuros VIX del CBOE CDN. Esto puede ocurrir fuera de horario de mercado o si el CDN está temporalmente inaccesible.")
-        st.info("💡 Verifica que tengas acceso a `cdn.cboe.com` desde tu red. Los datos se actualizan después de cada sesión de trading.")
+        st.error("⚠️ No se pudieron obtener precios de futuros VIX (CBOE ni Yahoo Finance).")
+        st.markdown("""
+        **Posibles causas y soluciones:**
+        - Fuera de horario de mercado (datos disponibles 8:30 AM – 3:15 PM CT días hábiles)
+        - CBOE bloqueando peticiones desde Streamlit Cloud — prueba correr localmente
+        - Haz clic en **Refresh Now** en el sidebar para reintentar
+        - URLs intentadas: `cdn.cboe.com/api/global/delayed_quotes/futures/VX.json` y tickers Yahoo Finance
+        """)
 
     found = len(prices)
     st.caption(f"Contratos cargados: {found}/{N_MONTHS} · Solo mensuales (sin weeklys) · Fuente: CBOE CDN Settlement CSVs")
