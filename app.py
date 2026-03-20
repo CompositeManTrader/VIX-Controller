@@ -1,769 +1,789 @@
-import io
-import re
-from datetime import date, datetime, timedelta
-from typing import Dict, List, Optional
+"""
+VIX Controller — Bloomberg-Style Term Structure + Operational Monitor
+Data: CBOE CDN Settlement CSVs (monthly contracts only) + Yahoo Finance
+Auto-refresh: every 60 seconds
+"""
 
-import numpy as np
-import pandas as pd
-import plotly.graph_objects as go
-import requests
 import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
 import yfinance as yf
-from bs4 import BeautifulSoup
+from datetime import datetime, timedelta, date
+import requests, io, time, warnings, json
 
-st.set_page_config(
-    page_title="VX Term Structure Monitor",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
+warnings.filterwarnings("ignore")
 
-# =========================================================
-# STYLING
-# =========================================================
-st.markdown(
-    """
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CONFIG
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+st.set_page_config(page_title="VIX Controller", page_icon="🔴", layout="wide",
+                   initial_sidebar_state="collapsed")
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# BLOOMBERG CSS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+st.markdown("""
 <style>
-    :root {
-        --bg:#07111f;
-        --panel:#0c1829;
-        --panel-2:#0e2138;
-        --line:#1d3557;
-        --text:#e8eef8;
-        --muted:#90a4c3;
-        --accent:#4ea7ff;
-        --green:#38c172;
-        --red:#ff6b6b;
-        --amber:#e6b450;
-    }
-    .stApp {background: linear-gradient(180deg,#06101c 0%, #081524 100%);}
-    #MainMenu, footer, header {visibility:hidden;}
-    .block-container {max-width: 1380px; padding-top: 1.0rem; padding-bottom: 1rem;}
-    .topbar {
-        border-bottom: 1px solid rgba(78,167,255,0.18);
-        padding-bottom: 0.85rem;
-        margin-bottom: 1rem;
-        display:flex; justify-content:space-between; align-items:flex-end; gap:1rem;
-    }
-    .brand {font-size: 2.0rem; font-weight: 700; color: var(--text); letter-spacing:-0.03em;}
-    .brand span {color: var(--accent);}
-    .subline {color: var(--muted); font-size: 0.86rem;}
-    .micro {color: var(--muted); font-size: 0.76rem;}
-    .kpi-grid {display:grid; grid-template-columns: repeat(6, minmax(140px,1fr)); gap: 0.7rem; margin: 0.6rem 0 1rem;}
-    .kpi-card {
-        background: linear-gradient(180deg, rgba(12,24,41,0.96) 0%, rgba(9,19,33,0.96) 100%);
-        border: 1px solid rgba(78,167,255,0.16);
-        border-radius: 14px; padding: 0.8rem 1rem; min-height: 92px;
-        box-shadow: 0 8px 22px rgba(0,0,0,0.18);
-    }
-    .kpi-label {color: var(--muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.12em;}
-    .kpi-value {color: var(--text); font-size: 1.55rem; font-weight: 700; margin-top: 0.25rem;}
-    .kpi-sub {color: var(--muted); font-size: 0.78rem; margin-top: 0.22rem;}
-    .pos {color: var(--green)!important;}
-    .neg {color: var(--red)!important;}
-    .warnbox {
-        background: rgba(230,180,80,0.12);
-        border: 1px solid rgba(230,180,80,0.28);
-        color: #f6d98f; border-radius: 12px; padding: 0.9rem 1rem; margin: 0.6rem 0 1rem;
-    }
-    .panel-title {font-size: 1rem; color: var(--text); font-weight: 700; margin-bottom: 0.2rem;}
-    .panel-sub {font-size: 0.78rem; color: var(--muted); margin-bottom: 0.8rem;}
-    .signal-box {
-        background: linear-gradient(180deg, rgba(12,24,41,0.96) 0%, rgba(9,19,33,0.96) 100%);
-        border:1px solid rgba(78,167,255,0.16); border-radius: 16px; padding:1rem 1rem 0.8rem;
-    }
-    .signal-banner {
-        border-radius: 14px; padding: 1rem 1.2rem; text-align:center; font-size: 2rem; font-weight:800;
-        margin-bottom: 0.8rem; letter-spacing: 0.06em;
-    }
-    .banner-long {background: rgba(56,193,114,0.14); color: #7ee2a6; border:1px solid rgba(56,193,114,0.30);}
-    .banner-cash {background: rgba(255,107,107,0.14); color: #ff9a9a; border:1px solid rgba(255,107,107,0.30);}
-    .rule-table {width:100%; border-collapse:collapse; font-size:0.84rem;}
-    .rule-table th, .rule-table td {padding: 0.52rem 0.55rem; border-bottom:1px solid rgba(144,164,195,0.12);}
-    .rule-table th {text-align:left; color:var(--muted); font-weight:600; font-size:0.76rem; text-transform:uppercase; letter-spacing:0.08em;}
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Inter:wght@400;500;600;700;800&display=swap');
+:root{
+  --bg:#0D1117;--card:#161B22;--border:#30363D;
+  --g:#3FB950;--r:#F85149;--y:#D29922;--b:#58A6FF;--c:#39D2C0;
+  --t:#C9D1D9;--dim:#8B949E;--w:#F0F6FC;
+  --gbg:#0B2E13;--rbg:#3B1218;
+}
+.stApp{background:var(--bg);}
+#MainMenu,footer,header{visibility:hidden;}
+.block-container{padding:0.5rem 1.5rem;max-width:1400px;}
+
+/* Header bar */
+.hdr{display:flex;align-items:center;padding:0.5rem 0;border-bottom:2px solid #F7931A;margin-bottom:0.8rem;}
+.hdr .logo{font-family:'Inter',sans-serif;font-weight:800;font-size:1.3rem;color:#F7931A;letter-spacing:1px;}
+.hdr .sub{font-family:'JetBrains Mono',monospace;font-size:0.7rem;color:var(--dim);margin-left:auto;}
+
+/* Metric row */
+.mrow{display:flex;gap:4px;margin-bottom:0.6rem;flex-wrap:wrap;}
+.mpill{background:var(--card);border:1px solid var(--border);border-radius:4px;padding:0.4rem 0.7rem;flex:1;min-width:120px;text-align:center;}
+.mpill .ml{font-family:'JetBrains Mono',monospace;font-size:0.58rem;color:var(--dim);text-transform:uppercase;letter-spacing:0.6px;}
+.mpill .mv{font-family:'Inter',sans-serif;font-weight:700;font-size:1.15rem;}
+.mv.up{color:var(--g);}.mv.dn{color:var(--r);}.mv.nt{color:var(--b);}
+
+/* Contango table — VIXCentral style */
+.ctx{width:100%;border-collapse:collapse;font-family:'JetBrains Mono',monospace;font-size:0.78rem;margin:0.4rem 0;}
+.ctx td,.ctx th{padding:0.35rem 0.5rem;text-align:center;border:1px solid var(--border);}
+.ctx th{background:#1C2128;color:var(--dim);font-weight:500;font-size:0.65rem;text-transform:uppercase;}
+.ctx .pos{color:var(--g);}.ctx .neg{color:var(--r);}
+.ctx .hdr-cell{background:var(--card);color:var(--t);font-weight:600;text-align:left;width:120px;}
+
+/* Data table */
+.dtbl{width:100%;border-collapse:collapse;font-family:'JetBrains Mono',monospace;font-size:0.75rem;margin-top:0.5rem;}
+.dtbl th{color:var(--b);font-weight:500;padding:0.4rem 0.6rem;border-bottom:1px solid var(--border);font-size:0.62rem;text-transform:uppercase;letter-spacing:0.5px;text-align:center;}
+.dtbl td{padding:0.35rem 0.6rem;text-align:center;color:var(--t);border-bottom:1px solid rgba(255,255,255,0.03);}
+.dtbl tr:hover td{background:rgba(88,166,255,0.04);}
+
+/* Signal box */
+.sig-box{border-radius:6px;padding:1rem;text-align:center;border-width:2px;border-style:solid;}
+.sig-long{background:var(--gbg);border-color:var(--g);}
+.sig-cash{background:var(--rbg);border-color:var(--r);}
+.sig-box .sl{font-family:'Inter',sans-serif;font-weight:800;font-size:2rem;}
+.sig-box .sd{font-family:'JetBrains Mono',monospace;font-size:0.7rem;color:var(--dim);margin-top:2px;}
+
+/* Check items */
+.chk{display:flex;align-items:center;gap:0.5rem;padding:0.3rem 0;font-family:'JetBrains Mono',monospace;font-size:0.82rem;color:var(--t);}
+.chk .ok{color:var(--g);font-weight:700;}.chk .no{color:var(--r);font-weight:700;}
+
+/* Info card */
+.icard{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:0.8rem 1rem;margin-bottom:0.5rem;}
+.icard .ic-title{font-family:'Inter',sans-serif;font-weight:700;font-size:0.85rem;color:var(--w);margin-bottom:0.5rem;border-bottom:1px solid var(--border);padding-bottom:0.3rem;}
+.icard .ic-row{display:flex;justify-content:space-between;padding:0.2rem 0;font-family:'JetBrains Mono',monospace;font-size:0.8rem;}
+.icard .ic-label{color:var(--dim);}.icard .ic-val{color:var(--t);font-weight:500;}
+
+/* Tabs */
+.stTabs [data-baseweb="tab-list"]{gap:0;border-bottom:1px solid var(--border);}
+.stTabs [data-baseweb="tab"]{font-family:'Inter',sans-serif;font-weight:600;font-size:0.82rem;color:var(--dim);padding:0.5rem 1.5rem;}
+.stTabs [aria-selected="true"]{color:#F7931A !important;border-bottom:2px solid #F7931A !important;}
+[data-testid="stSidebar"]{background:var(--card);}
 </style>
-""",
-    unsafe_allow_html=True,
-)
+""", unsafe_allow_html=True)
 
-# =========================================================
-# CONSTANTS / HELPERS
-# =========================================================
-MONTH_CODES = {1: "F", 2: "G", 3: "H", 4: "J", 5: "K", 6: "M", 7: "N", 8: "Q", 9: "U", 10: "V", 11: "X", 12: "Z"}
-MONTH_NAMES_SHORT = {1: "Jan", 2: "Feb", 3: "Mar", 4: "Apr", 5: "May", 6: "Jun", 7: "Jul", 8: "Aug", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dec"}
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"}
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CONSTANTS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MC = {1:'F',2:'G',3:'H',4:'J',5:'K',6:'M',7:'N',8:'Q',9:'U',10:'V',11:'X',12:'Z'}
+MN = {1:'Jan',2:'Feb',3:'Mar',4:'Apr',5:'May',6:'Jun',7:'Jul',8:'Aug',9:'Sep',10:'Oct',11:'Nov',12:'Dec'}
 
+def vix_exp(year, month):
+    nm, ny = (month+1, year) if month < 12 else (1, year+1)
+    d1 = date(ny, nm, 1)
+    fri3 = d1 + timedelta(days=(4 - d1.weekday()) % 7 + 14)
+    return fri3 - timedelta(days=30)
 
-# ---------------- formatting ----------------
-def fmt_num(x: Optional[float], digits: int = 2, default: str = "—") -> str:
-    try:
-        if x is None or (isinstance(x, float) and np.isnan(x)):
-            return default
-        return f"{float(x):,.{digits}f}"
-    except Exception:
-        return default
-
-
-def fmt_signed(x: Optional[float], digits: int = 2, suffix: str = "") -> str:
-    try:
-        if x is None or (isinstance(x, float) and np.isnan(x)):
-            return "—"
-        return f"{float(x):+,.{digits}f}{suffix}"
-    except Exception:
-        return "—"
-
-
-def value_class(x: Optional[float]) -> str:
-    try:
-        if x is None or (isinstance(x, float) and np.isnan(x)):
-            return ""
-        if float(x) > 0:
-            return "pos"
-        if float(x) < 0:
-            return "neg"
-        return ""
-    except Exception:
-        return ""
-
-
-def clean_numeric_series(s: pd.Series) -> pd.Series:
-    return pd.to_numeric(
-        s.astype(str)
-        .str.replace(",", "", regex=False)
-        .str.replace("--", "", regex=False)
-        .str.replace("-", "", regex=False)
-        .str.strip(),
-        errors="coerce",
-    )
-
-
-# ---------------- VX calendar ----------------
-def vix_futures_expiration(year: int, month: int) -> date:
-    """Wednesday 30 days before the 3rd Friday of the following month."""
-    next_month = month + 1
-    next_year = year
-    if next_month > 12:
-        next_month = 1
-        next_year += 1
-    first = date(next_year, next_month, 1)
-    days_to_friday = (4 - first.weekday()) % 7
-    third_friday = first + timedelta(days=days_to_friday + 14)
-    return third_friday - timedelta(days=30)
-
-
-def active_monthly_contracts(ref: Optional[date] = None, n: int = 8) -> List[dict]:
+def monthly_contracts(ref=None, n=9):
     ref = ref or date.today()
-    out: List[dict] = []
-    month = ref.month
-    year = ref.year
-    for i in range(n + 6):
-        cm = ((month - 1 + i) % 12) + 1
-        cy = year + ((month - 1 + i) // 12)
-        exp = vix_futures_expiration(cy, cm)
+    out = []
+    m, y = ref.month, ref.year
+    for i in range(n + 4):
+        cm = ((m - 1 + i) % 12) + 1
+        cy = y + ((m - 1 + i) // 12)
+        exp = vix_exp(cy, cm)
         if exp >= ref:
-            code = MONTH_CODES[cm]
-            out.append(
-                {
-                    "month": cm,
-                    "year": cy,
-                    "exp": exp,
-                    "dte": (exp - ref).days,
-                    "label": f"{MONTH_NAMES_SHORT[cm]} {str(cy)[-2:]}",
-                    "slash_symbol": f"VX/{code}{str(cy)[-1]}",
-                    "legacy_symbol": f"VX{code}{str(cy)[-2:]}",
-                }
-            )
+            code = MC[cm]
+            yr2 = str(cy)[-2:]
+            out.append(dict(
+                month=cm, year=cy, exp=exp, dte=(exp - ref).days,
+                label=f"{MN[cm]}", code=f"M{len(out)+1}",
+                symbol=f"VX/{code}{yr2}",
+                cboe_sym=f"VX_{exp.strftime('%Y-%m-%d')}",
+            ))
         if len(out) >= n:
             break
     return out
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# DATA LAYER
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def is_monthly_cboe_symbol(symbol: str) -> bool:
-    if not isinstance(symbol, str):
-        return False
-    symbol = symbol.strip().upper()
-    return re.fullmatch(r"VX/[FGHJKMNQUVXZ]\d", symbol) is not None
-
-
-# =========================================================
-# CBOE FETCHERS
-# =========================================================
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    rename = {}
-    for c in df.columns:
-        cs = str(c).strip().lower()
-        if "symbol" in cs:
-            rename[c] = "symbol"
-        elif "expiration" in cs:
-            rename[c] = "expiration"
-        elif cs in {"last", "last price"} or "last price" in cs:
-            rename[c] = "last"
-        elif "change" in cs:
-            rename[c] = "change"
-        elif cs == "high" or cs.endswith(" high"):
-            rename[c] = "high"
-        elif cs == "low" or cs.endswith(" low"):
-            rename[c] = "low"
-        elif cs in {"settlement", "settle", "settlement price", "price", "daily settlement price"} or "settle" in cs:
-            rename[c] = "settlement"
-        elif "volume" in cs:
-            rename[c] = "volume"
-        elif cs in {"open", "opening price"}:
-            rename[c] = "open"
-        elif cs in {"close", "closing price"}:
-            rename[c] = "close"
-    return df.rename(columns=rename)
-
-
-@st.cache_data(ttl=120)
-def fetch_cboe_live_table() -> pd.DataFrame:
-    """Get delayed VX market-data table from the Cboe VIX futures product page.
-    First tries HTML tables; then falls back to text parsing from page content.
-    """
-    url = "https://www.cboe.com/en/tradable-products/vix/vix-futures/"
-    resp = requests.get(url, headers=HEADERS, timeout=20)
-    resp.raise_for_status()
-    html = resp.text
-
-    # Attempt 1: pandas.read_html
+@st.cache_data(ttl=55)
+def fetch_vix_spot():
     try:
-        tables = pd.read_html(io.StringIO(html))
-        for t in tables:
-            t = normalize_columns(t)
-            cols = set(t.columns)
-            if {"symbol", "expiration"}.issubset(cols):
-                if "symbol" in t.columns:
-                    t["symbol"] = t["symbol"].astype(str).str.strip()
-                    t = t[t["symbol"].apply(is_monthly_cboe_symbol)].copy()
-                    if not t.empty:
-                        for c in ["last", "change", "high", "low", "settlement", "volume"]:
-                            if c in t.columns:
-                                t[c] = clean_numeric_series(t[c])
-                        t["expiration"] = pd.to_datetime(t["expiration"], errors="coerce")
-                        return t
-    except Exception:
-        pass
+        h = yf.Ticker("^VIX").history(period="5d")
+        if not h.empty:
+            c = round(float(h['Close'].iloc[-1]), 2)
+            p = round(float(h['Close'].iloc[-2]), 2) if len(h) > 1 else c
+            return dict(price=c, prev=p, chg=round(c - p, 2))
+    except: pass
+    return None
 
-    # Attempt 2: parse visible text section
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text("\n", strip=True)
-    marker = "Symbol Expiration Last Price Change High Low Settlement Volume"
-    if marker not in text:
-        raise ValueError("No encontré la sección de market data de VIX futures en CBOE.")
-    section = text.split(marker, 1)[1]
-    lines = [ln.strip() for ln in section.splitlines() if ln.strip()]
-    rows = []
-    row_regex = re.compile(r"^(VX\d{0,2}/[FGHJKMNQUVXZ]\d)\s+(\d{2}/\d{2}/\d{4})(.*)$")
-    number_regex = re.compile(r"[-+]?\d+(?:\.\d+)?")
+@st.cache_data(ttl=55)
+def fetch_cboe_contracts(contracts_json):
+    """Fetch settlement prices from CBOE CDN individual contract CSVs."""
+    contracts = json.loads(contracts_json)
+    results = {}
+    for c in contracts:
+        url = f"https://cdn.cboe.com/data/us/futures/market_statistics/historical_data/products/csv/VX/{c['cboe_sym']}.csv"
+        try:
+            r = requests.get(url, timeout=12,
+                             headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code == 200 and len(r.text) > 100:
+                df = pd.read_csv(io.StringIO(r.text))
+                if df.empty:
+                    continue
+                last = df.iloc[-1]
+                price = None
+                for col in ['Settle', 'Close', 'Last']:
+                    if col in df.columns and pd.notna(last.get(col)) and float(last[col]) > 0:
+                        price = round(float(last[col]), 2)
+                        break
+                if price:
+                    prev = None
+                    if len(df) > 1:
+                        prev_row = df.iloc[-2]
+                        for col in ['Settle', 'Close', 'Last']:
+                            if col in df.columns and pd.notna(prev_row.get(col)) and float(prev_row[col]) > 0:
+                                prev = round(float(prev_row[col]), 2)
+                                break
+                    # Get volume and OI from last row
+                    vol = int(last.get('Total Volume', last.get('Volume', 0))) if 'Total Volume' in df.columns or 'Volume' in df.columns else 0
+                    oi = int(last.get('Open Interest', 0)) if 'Open Interest' in df.columns else 0
+                    hi = round(float(last.get('High', 0)), 2) if 'High' in df.columns and pd.notna(last.get('High')) else None
+                    lo = round(float(last.get('Low', 0)), 2) if 'Low' in df.columns and pd.notna(last.get('Low')) else None
+                    trade_date = str(last.get('Trade Date', ''))
 
-    for line in lines:
-        if line.startswith("#") or line.startswith("The Next Generation"):
-            break
-        m = row_regex.match(line)
-        if not m:
+                    results[c['symbol']] = dict(
+                        price=price, prev=prev, vol=vol, oi=oi,
+                        high=hi, low=lo, trade_date=trade_date, src='CBOE'
+                    )
+        except:
             continue
-        symbol, expiration, tail = m.groups()
-        if not is_monthly_cboe_symbol(symbol):
-            continue
-        nums = [float(x) for x in number_regex.findall(tail)]
-        row = {"symbol": symbol, "expiration": pd.to_datetime(expiration, errors="coerce")}
-        # Heuristic mapping. Most important fields are last and settlement.
-        if len(nums) >= 5:
-            row.update({"last": nums[0], "change": nums[1], "high": nums[2], "low": nums[3], "settlement": nums[4]})
-        elif len(nums) == 4:
-            row.update({"last": nums[0], "high": nums[1], "low": nums[2], "settlement": nums[3]})
-        elif len(nums) == 2:
-            row.update({"last": nums[0], "settlement": nums[1]})
-        elif len(nums) == 1:
-            row.update({"settlement": nums[0]})
-        rows.append(row)
+    return results
 
-    df = pd.DataFrame(rows)
-    if df.empty:
-        raise ValueError("No se pudo parsear la curva live de CBOE.")
-    return df
+@st.cache_data(ttl=55)
+def fetch_etps():
+    """Fetch VXX, SVXY, SVIX, SPY from Yahoo."""
+    out = {}
+    for name, sym in [("VXX","VXX"),("SVXY","SVXY"),("SVIX","SVIX"),("SPY","SPY")]:
+        try:
+            h = yf.Ticker(sym).history(period="5d")
+            if not h.empty:
+                out[name] = dict(
+                    close=round(float(h['Close'].iloc[-1]), 2),
+                    open=round(float(h['Open'].iloc[-1]), 2),
+                    prev=round(float(h['Close'].iloc[-2]), 2) if len(h) > 1 else None,
+                )
+        except: continue
+    return out
 
-
-@st.cache_data(ttl=300)
-def fetch_contract_daily_history(expiration: str) -> pd.DataFrame:
-    url = f"https://cdn.cboe.com/data/us/futures/market_statistics/historical_data/products/csv/VX/VX_{expiration}.csv"
-    resp = requests.get(url, headers=HEADERS, timeout=20)
-    resp.raise_for_status()
-    df = pd.read_csv(io.StringIO(resp.text))
-    df = normalize_columns(df)
-    # Normalize common headers from product CSVs
-    extra_map = {}
-    for c in df.columns:
-        cs = str(c).strip().lower()
-        if cs == "trade date":
-            extra_map[c] = "trade_date"
-        elif cs == "open":
-            extra_map[c] = "open"
-        elif cs == "high":
-            extra_map[c] = "high"
-        elif cs == "low":
-            extra_map[c] = "low"
-        elif cs == "close":
-            extra_map[c] = "close"
-        elif cs in {"last", "last sale"}:
-            extra_map[c] = "last"
-        elif "settle" in cs or cs == "price":
-            extra_map[c] = "settlement"
-        elif "volume" in cs:
-            extra_map[c] = "volume"
-    df = df.rename(columns=extra_map)
-    if "trade_date" in df.columns:
-        df["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce")
-    for c in ["open", "high", "low", "close", "last", "settlement", "volume"]:
-        if c in df.columns:
-            df[c] = clean_numeric_series(df[c])
-    return df
-
-
-@st.cache_data(ttl=120)
-def fetch_vix_spot() -> Optional[dict]:
-    try:
-        ticker = yf.Ticker("^VIX")
-        hist = ticker.history(period="7d", auto_adjust=False)
-        if hist.empty:
-            return None
-        latest = hist.iloc[-1]
-        prev_close = float(hist["Close"].iloc[-2]) if len(hist) > 1 else float(latest["Close"])
-        return {
-            "last": float(latest["Close"]),
-            "open": float(latest["Open"]),
-            "high": float(latest["High"]),
-            "low": float(latest["Low"]),
-            "close": float(latest["Close"]),
-            "prev_close": prev_close,
-            "change": float(latest["Close"]) - prev_close,
-            "pct_change": ((float(latest["Close"]) / prev_close) - 1) * 100 if prev_close else None,
-            "timestamp": hist.index[-1],
-        }
-    except Exception:
-        return None
-
-
-@st.cache_data(ttl=600)
-def build_monthly_curve(n_months: int = 8) -> pd.DataFrame:
-    contracts = active_monthly_contracts(n=n_months)
-    live = fetch_cboe_live_table()
-    live = normalize_columns(live)
-    if "symbol" not in live.columns:
-        raise ValueError("CBOE live table no trajo columna de símbolo.")
-    live["symbol"] = live["symbol"].astype(str).str.strip()
-    live = live[live["symbol"].apply(is_monthly_cboe_symbol)].copy()
-    if "expiration" in live.columns:
-        live["expiration"] = pd.to_datetime(live["expiration"], errors="coerce")
-
-    live_map = {row["symbol"]: row.to_dict() for _, row in live.iterrows()}
-
-    rows = []
-    for idx, c in enumerate(contracts, start=1):
-        hist_df = fetch_contract_daily_history(c["exp"].strftime("%Y-%m-%d"))
-        if hist_df.empty:
-            hist_row = {}
-        else:
-            hist_df = hist_df.sort_values("trade_date") if "trade_date" in hist_df.columns else hist_df
-            hist_row = hist_df.iloc[-1].to_dict()
-        lrow = live_map.get(c["slash_symbol"], {})
-
-        close_px = hist_row.get("close")
-        last_px = lrow.get("last")
-        if pd.isna(last_px) or last_px in (None, 0):
-            last_px = close_px
-        settlement_px = lrow.get("settlement") if pd.notna(lrow.get("settlement")) else hist_row.get("settlement")
-        open_px = hist_row.get("open")
-        high_px = hist_row.get("high")
-        low_px = hist_row.get("low")
-        prev_close = None
-        if isinstance(hist_df, pd.DataFrame) and not hist_df.empty and len(hist_df) >= 2 and "close" in hist_df.columns:
-            prev_close = hist_df["close"].iloc[-2]
-        change_px = None
-        if pd.notna(lrow.get("change")):
-            change_px = lrow.get("change")
-        elif pd.notna(last_px) and pd.notna(prev_close):
-            change_px = float(last_px) - float(prev_close)
-
-        rows.append(
-            {
-                "m": f"M{idx}",
-                "label": c["label"],
-                "symbol": c["slash_symbol"],
-                "expiration": c["exp"],
-                "dte": c["dte"],
-                "last": last_px,
-                "close": close_px,
-                "open": open_px,
-                "high": high_px,
-                "low": low_px,
-                "settlement": settlement_px,
-                "change": change_px,
-                "prev_close": prev_close,
-                "source_last": "CBOE product page" if pd.notna(lrow.get("last")) else "CBOE contract CSV fallback",
-                "source_ohlc": "CBOE contract CSV",
-            }
-        )
-
-    curve = pd.DataFrame(rows)
-    curve["term_price"] = curve["last"].where(curve["last"].notna(), curve["close"])
-    curve["contango_pct_vs_prev"] = (curve["term_price"] / curve["term_price"].shift(1) - 1) * 100
-    curve["difference_vs_prev"] = curve["term_price"] - curve["term_price"].shift(1)
-    return curve
-
-
-# =========================================================
-# STRATEGY
-# =========================================================
-@st.cache_data(ttl=300)
-def fetch_strategy_market_data(days: int = 320) -> pd.DataFrame:
+@st.cache_data(ttl=55)
+def fetch_bb_data():
+    """Fetch VXX data + compute Bollinger Bands for operational monitor."""
     end = datetime.now()
-    start = end - timedelta(days=days)
-    symbols = {"VXX": "VXX", "SVXY": "SVXY", "SVIX": "SVIX", "VIX": "^VIX", "SPY": "SPY"}
-    out = pd.DataFrame()
-    for alias, symbol in symbols.items():
-        df = yf.download(symbol, start=start, end=end, progress=False, auto_adjust=False)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        if df.empty:
-            continue
-        out[f"{alias}_Open"] = df["Open"]
-        out[f"{alias}_High"] = df["High"]
-        out[f"{alias}_Low"] = df["Low"]
-        out[f"{alias}_Close"] = df["Close"]
-    out = out.sort_index().dropna(subset=["VXX_Close"], how="any")
-    out["SMA20"] = out["VXX_Close"].rolling(20).mean()
-    out["STD20"] = out["VXX_Close"].rolling(20).std()
-    out["BB_Upper"] = out["SMA20"] + 2.0 * out["STD20"]
-    out["BB_Lower"] = out["SMA20"] - 2.0 * out["STD20"]
+    start = end - timedelta(days=300)
+    syms = {"VXX":"VXX","SVXY":"SVXY","SVIX":"SVIX","VIX":"^VIX","SPY":"SPY"}
+    data = pd.DataFrame()
+    for name, sym in syms.items():
+        try:
+            df_t = yf.download(sym, start=start, end=end, progress=False)
+            if isinstance(df_t.columns, pd.MultiIndex):
+                df_t.columns = df_t.columns.get_level_values(0)
+            if len(df_t) > 0:
+                data[f"{name}_Close"] = df_t["Close"]
+                data[f"{name}_Open"] = df_t["Open"]
+        except: continue
+    if data.empty:
+        return None
+    data = data.sort_index()
+    vxx = data["VXX_Close"]
+    data["SMA20"] = vxx.rolling(20).mean()
+    data["STD20"] = vxx.rolling(20).std()
+    data["BB_Upper"] = data["SMA20"] + 2.0 * data["STD20"]
+    data["BB_Lower"] = data["SMA20"] - 2.0 * data["STD20"]
 
-    clean = out.dropna(subset=["SMA20", "BB_Upper"]).copy()
+    clean = data.dropna(subset=["SMA20"]).copy()
     pos = 0
-    state = []
-    for _, row in clean.iterrows():
-        p = row["VXX_Close"]
-        sma = row["SMA20"]
-        upper = row["BB_Upper"]
-        if pos == 0 and p < sma:
-            pos = 1
-        elif pos == 1 and p > upper:
-            pos = 0
-        state.append(pos)
-    clean["bb_sig"] = state
+    bb_list = []
+    for i in range(len(clean)):
+        p = clean["VXX_Close"].iloc[i]
+        s = clean["SMA20"].iloc[i]
+        u = clean["BB_Upper"].iloc[i]
+        if pd.isna(s) or pd.isna(u) or pd.isna(p):
+            bb_list.append(pos); continue
+        if pos == 0 and p < s: pos = 1
+        elif pos == 1 and p > u: pos = 0
+        bb_list.append(pos)
+    clean["bb_sig"] = bb_list
     return clean
 
+def cpct(p1, p2):
+    if p1 and p2 and p1 > 0:
+        return round((p2 - p1) / p1 * 100, 2)
+    return None
 
-def build_strategy_snapshot(curve: pd.DataFrame) -> dict:
-    data = fetch_strategy_market_data()
-    last = data.iloc[-1]
-    prev = data.iloc[-2] if len(data) >= 2 else last
-    m1 = curve.iloc[0]
-    m2 = curve.iloc[1] if len(curve) > 1 else None
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CHART BUILDERS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    contango_pct = None
-    in_contango = False
-    if m2 is not None and pd.notna(m1["term_price"]) and pd.notna(m2["term_price"]):
-        contango_pct = (float(m2["term_price"]) / float(m1["term_price"]) - 1) * 100
-        in_contango = float(m2["term_price"]) > float(m1["term_price"])
-
-    bb_sig = int(last["bb_sig"])
-    vxx_below_sma = float(last["VXX_Close"]) < float(last["SMA20"])
-    vxx_above_upper = float(last["VXX_Close"]) > float(last["BB_Upper"])
-    final_signal = int(bb_sig and in_contango)
-
-    exec_date = pd.Timestamp(data.index[-1]).to_pydatetime().date() + timedelta(days=1)
-    while exec_date.weekday() >= 5:
-        exec_date += timedelta(days=1)
-
-    return {
-        "data": data,
-        "last": last,
-        "prev": prev,
-        "m1": m1,
-        "m2": m2,
-        "contango_pct": contango_pct,
-        "in_contango": in_contango,
-        "bb_sig": bb_sig,
-        "final_signal": final_signal,
-        "vxx_below_sma": vxx_below_sma,
-        "vxx_above_upper": vxx_above_upper,
-        "pct_to_sma": (float(last["VXX_Close"]) / float(last["SMA20"]) - 1) * 100,
-        "pct_to_upper": (float(last["VXX_Close"]) / float(last["BB_Upper"]) - 1) * 100,
-        "exec_date": exec_date,
-    }
-
-
-# =========================================================
-# CHARTS
-# =========================================================
-
-def build_term_structure_chart(curve: pd.DataFrame, spot: Optional[dict]) -> go.Figure:
+def build_term_chart(vix_spot, contracts, fdata, show_prev=True):
+    """VIXCentral-faithful term structure chart."""
     fig = go.Figure()
-    x = curve["label"].tolist()
 
-    fig.add_trace(
-        go.Scatter(
-            x=x,
-            y=curve["term_price"],
-            mode="lines+markers+text",
-            text=[fmt_num(v, 2) for v in curve["term_price"]],
-            textposition="top center",
-            name="Last / Term Price",
-            line=dict(color="#39a0ff", width=3.2, shape="spline"),
-            marker=dict(size=8, color="#39a0ff"),
-            hovertemplate="<b>%{x}</b><br>Term Price: %{y:.2f}<extra></extra>",
-        )
-    )
+    xlbl, xpos, yt, yp = [], [], [], []
+    for i, c in enumerate(contracts):
+        xlbl.append(c['label'])
+        xpos.append(i)
+        s = c['symbol']
+        yt.append(fdata[s]['price'] if s in fdata else None)
+        yp.append(fdata[s].get('prev') if s in fdata else None)
 
-    series_meta = [
-        ("close", "Close", "#A8B3C7", "dot"),
-        ("open", "Open", "#F2C14E", "dot"),
-        ("high", "High", "#4CD7A2", "dot"),
-        ("low", "Low", "#FF7F7F", "dot"),
-    ]
-    for col, name, color, dash in series_meta:
-        if col in curve.columns and curve[col].notna().any():
-            fig.add_trace(
-                go.Scatter(
-                    x=x,
-                    y=curve[col],
-                    mode="lines+markers",
-                    name=name,
-                    line=dict(color=color, width=1.6, dash=dash),
-                    marker=dict(size=5, color=color),
-                    visible="legendonly" if name != "Close" else True,
-                    hovertemplate=f"<b>%{{x}}</b><br>{name}: %{{y:.2f}}<extra></extra>",
-                )
-            )
+    vx = [x for x, y in zip(xpos, yt) if y]; vy = [y for y in yt if y]
 
-    if spot and spot.get("last") is not None:
+    # Today's curve — blue like VIXCentral
+    if vy:
+        fig.add_trace(go.Scatter(
+            x=vx, y=vy, mode='lines+markers+text',
+            name='Last', line=dict(color='#4A90D9', width=3, shape='spline'),
+            marker=dict(size=9, color='#4A90D9', line=dict(width=2, color='#0D1117')),
+            text=[f"{v:.3f}" if v else "" for v in vy],
+            textposition='top center',
+            textfont=dict(size=10, color='#C9D1D9', family='JetBrains Mono'),
+            hovertemplate='%{text}<extra></extra>',
+        ))
+
+    # Previous day — gray dotted
+    if show_prev:
+        pvx = [x for x, y in zip(xpos, yp) if y]
+        pvy = [y for y in yp if y]
+        if len(pvy) >= 2:
+            fig.add_trace(go.Scatter(
+                x=pvx, y=pvy, mode='lines+markers',
+                name='Previous Close', line=dict(color='#8B949E', width=1.5, dash='dot', shape='spline'),
+                marker=dict(size=5, color='#8B949E', symbol='diamond'),
+                hovertemplate='Prev: %{y:.3f}<extra></extra>',
+            ))
+
+    # VIX Index — green dashed line across full chart
+    if vix_spot:
         fig.add_hline(
-            y=float(spot["last"]),
-            line_width=2,
-            line_color="#6DD36F",
-            line_dash="dash",
-            annotation_text=f"VIX Spot {spot['last']:.2f}",
-            annotation_position="top right",
-            annotation_font_color="#6DD36F",
+            y=vix_spot['price'], line_dash="dash", line_color="#3FB950", line_width=2,
+            annotation_text=f"  {vix_spot['price']:.2f}",
+            annotation_position="right",
+            annotation_font=dict(size=12, color="#3FB950", family="Inter"),
         )
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode='lines',
+            name='VIX Index', line=dict(color='#3FB950', width=2, dash='dash'),
+            showlegend=True,
+        ))
+
+    all_y = vy + ([vix_spot['price']] if vix_spot else [])
+    y_min = min(all_y) - 1.5 if all_y else 15
+    y_max = max(all_y) + 1.5 if all_y else 30
 
     fig.update_layout(
-        title=dict(text="VIX Futures Term Structure", x=0.5, font=dict(size=26, color="#F3F7FF")),
-        paper_bgcolor="#081321",
-        plot_bgcolor="#0A182A",
-        font=dict(color="#E6EEF9"),
-        height=560,
-        margin=dict(l=40, r=30, t=80, b=55),
-        legend=dict(
-            orientation="v",
-            yanchor="top",
-            y=1,
-            xanchor="left",
-            x=1.01,
-            bgcolor="rgba(8,19,33,0.7)",
-            bordercolor="rgba(61,165,255,0.15)",
-            borderwidth=1,
+        title=dict(
+            text="<b>VIX Futures Term Structure</b><br><sup>Source: CBOE Delayed Quotes · vixcontroller</sup>",
+            font=dict(size=15, color='#C9D1D9', family='Inter'), x=0.5,
         ),
+        template='plotly_dark',
+        paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
+        height=420, margin=dict(l=50, r=30, t=65, b=50),
         xaxis=dict(
-            title="Future Month",
-            gridcolor="rgba(168,179,199,0.10)",
-            zeroline=False,
-            showline=True,
-            linecolor="rgba(168,179,199,0.18)",
+            tickvals=xpos, ticktext=xlbl,
+            tickfont=dict(size=11, color='#8B949E', family='JetBrains Mono'),
+            gridcolor='#21262D', showline=True, linecolor='#30363D',
+            title=dict(text="Future Month", font=dict(size=11, color='#8B949E', family='Inter')),
         ),
         yaxis=dict(
-            title="Volatility",
-            gridcolor="rgba(168,179,199,0.10)",
-            zeroline=False,
-            showline=True,
-            linecolor="rgba(168,179,199,0.18)",
+            range=[y_min, y_max],
+            title=dict(text="Volatility", font=dict(size=11, color='#8B949E', family='Inter')),
+            tickfont=dict(size=11, color='#8B949E', family='JetBrains Mono'),
+            gridcolor='#21262D', showline=True, linecolor='#30363D',
         ),
-        hovermode="x unified",
+        legend=dict(
+            orientation='v', yanchor='top', y=0.99, xanchor='right', x=0.99,
+            bgcolor='rgba(22,27,34,0.9)', bordercolor='#30363D', borderwidth=1,
+            font=dict(size=10, color='#C9D1D9', family='JetBrains Mono'),
+        ),
+        hoverlabel=dict(bgcolor='#1C2128', bordercolor='#58A6FF',
+                        font=dict(size=11, family='JetBrains Mono', color='#C9D1D9')),
+        hovermode='x unified',
     )
     return fig
 
 
-def build_vxx_timing_chart(strategy: dict) -> go.Figure:
-    data = strategy["data"].tail(120).copy()
+def build_bb_chart(clean, window=120):
+    """VXX + Bollinger Bands chart for operational monitor."""
+    p = clean.tail(window).copy()
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=data.index, y=data["VXX_Close"], mode="lines", name="VXX Close", line=dict(color="#4ea7ff", width=2.4)))
-    fig.add_trace(go.Scatter(x=data.index, y=data["SMA20"], mode="lines", name="SMA20", line=dict(color="#c0cad8", width=1.5)))
-    fig.add_trace(go.Scatter(x=data.index, y=data["BB_Upper"], mode="lines", name="BB Upper", line=dict(color="#ff8a80", width=1.4, dash="dot")))
-    fig.add_trace(go.Scatter(x=data.index, y=data["BB_Lower"], mode="lines", name="BB Lower", line=dict(color="#56d364", width=1.2, dash="dot")))
+
+    # BB bands fill
+    fig.add_trace(go.Scatter(
+        x=p.index, y=p["BB_Upper"], mode='lines', name='BB Upper',
+        line=dict(color='#F85149', width=1.2),
+        showlegend=True,
+    ))
+    fig.add_trace(go.Scatter(
+        x=p.index, y=p["BB_Lower"], mode='lines', name='BB Lower',
+        line=dict(color='#F85149', width=0.5),
+        fill='tonexty', fillcolor='rgba(88,166,255,0.03)',
+        showlegend=False,
+    ))
+    # SMA
+    fig.add_trace(go.Scatter(
+        x=p.index, y=p["SMA20"], mode='lines', name='SMA(20)',
+        line=dict(color='#58A6FF', width=1.5, dash='dash'),
+    ))
+    # VXX
+    fig.add_trace(go.Scatter(
+        x=p.index, y=p["VXX_Close"], mode='lines', name='VXX Close',
+        line=dict(color='#F0F6FC', width=2),
+    ))
+
+    # Color background by BB signal
+    for i in range(1, len(p)):
+        clr = 'rgba(63,185,80,0.06)' if p["bb_sig"].iloc[i] == 1 else 'rgba(248,81,73,0.03)'
+        fig.add_vrect(x0=p.index[i-1], x1=p.index[i], fillcolor=clr, layer="below", line_width=0)
+
+    # Entry/Exit arrows
+    for i in range(1, len(p)):
+        if p["bb_sig"].iloc[i] == 1 and p["bb_sig"].iloc[i-1] == 0:
+            fig.add_annotation(x=p.index[i], y=p["VXX_Close"].iloc[i],
+                text="▲ ENTRY", showarrow=True, arrowhead=2, arrowcolor="#3FB950",
+                font=dict(size=9, color="#3FB950", family="JetBrains Mono"),
+                ax=0, ay=25)
+        elif p["bb_sig"].iloc[i] == 0 and p["bb_sig"].iloc[i-1] == 1:
+            fig.add_annotation(x=p.index[i], y=p["VXX_Close"].iloc[i],
+                text="▼ EXIT", showarrow=True, arrowhead=2, arrowcolor="#F85149",
+                font=dict(size=9, color="#F85149", family="JetBrains Mono"),
+                ax=0, ay=-25)
+
+    # Today marker
+    fig.add_trace(go.Scatter(
+        x=[p.index[-1]], y=[p["VXX_Close"].iloc[-1]],
+        mode='markers', name='Today',
+        marker=dict(size=12, color='#D29922', line=dict(width=2, color='white')),
+        showlegend=False,
+    ))
+
     fig.update_layout(
-        height=420,
-        paper_bgcolor="#0b1728",
-        plot_bgcolor="#0b1728",
-        font=dict(color="#d7e4f5"),
-        margin=dict(l=30, r=20, t=45, b=30),
-        title=dict(text="VXX Timing Model — Bollinger Bands (20, 2σ)", x=0.5),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        xaxis=dict(gridcolor="rgba(144,164,195,0.08)"),
-        yaxis=dict(gridcolor="rgba(144,164,195,0.08)", title="Price"),
-        hovermode="x unified",
+        title=dict(text="<b>VXX + Bollinger Bands</b><sup>  (BB timing — contango from term structure)</sup>",
+                   font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
+        template='plotly_dark',
+        paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
+        height=380, margin=dict(l=50, r=30, t=55, b=40),
+        xaxis=dict(gridcolor='#21262D', tickfont=dict(size=10, color='#8B949E', family='JetBrains Mono')),
+        yaxis=dict(title=dict(text="VXX", font=dict(size=11, color='#8B949E')),
+                   gridcolor='#21262D', tickfont=dict(size=10, color='#8B949E', family='JetBrains Mono')),
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, bgcolor='rgba(0,0,0,0)',
+                    font=dict(size=9, color='#8B949E', family='JetBrains Mono')),
+        hovermode='x unified',
     )
     return fig
 
 
-# =========================================================
-# UI
-# =========================================================
-curve_error = None
-spot_error = None
-strategy_error = None
-curve = None
-spot = None
-strategy = None
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# AUTO-REFRESH (every 60s)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+if "last_refresh" not in st.session_state:
+    st.session_state.last_refresh = time.time()
 
-try:
-    curve = build_monthly_curve(n_months=8)
-except Exception as e:
-    curve_error = str(e)
+elapsed = time.time() - st.session_state.last_refresh
+if elapsed > 60:
+    st.session_state.last_refresh = time.time()
+    st.cache_data.clear()
+    st.rerun()
 
-try:
-    spot = fetch_vix_spot()
-except Exception as e:
-    spot_error = str(e)
-
-if curve is not None:
-    try:
-        strategy = build_strategy_snapshot(curve)
-    except Exception as e:
-        strategy_error = str(e)
-
-now_txt = datetime.now().strftime("%B %d, %Y · %H:%M")
-st.markdown(
-    f"""
-<div class="topbar">
-    <div>
-        <div class="brand">VX <span>Term Structure Monitor</span></div>
-        <div class="subline">Institutional dashboard for monthly VIX futures curve, regime diagnostics and short-vol execution monitor.</div>
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# HEADER
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+next_refresh = 60 - int(elapsed)
+st.markdown(f"""
+<div class="hdr">
+    <div class="logo">VIX CONTROLLER</div>
+    <div class="sub">
+        {now_str} &nbsp;·&nbsp; Auto-refresh in {next_refresh}s &nbsp;·&nbsp; Source: CBOE Settlement + Yahoo Finance
     </div>
-    <div class="micro">{now_txt} · Monthly curve: CBOE official VX contract history CSVs · Settlement overlay: CBOE settlement CSV · Spot: Yahoo fallback</div>
 </div>
-""",
-    unsafe_allow_html=True,
-)
+""", unsafe_allow_html=True)
 
-if curve is not None:
-    m1 = curve.iloc[0]
-    m2 = curve.iloc[1] if len(curve) > 1 else None
-    spot_last = spot.get("last") if spot else None
-    m1m2_pct = ((float(m2['term_price']) / float(m1['term_price']) - 1) * 100) if m2 is not None and pd.notna(m1['term_price']) and pd.notna(m2['term_price']) else None
-    vix_m1 = (float(m1['term_price']) - float(spot_last)) if (spot_last is not None and pd.notna(m1['term_price'])) else None
-    total_curve = ((float(curve.iloc[-1]['term_price']) / float(m1['term_price']) - 1) * 100) if len(curve) > 1 and pd.notna(curve.iloc[-1]['term_price']) and pd.notna(m1['term_price']) else None
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# SIDEBAR
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+with st.sidebar:
+    st.markdown("### ⚙️ Settings")
+    N_MONTHS = st.slider("Futures months", 4, 12, 8)
+    SHOW_PREV = st.checkbox("Show previous day", True)
+    SHOW_TABLE = st.checkbox("Show data table", True)
+    if st.button("🔄 Refresh Now"):
+        st.session_state.last_refresh = time.time()
+        st.cache_data.clear()
+        st.rerun()
 
-    st.markdown(
-        f"""
-<div class="kpi-grid">
-  <div class="kpi-card"><div class="kpi-label">VIX Spot</div><div class="kpi-value">{fmt_num(spot_last)}</div><div class="kpi-sub {value_class(spot.get('change') if spot else None)}">{fmt_signed(spot.get('change') if spot else None)} ({fmt_signed(spot.get('pct_change') if spot else None, suffix='%')})</div></div>
-  <div class="kpi-card"><div class="kpi-label">M1 · {m1['dte']} DTE</div><div class="kpi-value">{fmt_num(m1['term_price'])}</div><div class="kpi-sub">{m1['symbol']} · Last source: {m1['source_last']}</div></div>
-  <div class="kpi-card"><div class="kpi-label">M2</div><div class="kpi-value">{fmt_num(m2['term_price'] if m2 is not None else None)}</div><div class="kpi-sub">{m2['symbol'] if m2 is not None else '—'}</div></div>
-  <div class="kpi-card"><div class="kpi-label">VIX ↔ M1 basis</div><div class="kpi-value {value_class(vix_m1)}">{fmt_signed(vix_m1)}</div><div class="kpi-sub">M1 minus spot</div></div>
-  <div class="kpi-card"><div class="kpi-label">M1 → M2 contango</div><div class="kpi-value {value_class(m1m2_pct)}">{fmt_signed(m1m2_pct, suffix='%')}</div><div class="kpi-sub">Positive = contango</div></div>
-  <div class="kpi-card"><div class="kpi-label">M1 → M8 total curve</div><div class="kpi-value {value_class(total_curve)}">{fmt_signed(total_curve, suffix='%')}</div><div class="kpi-sub">Back-end slope</div></div>
-</div>
-""",
-        unsafe_allow_html=True,
-    )
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# FETCH DATA
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+contracts = monthly_contracts(n=N_MONTHS)
+vix_spot = fetch_vix_spot()
+fdata = fetch_cboe_contracts(json.dumps(contracts, default=str))
+etps = fetch_etps()
 
-if curve_error:
-    st.markdown(f'<div class="warnbox"><b>No se pudo construir la curva mensual de VIX desde CBOE.</b><br>Detalle técnico: {curve_error}</div>', unsafe_allow_html=True)
+# Collect prices in order
+prices = []  # list of (label, price, prev_price)
+for c in contracts:
+    s = c['symbol']
+    if s in fdata:
+        prices.append((c['code'], c['label'], fdata[s]['price'], fdata[s].get('prev')))
 
-if spot_error:
-    st.markdown(f'<div class="warnbox"><b>No se pudo cargar VIX spot.</b><br>Detalle técnico: {spot_error}</div>', unsafe_allow_html=True)
+m1p = prices[0][2] if prices else None
+m2p = prices[1][2] if len(prices) > 1 else None
+front_ct = cpct(m1p, m2p)
 
-term_tab, strategy_tab, diag_tab = st.tabs(["Term Structure", "Strategy Monitor", "Raw Data & Diagnostics"])
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TABS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+tab1, tab2, tab3 = st.tabs(["📈  Term Structure", "🎯  Monitor Operativo", "ℹ️  Help"])
 
-with term_tab:
-    if curve is not None:
-        col_chart, col_table = st.columns([2.0, 1.15], gap="large")
-        with col_chart:
-            st.plotly_chart(build_term_structure_chart(curve, spot), use_container_width=True)
-            table_contango = pd.DataFrame(
-                {
-                    "Month": curve["m"],
-                    "% Contango vs Prev": curve["contango_pct_vs_prev"].map(lambda x: fmt_signed(x, suffix="%")),
-                    "Difference vs Prev": curve["difference_vs_prev"].map(fmt_signed),
-                }
-            )
-            st.dataframe(table_contango, use_container_width=True, hide_index=True)
-        with col_table:
-            st.markdown('<div class="panel-title">Monthly VX quote panel</div><div class="panel-sub">M1, M2 and the full curve are built from the nearest monthly VX expirations. The displayed term price uses CBOE LAST first, then CLOSE, then SETTLEMENT. OHLC columns come from the official CBOE contract history files.</div>', unsafe_allow_html=True)
-            display = curve[["m", "label", "symbol", "expiration", "dte", "term_price", "last", "close", "open", "high", "low", "settlement", "change"]].copy()
-            display["expiration"] = pd.to_datetime(display["expiration"]).dt.strftime("%Y-%m-%d")
-            for c in ["term_price", "last", "close", "open", "high", "low", "settlement", "change"]:
-                display[c] = display[c].map(fmt_num if c != "change" else fmt_signed)
-            st.dataframe(display, use_container_width=True, hide_index=True, height=500)
-    else:
-        st.info("Sin curva disponible.")
+# ━━━━━━━━━━━━━━━━━ TAB 1: TERM STRUCTURE ━━━━━━━━━━━━━━━━━━
+with tab1:
+    # Metric strip
+    def fv(v):
+        return f"{v:.2f}" if v is not None else "—"
+    def vc(v):
+        if v is None: return "nt"
+        return "up" if v >= 0 else "dn"
+    def fp(v):
+        if v is None: return "—"
+        return f"{'+' if v >= 0 else ''}{v:.2f}%"
 
-with strategy_tab:
-    if strategy is not None:
-        banner_class = "banner-long" if strategy["final_signal"] else "banner-cash"
-        banner_text = "LONG" if strategy["final_signal"] else "CASH"
-        st.markdown('<div class="panel-title">Short-vol operating monitor</div><div class="panel-sub">Rules adapted from your notebook: timing via Bollinger Bands on VXX, filtered by live M1/M2 contango from the current CBOE monthly curve.</div>', unsafe_allow_html=True)
+    vix_p = vix_spot['price'] if vix_spot else None
+    total_ct = cpct(vix_p, prices[-1][2]) if vix_p and prices else None
+    spot_m1 = cpct(vix_p, m1p)
 
-        left, right = st.columns([1.05, 1.65], gap="large")
-        with left:
-            st.markdown('<div class="signal-box">', unsafe_allow_html=True)
-            st.markdown(f'<div class="signal-banner {banner_class}">{banner_text}</div>', unsafe_allow_html=True)
-            rows_html = f"""
-            <table class="rule-table">
-                <thead><tr><th>Component</th><th>Reading</th><th>Status</th></tr></thead>
-                <tbody>
-                    <tr><td>BB Timing</td><td>VXX &lt; SMA20</td><td class="{'pos' if strategy['bb_sig'] else 'neg'}">{'LONG' if strategy['bb_sig'] else 'CASH'}</td></tr>
-                    <tr><td>Contango Filter</td><td>M2 &gt; M1</td><td class="{'pos' if strategy['in_contango'] else 'neg'}">{fmt_signed(strategy['contango_pct'], suffix='%')}</td></tr>
-                    <tr><td>Final Signal</td><td>BB × Contango</td><td class="{'pos' if strategy['final_signal'] else 'neg'}">{'LONG' if strategy['final_signal'] else 'CASH'}</td></tr>
-                    <tr><td>Execution</td><td>Next session</td><td>{strategy['exec_date'].strftime('%Y-%m-%d')}</td></tr>
-                </tbody>
+    m1_lbl = prices[0][1] if prices else "—"
+    m2_lbl = prices[1][1] if len(prices) > 1 else "—"
+    m1_dte = contracts[0]['dte'] if contracts else "?"
+
+    st.markdown(f"""
+    <div class="mrow">
+        <div class="mpill"><div class="ml">VIX Index</div><div class="mv nt">{fv(vix_p)}</div></div>
+        <div class="mpill"><div class="ml">M1 · {m1_lbl} · {m1_dte} DTE</div><div class="mv nt">{fv(m1p)}</div></div>
+        <div class="mpill"><div class="ml">M2 · {m2_lbl}</div><div class="mv nt">{fv(m2p)}</div></div>
+        <div class="mpill"><div class="ml">VIX → M1</div><div class="mv {vc(spot_m1)}">{fp(spot_m1)}</div></div>
+        <div class="mpill"><div class="ml">M1 → M2 Contango</div><div class="mv {vc(front_ct)}">{fp(front_ct)}</div></div>
+        <div class="mpill"><div class="ml">Total Curve</div><div class="mv {vc(total_ct)}">{fp(total_ct)}</div></div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Chart
+    fig = build_term_chart(vix_spot, contracts, fdata, show_prev=SHOW_PREV)
+    st.plotly_chart(fig, use_container_width=True, config=dict(displayModeBar=True, displaylogo=False))
+
+    # ── Contango & Difference table (VIXCentral style) ──
+    if len(prices) >= 2:
+        ct_cells = ""
+        diff_cells = ""
+        for i in range(len(prices) - 1):
+            n = i + 1
+            p1, p2 = prices[i][2], prices[i+1][2]
+            ct = cpct(p1, p2)
+            diff = round(p2 - p1, 2) if p1 and p2 else None
+            ct_cls = "pos" if ct and ct >= 0 else "neg"
+            diff_cls = "pos" if diff and diff >= 0 else "neg"
+            ct_cells += f'<td>{n}</td><td class="{ct_cls}">{fp(ct)}</td>'
+            diff_cells += f'<td>{n}</td><td class="{diff_cls}">{fv(diff)}</td>'
+
+        # Month 7 to 4 contango
+        m74_ct, m74_diff = None, None
+        if len(prices) >= 7:
+            p4, p7 = prices[3][2], prices[6][2]
+            m74_ct = cpct(p4, p7)
+            m74_diff = round(p7 - p4, 2) if p4 and p7 else None
+
+        st.markdown(f"""
+        <table class="ctx">
+        <tr><td class="hdr-cell">% Contango</td>{ct_cells}</tr>
+        <tr><td class="hdr-cell">Difference</td>{diff_cells}</tr>
+        </table>
+        """, unsafe_allow_html=True)
+
+        if m74_ct is not None:
+            m74_cls = "pos" if m74_ct >= 0 else "neg"
+            st.markdown(f"""
+            <table class="ctx" style="width:auto;margin-top:4px;">
+            <tr><td class="hdr-cell">Month 7 to 4 contango</td>
+            <td class="{m74_cls}">{fp(m74_ct)}</td>
+            <td class="{m74_cls}">{fv(m74_diff)}</td></tr>
             </table>
-            """
-            st.markdown(rows_html, unsafe_allow_html=True)
+            """, unsafe_allow_html=True)
 
-            s_last = strategy["last"]
-            detail = pd.DataFrame(
-                [
-                    ["VXX Close", fmt_num(s_last['VXX_Close'])],
-                    ["SMA20", fmt_num(s_last['SMA20'])],
-                    ["BB Upper", fmt_num(s_last['BB_Upper'])],
-                    ["Distance vs SMA", fmt_signed(strategy['pct_to_sma'], suffix='%')],
-                    ["Distance vs Upper BB", fmt_signed(strategy['pct_to_upper'], suffix='%')],
-                    ["M1", f"{strategy['m1']['symbol']} · {fmt_num(strategy['m1']['term_price'])}"],
-                    ["M2", f"{strategy['m2']['symbol']} · {fmt_num(strategy['m2']['term_price'])}" if strategy['m2'] is not None else "—"],
-                    ["SVXY Close", fmt_num(s_last['SVXY_Close'])],
-                    ["SVIX Close", fmt_num(s_last['SVIX_Close'])],
-                    ["SPY Close", fmt_num(s_last['SPY_Close'])],
-                ],
-                columns=["Metric", "Value"],
-            )
-            st.dataframe(detail, use_container_width=True, hide_index=True, height=360)
-            st.markdown('</div>', unsafe_allow_html=True)
-        with right:
-            st.plotly_chart(build_vxx_timing_chart(strategy), use_container_width=True)
+    # ── Data table ──
+    if SHOW_TABLE and prices:
+        rows = ""
+        prev_p = vix_p
+        for c in contracts:
+            s = c['symbol']
+            if s in fdata:
+                d = fdata[s]
+                p = d['price']
+                chg = round(p - d['prev'], 2) if d.get('prev') else None
+                ct = cpct(prev_p, p)
+                chg_c = "color:var(--g)" if chg and chg >= 0 else "color:var(--r)" if chg else ""
+                ct_c = "color:var(--g)" if ct and ct >= 0 else "color:var(--r)" if ct else ""
+                chg_s = f"{chg:+.3f}" if chg is not None else "—"
+                ct_s = fp(ct) if ct is not None else "—"
+                hi_s = f"{d['high']:.2f}" if d.get('high') and d['high'] > 0 else "—"
+                lo_s = f"{d['low']:.2f}" if d.get('low') and d['low'] > 0 else "—"
+                rows += f"""<tr>
+                    <td style="color:var(--b);font-weight:600">{c['symbol']}</td>
+                    <td>{c['exp'].strftime('%m/%d/%Y')}</td>
+                    <td style="font-weight:600">{p:.4f}</td>
+                    <td style="{chg_c}">{chg_s}</td>
+                    <td>{hi_s}</td><td>{lo_s}</td>
+                    <td style="{ct_c}">{ct_s}</td>
+                    <td>{c['dte']}</td>
+                    <td>{d.get('vol',0):,}</td>
+                </tr>"""
+                prev_p = p
+
+        st.markdown(f"""
+        <table class="dtbl">
+            <thead><tr><th>Symbol</th><th>Expiration</th><th>Settlement</th><th>Change</th>
+            <th>High</th><th>Low</th><th>Contango</th><th>DTE</th><th>Volume</th></tr></thead>
+            <tbody>{rows}</tbody>
+        </table>""", unsafe_allow_html=True)
+
+    if not prices:
+        st.warning("⚠️ No se pudieron obtener precios de futuros VIX del CBOE CDN. Esto puede ocurrir fuera de horario de mercado o si el CDN está temporalmente inaccesible.")
+        st.info("💡 Verifica que tengas acceso a `cdn.cboe.com` desde tu red. Los datos se actualizan después de cada sesión de trading.")
+
+    found = len(prices)
+    st.caption(f"Contratos cargados: {found}/{N_MONTHS} · Solo mensuales (sin weeklys) · Fuente: CBOE CDN Settlement CSVs")
+
+
+# ━━━━━━━━━━━━━━━━━ TAB 2: MONITOR OPERATIVO ━━━━━━━━━━━━━━━
+with tab2:
+
+    bb_data = fetch_bb_data()
+
+    if bb_data is not None and len(bb_data) > 0:
+        last = bb_data.iloc[-1]
+        last_date = bb_data.index[-1]
+
+        vxx_close = last["VXX_Close"]
+        sma20 = last["SMA20"]
+        bb_upper = last["BB_Upper"]
+        vix_close = last.get("VIX_Close", vix_spot['price'] if vix_spot else 0)
+        svxy_close = last.get("SVXY_Close", 0)
+        svxy_open = last.get("SVXY_Open", 0)
+        svix_close = last.get("SVIX_Close", 0)
+        svix_open = last.get("SVIX_Open", 0)
+        spy_close = last.get("SPY_Close", 0)
+
+        # Auto M1/M2 from term structure
+        auto_m1 = m1p
+        auto_m2 = m2p
+        auto_m1_sym = contracts[0]['symbol'] if contracts else "?"
+        auto_m2_sym = contracts[1]['symbol'] if len(contracts) > 1 else "?"
+        contango_pct = cpct(auto_m1, auto_m2) if auto_m1 and auto_m2 else None
+        in_contango = contango_pct is not None and contango_pct > 0
+
+        # BB signal
+        bb_sig = int(bb_data["bb_sig"].iloc[-1])
+        vxx_below_sma = vxx_close < sma20
+        vxx_above_bb = vxx_close > bb_upper
+
+        # FINAL SIGNAL
+        final_signal = bb_sig * int(in_contango) if contango_pct is not None else 0
+
+        pct_to_sma = (vxx_close / sma20 - 1) * 100
+        pct_to_bb = (vxx_close / bb_upper - 1) * 100
+
+        # Previous BB
+        bb_sig_prev = int(bb_data["bb_sig"].iloc[-2]) if len(bb_data) >= 2 else bb_sig
+        bb_changed = bb_sig != bb_sig_prev
+
+        # ── Layout ──
+        c1, c2, c3 = st.columns([1.2, 1.5, 1.3])
+
+        # Signal box
+        with c1:
+            sig_cls = "sig-long" if final_signal else "sig-cash"
+            sig_txt = "LONG" if final_signal else "CASH"
+            sig_clr = "var(--g)" if final_signal else "var(--r)"
+            st.markdown(f"""
+            <div class="sig-box {sig_cls}">
+                <div class="sl" style="color:{sig_clr}">{sig_txt}</div>
+                <div class="sd">{last_date.strftime('%Y-%m-%d')}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+
+            # Checks
+            bb_ok = "ok" if bb_sig == 1 else "no"
+            bb_mark = "✓ OK" if bb_sig == 1 else "✗ NO"
+            ct_ok = "ok" if in_contango else "no"
+            ct_mark = "✓ OK" if in_contango else "✗ NO"
+            ct_val = f"{contango_pct:+.2f}%" if contango_pct is not None else "N/A"
+
+            st.markdown(f"""
+            <div class="chk"><span class="{bb_ok}">{bb_mark}</span> BB Timing — VXX &lt; SMA(20)</div>
+            <div class="chk"><span class="{ct_ok}">{ct_mark}</span> Contango — M2 &gt; M1 ({ct_val})</div>
+            """, unsafe_allow_html=True)
+
+            if bb_changed:
+                st.markdown('<div class="chk"><span style="color:var(--y)">⚠</span> BB cambió hoy</div>', unsafe_allow_html=True)
+
+        # VXX Detail
+        with c2:
+            sma_clr = "var(--g)" if vxx_below_sma else "var(--r)"
+            sma_lbl = "DEBAJO" if vxx_below_sma else "ENCIMA"
+            bb_clr = "var(--g)" if not vxx_above_bb else "var(--r)"
+            bb_lbl = "DEBAJO" if not vxx_above_bb else "ENCIMA"
+            bb_state = "LONG" if bb_sig else "CASH"
+            bb_st_clr = "var(--g)" if bb_sig else "var(--r)"
+
+            st.markdown(f"""
+            <div class="icard">
+                <div class="ic-title">VXX — Timing (Bollinger Band)</div>
+                <div class="ic-row"><span class="ic-label">VXX Close</span><span class="ic-val" style="font-weight:700">${vxx_close:.2f}</span></div>
+                <div class="ic-row"><span class="ic-label">SMA(20)</span><span class="ic-val" style="color:{sma_clr}">${sma20:.2f} ({pct_to_sma:+.1f}% {sma_lbl})</span></div>
+                <div class="ic-row"><span class="ic-label">BB Superior</span><span class="ic-val" style="color:{bb_clr}">${bb_upper:.2f} ({pct_to_bb:+.1f}% {bb_lbl})</span></div>
+                <div class="ic-row"><span class="ic-label">Distancia a BB</span><span class="ic-val">${bb_upper - vxx_close:.2f} ({abs(pct_to_bb):.1f}%)</span></div>
+                <div class="ic-row"><span class="ic-label">BB Estado</span><span class="ic-val" style="color:{bb_st_clr};font-weight:700;font-size:1rem">{bb_state}</span></div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        # Contango + VIX + Vehicles
+        with c3:
+            ct_clr = "var(--g)" if in_contango else "var(--r)"
+            ct_estado = "CONTANGO" if in_contango else "BACKWARDATION"
+
+            if vix_close < 15: regime, r_clr = "BAJO (óptimo)", "var(--g)"
+            elif vix_close < 20: regime, r_clr = "NORMAL (bueno)", "var(--g)"
+            elif vix_close < 28: regime, r_clr = "ELEVADO (precaución)", "var(--y)"
+            else: regime, r_clr = "CRISIS (peligro)", "var(--r)"
+
+            m1_s = f"${auto_m1:.2f}" if auto_m1 else "N/A"
+            m2_s = f"${auto_m2:.2f}" if auto_m2 else "N/A"
+
+            st.markdown(f"""
+            <div class="icard">
+                <div class="ic-title">Contango + VIX</div>
+                <div class="ic-row"><span class="ic-label">M1 ({auto_m1_sym})</span><span class="ic-val">{m1_s}</span></div>
+                <div class="ic-row"><span class="ic-label">M2 ({auto_m2_sym})</span><span class="ic-val">{m2_s}</span></div>
+                <div class="ic-row"><span class="ic-label">Contango</span><span class="ic-val" style="color:{ct_clr};font-weight:700">{ct_val} {ct_estado}</span></div>
+                <div class="ic-row"><span class="ic-label">VIX</span><span class="ic-val" style="color:{r_clr}">{vix_close:.1f} {regime}</span></div>
+            </div>
+            <div class="icard">
+                <div class="ic-title">Vehículos</div>
+                <div class="ic-row"><span class="ic-label">SVXY (-0.5x)</span><span class="ic-val" style="color:var(--c);font-weight:700">${svxy_close:.2f}</span></div>
+                <div class="ic-row"><span class="ic-label">SVIX (-1x agresivo)</span><span class="ic-val" style="color:var(--c);font-weight:700">${svix_close:.2f}</span></div>
+                <div class="ic-row"><span class="ic-label">SPY</span><span class="ic-val">${spy_close:.2f}</span></div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        # ── Alerts ──
+        alerts = []
+        if final_signal and abs(pct_to_bb) < 3:
+            alerts.append(f"⚠️ VXX cerca de BB Superior ({abs(pct_to_bb):.1f}%) — posible salida pronto")
+        if contango_pct is not None and 0 < contango_pct < 1:
+            alerts.append(f"⚠️ Contango muy bajo ({contango_pct:.1f}%) — monitorear")
+        if not final_signal and abs(pct_to_sma) < 2 and in_contango:
+            alerts.append(f"🔔 Posible entrada pronto — VXX a {abs(pct_to_sma):.1f}% de SMA")
+        if vix_close >= 28:
+            alerts.append(f"🚨 VIX en zona de crisis ({vix_close:.1f}) — máxima precaución")
+
+        if alerts:
+            for a in alerts:
+                st.warning(a)
+
+        # ── BB Chart ──
+        fig_bb = build_bb_chart(bb_data)
+        st.plotly_chart(fig_bb, use_container_width=True, config=dict(displayModeBar=True, displaylogo=False))
+
+        # ── Execution note ──
+        exec_date = last_date + timedelta(days=1)
+        while exec_date.weekday() >= 5:
+            exec_date += timedelta(days=1)
+
+        sig_str = "LONG" if final_signal else "CASH"
+        st.markdown(f"""
+        <div class="icard" style="text-align:center">
+            <span style="font-family:'JetBrains Mono';font-size:0.8rem;color:var(--dim)">
+                SEÑAL: <b style="color:{'var(--g)' if final_signal else 'var(--r)'}">{sig_str}</b>
+                &nbsp;·&nbsp; BB: <b>{'LONG' if bb_sig else 'CASH'}</b>
+                × Contango: <b>{'SÍ' if in_contango else 'NO'}</b>
+                &nbsp;·&nbsp; Ejecución (si cambio): <b>{exec_date.strftime('%Y-%m-%d')}</b> al OPEN
+            </span>
+        </div>
+        """, unsafe_allow_html=True)
+
     else:
-        if strategy_error:
-            st.markdown(f'<div class="warnbox"><b>No se pudo construir el monitor operativo.</b><br>Detalle técnico: {strategy_error}</div>', unsafe_allow_html=True)
-        else:
-            st.info("Monitor operativo no disponible.")
+        st.error("No se pudieron descargar datos de Yahoo Finance para el monitor operativo.")
 
-with diag_tab:
-    st.markdown('<div class="panel-title">Diagnostics</div><div class="panel-sub">Raw tables used by the dashboard. This section is useful for validating whether the monthly curve is being sourced and merged correctly.</div>', unsafe_allow_html=True)
-    d1, d2 = st.columns(2)
-    with d1:
-        try:
-            live_df = fetch_cboe_live_table().copy()
-            if "expiration" in live_df.columns:
-                live_df["expiration"] = pd.to_datetime(live_df["expiration"], errors="coerce").dt.strftime("%Y-%m-%d")
-            st.markdown("**CBOE live table (raw filtered monthly rows)**")
-            st.dataframe(live_df, use_container_width=True, hide_index=True)
-        except Exception as e:
-            st.error(f"Live table error: {e}")
-    with d2:
-        if curve is not None:
-            st.markdown("**Merged monthly curve used by the app**")
-            dbg = curve.copy()
-            dbg["expiration"] = pd.to_datetime(dbg["expiration"]).dt.strftime("%Y-%m-%d")
-            st.dataframe(dbg, use_container_width=True, hide_index=True)
 
-st.caption("Monthly curve uses CBOE VX product page for delayed last/settlement when available and CBOE individual contract history CSVs for close, open, high and low. Strategy logic adapted from your uploaded Monitor_Operativo_v3 notebook.")
+# ━━━━━━━━━━━━━━━━━ TAB 3: HELP ━━━━━━━━━━━━━━━━━━━━━━━━━━━
+with tab3:
+    st.markdown("""
+    ### VIX Controller — Guía
+
+    **Tab 1: Term Structure** — Réplica de VIXCentral.com
+    - Datos de CBOE CDN (settlement CSVs por contrato individual)
+    - Solo contratos mensuales (sin weeklys)
+    - Tabla de contango/diferencia entre meses consecutivos
+    - Month 7 to 4 contango (indicador de término medio)
+    - Auto-refresh cada 60 segundos
+
+    **Tab 2: Monitor Operativo** — Señal BB × Contango
+    - **Bollinger Band Timing**: VXX < SMA(20) = LONG, VXX > BB Superior = EXIT
+    - **Filtro Contango**: M2 > M1 (automático desde term structure)
+    - **Señal Final** = BB × Contango — ambos deben ser TRUE para LONG
+    - Gráfico VXX + BB con zonas de señal coloreadas
+    - Alertas automáticas de proximidad a niveles clave
+
+    ---
+
+    **Fuentes de datos:**
+    - `cdn.cboe.com` — Settlement prices por contrato VX
+    - Yahoo Finance — VIX spot, VXX, SVXY, SVIX, SPY
+
+    **Instrumentos:**
+
+    | Instrumento | Exposición | Descripción |
+    |------------|-----------|-------------|
+    | SVXY | -0.5x | ProShares Short VIX Short-Term Futures |
+    | SVIX | -1x | -1x Short VIX Futures ETF |
+    | VXX | +1x | iPath Series B VIX Short-Term Futures ETN |
+
+    **Expiración VIX Futures:** Miércoles 30 días antes del 3er viernes del mes siguiente.
+    """)
+
+# ── Footer ──
+st.markdown(f"""
+<div style="text-align:center;padding:0.8rem 0 0.3rem;border-top:1px solid #30363D;margin-top:1rem;">
+    <span style="font-family:'JetBrains Mono',monospace;font-size:0.6rem;color:#484F58;">
+        VIX CONTROLLER · Alberto Alarcón González · Estrategia Volatilidad Inversa · Not financial advice
+    </span>
+</div>
+""", unsafe_allow_html=True)
