@@ -11,6 +11,7 @@ import plotly.graph_objects as go
 import yfinance as yf
 from datetime import datetime, timedelta, date
 import requests, io, time, warnings, json
+from bs4 import BeautifulSoup
 
 warnings.filterwarnings("ignore")
 
@@ -134,124 +135,131 @@ def fetch_vix_spot():
     except: pass
     return None
 
+def _safe_float(v):
+    try:
+        f = float(str(v).replace(",", ""))
+        return round(f, 4) if f != 0 else 0.0
+    except (ValueError, TypeError):
+        return 0.0
+
+def _safe_int(v):
+    try:
+        return int(str(v).replace(",", ""))
+    except (ValueError, TypeError):
+        return 0
+
 @st.cache_data(ttl=55)
 def fetch_cboe_delayed_quotes():
     """
-    Fetch VX futures from CBOE Delayed Quotes JSON API.
-    Tries multiple endpoints/strategies before falling back to Yahoo Finance.
-    Returns only MONTHLY contracts (filters out weeklys).
+    Scrape VX futures from CBOE delayed quotes page.
+    Targets table index 4 which contains VX/ monthly contracts.
+    Confirmed structure: SYMBOL | EXPIRATION | LAST | CHANGE | HIGH | LOW | SETTLEMENT | VOLUME
+    Falls back to Yahoo Finance if scraping fails.
     """
     results = {}
     raw_rows = []
-
-    # ── Strategy 1: CBOE CDN JSON (primary) ──
-    cboe_urls = [
-        "https://cdn.cboe.com/api/global/delayed_quotes/futures/VX.json",
-        "https://www.cboe.com/data/alphashares/futures/VX.json",
-        "https://cdn.cboe.com/api/global/futures/delayed_quotes/VX.json",
-    ]
-    headers_list = [
-        {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://www.cboe.com/delayed_quotes/futures/future_quotes",
-            "Origin": "https://www.cboe.com",
-        },
-        {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-            "Accept": "application/json",
-        },
-    ]
-
-    rows = []
     source_used = None
-    for url in cboe_urls:
-        for headers in headers_list:
-            try:
-                session = requests.Session()
-                session.headers.update(headers)
-                r = session.get(url, timeout=20)
-                if r.status_code == 200:
-                    data = r.json()
-                    rows = data.get("data", [])
-                    if not rows:
-                        if isinstance(data, list):
-                            rows = data
-                        elif "options" in data:
-                            rows = data.get("options", [])
-                        elif "futures" in data:
-                            rows = data.get("futures", [])
-                    if rows:
-                        source_used = "CBOE"
-                        break
-            except Exception:
-                continue
-        if rows:
-            break
 
-    # ── Strategy 2: CBOE settlement CSVs per contract (fallback) ──
-    if not rows:
+    # ── Strategy 1: Web scraping CBOE page ──
+    CBOE_URL = "https://www.cboe.com/delayed_quotes/futures/future_quotes"
+    scrape_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/123.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Referer": "https://www.cboe.com/",
+        "Connection": "keep-alive",
+        "Cache-Control": "no-cache",
+    }
+
+    try:
+        session = requests.Session()
+        session.headers.update(scrape_headers)
+        resp = session.get(CBOE_URL, timeout=25)
+
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            tables = soup.find_all("table")
+
+            # Find the VX table: look for any table that has VX/ in its rows
+            vx_table = None
+            for tbl in tables:
+                if tbl.find(string=lambda t: t and "VX/" in t):
+                    vx_table = tbl
+                    break
+
+            if vx_table:
+                # Parse headers
+                headers_row = vx_table.find("thead")
+                col_names = []
+                if headers_row:
+                    col_names = [th.get_text(strip=True).upper()
+                                 for th in headers_row.find_all("th")]
+
+                # Expected: SYMBOL EXPIRATION LAST CHANGE HIGH LOW SETTLEMENT VOLUME
+                # Map by position (confirmed from DevTools output)
+                IDX = {"SYMBOL": 0, "EXPIRATION": 1, "LAST": 2, "CHANGE": 3,
+                       "HIGH": 4, "LOW": 5, "SETTLEMENT": 6, "VOLUME": 7}
+
+                tbody = vx_table.find("tbody")
+                if tbody:
+                    for tr in tbody.find_all("tr"):
+                        cells = [td.get_text(strip=True) for td in tr.find_all("td")]
+                        if len(cells) < 7:
+                            continue
+                        symbol = cells[IDX["SYMBOL"]]
+                        # Only monthly VX contracts: exactly "VX/XX" pattern
+                        if not symbol.startswith("VX/"):
+                            continue
+                        # Filter weeklys: monthly symbols are VX/J6, VX/K6 etc (2 char suffix)
+                        suffix = symbol.replace("VX/", "")
+                        if len(suffix) != 2:
+                            continue
+
+                        raw_rows.append(cells)
+                        results[symbol] = dict(
+                            price=_safe_float(cells[IDX["LAST"]]) or _safe_float(cells[IDX["SETTLEMENT"]]),
+                            last=_safe_float(cells[IDX["LAST"]]),
+                            settlement=_safe_float(cells[IDX["SETTLEMENT"]]),
+                            change=_safe_float(cells[IDX["CHANGE"]]),
+                            high=_safe_float(cells[IDX["HIGH"]]) or None,
+                            low=_safe_float(cells[IDX["LOW"]]) or None,
+                            vol=_safe_int(cells[IDX["VOLUME"]]),
+                            expiration=cells[IDX["EXPIRATION"]],
+                            src="CBOE_SCRAPE",
+                        )
+                if results:
+                    source_used = "CBOE_SCRAPE"
+
+    except Exception as e:
+        st.sidebar.warning(f"Scraping CBOE: {e}")
+
+    # ── Strategy 2: Yahoo Finance fallback ──
+    if not results:
         try:
             contracts = monthly_contracts()
-            for c in contracts:
-                exp_str = c['exp'].strftime('%Y-%m-%d')
-                csv_url = f"https://cdn.cboe.com/data/us/futures/market_statistics/historical_data/products/csv/VX/VX_{exp_str}.csv"
-                try:
-                    r2 = requests.get(csv_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-                    if r2.status_code == 200:
-                        df_c = pd.read_csv(io.StringIO(r2.text))
-                        df_c.columns = [col.strip().lower() for col in df_c.columns]
-                        if not df_c.empty:
-                            last_row = df_c.iloc[-1]
-                            settle = _safe_float(last_row.get('settle', last_row.get('settlement', 0)))
-                            if settle > 0:
-                                rows.append({
-                                    "symbol": c['symbol'],
-                                    "expiration": exp_str,
-                                    "last": settle,
-                                    "settlement": settle,
-                                    "change": 0,
-                                    "high": _safe_float(last_row.get('high', 0)),
-                                    "low": _safe_float(last_row.get('low', 0)),
-                                    "volume": _safe_int(last_row.get('total_volume', last_row.get('volume', 0))),
-                                })
-                                source_used = "CBOE_CSV"
-                except Exception:
-                    continue
-        except Exception:
-            pass
-
-    # ── Strategy 3: Yahoo Finance VX futures (last resort) ──
-    if not rows:
-        try:
-            yf_symbols = {
-                "VX/J6": "/VXJ26",
-                "VX/K6": "/VXK26",
-                "VX/M6": "/VXM26",
-                "VX/N6": "/VXN26",
-                "VX/Q6": "/VXQ26",
-                "VX/U6": "/VXU26",
-                "VX/V6": "/VXV26",
-            }
-            contracts = monthly_contracts()
-            for c in contracts[:7]:
+            for c in contracts[:8]:
                 yf_sym = f"VX{MC[c['month']]}{str(c['year'])[-2:]}.CFE"
                 try:
                     h = yf.Ticker(yf_sym).history(period="5d")
                     if not h.empty:
                         price = round(float(h['Close'].iloc[-1]), 4)
                         prev  = round(float(h['Close'].iloc[-2]), 4) if len(h) > 1 else price
-                        rows.append({
-                            "symbol": c['symbol'],
-                            "expiration": c['exp'].strftime('%Y-%m-%d'),
-                            "last": price,
-                            "settlement": prev,
-                            "change": round(price - prev, 4),
-                            "high": round(float(h['High'].iloc[-1]), 4),
-                            "low": round(float(h['Low'].iloc[-1]), 4),
-                            "volume": int(h['Volume'].iloc[-1]) if 'Volume' in h.columns else 0,
-                        })
+                        results[c['symbol']] = dict(
+                            price=price,
+                            last=price,
+                            settlement=prev,
+                            change=round(price - prev, 4),
+                            high=round(float(h['High'].iloc[-1]), 4),
+                            low=round(float(h['Low'].iloc[-1]), 4),
+                            vol=int(h['Volume'].iloc[-1]) if 'Volume' in h.columns else 0,
+                            expiration=c['exp'].strftime('%m/%d/%Y'),
+                            src="Yahoo",
+                        )
                         source_used = "Yahoo"
                 except Exception:
                     continue
@@ -259,47 +267,9 @@ def fetch_cboe_delayed_quotes():
             pass
 
     if source_used:
-        st.sidebar.success(f"✅ Datos obtenidos: {source_used}")
+        st.sidebar.success(f"✅ Fuente: {source_used} · {len(results)} contratos")
     else:
-        st.sidebar.warning("⚠️ No se pudo conectar con CBOE ni Yahoo Finance")
-
-    # ── Parse rows into results dict ──
-    for row in rows:
-        symbol = row.get("symbol", "")
-
-        # ── FILTER: only monthly contracts ──
-        parts = symbol.split("/")
-        if len(parts) != 2:
-            continue
-        prefix = parts[0]
-        if prefix != "VX":
-            continue  # Skip weeklys (VX12, VX13, etc.)
-
-        # Parse fields
-        expiration = row.get("expiration", "")
-        last_price = _safe_float(row.get("last", row.get("last_price", 0)))
-        change = _safe_float(row.get("change", 0))
-        high = _safe_float(row.get("high", 0))
-        low = _safe_float(row.get("low", 0))
-        settlement = _safe_float(row.get("settlement", row.get("settle", row.get("prev_settle", 0))))
-        volume = _safe_int(row.get("volume", row.get("total_volume", 0)))
-
-        # Use LAST if available, otherwise Settlement
-        price = last_price if last_price and last_price > 0 else settlement
-
-        if price and price > 0:
-            results[symbol] = dict(
-                price=price,
-                last=last_price,
-                settlement=settlement,
-                change=change,
-                high=high if high and high > 0 else None,
-                low=low if low and low > 0 else None,
-                vol=volume,
-                expiration=expiration,
-                src=source_used or 'CBOE',
-            )
-            raw_rows.append(row)
+        st.sidebar.error("❌ Sin datos — CBOE y Yahoo fallaron")
 
     return results, raw_rows
 
