@@ -61,26 +61,28 @@ MONTH_ORDER = {k: i for i, k in enumerate(["F", "G", "H", "J", "K", "M", "N", "Q
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     mapping = {}
     for c in df.columns:
-        cl = str(c).strip().lower()
-        if "symbol" == cl or cl.endswith("symbol"):
+        raw = str(c).strip()
+        cl = raw.lower().replace("_", " ")
+        cl = re.sub(r"\s+", " ", cl)
+        if cl == "symbol" or cl.endswith(" symbol") or "future symbol" in cl:
             mapping[c] = "Symbol"
-        elif "expiration" in cl:
+        elif "expiration" in cl or cl in {"expiry", "expiration date", "expire date"}:
             mapping[c] = "Expiration"
-        elif cl in {"last", "last price", "last_price"}:
+        elif cl in {"last", "last price", "last trade", "last traded", "daily last"} or ("last" in cl and "price" in cl):
             mapping[c] = "Last"
-        elif "settle" in cl:
+        elif "settle" in cl or cl in {"close", "closing price", "settlement price", "daily settlement"}:
             mapping[c] = "Settle"
-        elif "open" == cl:
+        elif cl == "open" or "open price" in cl:
             mapping[c] = "Open"
-        elif "high" == cl:
+        elif cl == "high" or "high price" in cl:
             mapping[c] = "High"
-        elif "low" == cl:
+        elif cl == "low" or "low price" in cl:
             mapping[c] = "Low"
-        elif "bid" == cl:
+        elif cl == "bid" or "bid price" in cl:
             mapping[c] = "Bid"
-        elif "ask" == cl:
+        elif cl == "ask" or "ask price" in cl:
             mapping[c] = "Ask"
-        elif "change" == cl:
+        elif cl == "change" or "net change" in cl:
             mapping[c] = "Change"
     return df.rename(columns=mapping)
 
@@ -129,22 +131,59 @@ def sort_monthly_df(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _read_csv_flex(raw_text: str) -> pd.DataFrame:
+    txt = raw_text.lstrip("﻿").strip()
+    if not txt or "<!DOCTYPE" in txt.upper() or "<HTML" in txt.upper():
+        raise ValueError("El endpoint de settlement no devolvió CSV válido.")
+
+    candidates = []
+    for skip in range(0, 8):
+        try:
+            df = pd.read_csv(io.StringIO(txt), skiprows=skip)
+            if not df.empty and len(df.columns) >= 2:
+                candidates.append(df)
+        except Exception:
+            continue
+    if not candidates:
+        raise ValueError("No pude leer el CSV de CBOE.")
+
+    def score(df: pd.DataFrame) -> int:
+        cols = [str(c).strip().lower() for c in df.columns]
+        s = 0
+        if any("symbol" in c for c in cols):
+            s += 5
+        if any("settle" in c or "last" in c or "close" in c for c in cols):
+            s += 5
+        if any("expiration" in c or "expiry" in c for c in cols):
+            s += 3
+        return s
+
+    best = max(candidates, key=score)
+    best = normalize_columns(best)
+    best = ensure_symbol_column(best)
+    return best
+
+
+def ensure_symbol_column(df: pd.DataFrame) -> pd.DataFrame:
+    if "Symbol" in df.columns:
+        return df
+    for c in df.columns:
+        vals = df[c].astype(str).head(20).tolist()
+        if any(("VX" in v.upper()) for v in vals):
+            return df.rename(columns={c: "Symbol"})
+    return df
+
 @st.cache_data(ttl=900)
 def fetch_settlement_for_date(target: date) -> pd.DataFrame:
     url = f"https://www.cboe.com/us/futures/market_statistics/settlement/csv?dt={target:%Y-%m-%d}"
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Accept": "text/csv,application/octet-stream,text/plain,*/*",
+        "Referer": "https://www.cboe.com/us/futures/market_statistics/settlement/",
     }
     r = requests.get(url, timeout=20, headers=headers)
     r.raise_for_status()
-    text = r.text.strip()
-    if not text or "<!DOCTYPE" in text.upper() or "<HTML" in text.upper():
-        raise ValueError("El endpoint de settlement no devolvió CSV válido.")
-    df = pd.read_csv(io.StringIO(text))
-    if df.empty:
-        raise ValueError("CSV vacío.")
-    return normalize_columns(df)
+    return _read_csv_flex(r.text)
 
 
 @st.cache_data(ttl=900)
@@ -182,14 +221,23 @@ def fetch_vix_spot():
 
 
 def choose_price_col(df: pd.DataFrame) -> str:
-    for c in ["Last", "Settle"]:
+    preferred = ["Last", "Settle", "Close"]
+    for c in preferred:
         if c in df.columns:
             return c
-    raise ValueError("No encontré columna Last/Settle en settlement de CBOE.")
+
+    for c in df.columns:
+        cl = str(c).strip().lower().replace("_", " ")
+        if any(k in cl for k in ["last", "settle", "close"]):
+            return c
+
+    raise ValueError("No encontré una columna de precio usable en settlement de CBOE. Columnas detectadas: " + ", ".join(map(str, df.columns)))
 
 
 def clean_numeric(series: pd.Series) -> pd.Series:
-    return pd.to_numeric(series, errors="coerce")
+    s = series.astype(str).str.replace(",", "", regex=False).str.strip()
+    s = s.replace({"": pd.NA, "-": pd.NA, "--": pd.NA, "N/A": pd.NA, "nan": pd.NA})
+    return pd.to_numeric(s, errors="coerce")
 
 
 def prepare_curve(df_today: pd.DataFrame, df_prev: pd.DataFrame | None = None) -> pd.DataFrame:
