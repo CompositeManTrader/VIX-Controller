@@ -288,7 +288,7 @@ def fetch_cboe_live_table() -> pd.DataFrame:
             continue
 
     # Attempt 3: fallback to text block from the rendered page.
-    TEMPPLACEHOLDER
+    text = soup.get_text("\n", strip=True)
     marker = "Symbol Expiration Last Price Change High Low Settlement Volume"
     if marker not in text:
         marker = "Symbol Expiration Last Change High Low Settlement Volume"
@@ -314,42 +314,6 @@ def fetch_cboe_live_table() -> pd.DataFrame:
             return finalize(pd.DataFrame(rows))
 
     raise ValueError("No se pudo scrapear la tabla de VIX Futures en CBOE usando table scraping ni text parsing.")
-
-@st.cache_data(ttl=300)
-def fetch_contract_daily_history(expiration: str) -> pd.DataFrame:
-    url = f"https://cdn.cboe.com/data/us/futures/market_statistics/historical_data/products/csv/VX/VX_{expiration}.csv"
-    resp = requests.get(url, headers=HEADERS, timeout=20)
-    resp.raise_for_status()
-    df = pd.read_csv(io.StringIO(resp.text))
-    df = normalize_columns(df)
-    # Normalize common headers from product CSVs
-    extra_map = {}
-    for c in df.columns:
-        cs = str(c).strip().lower()
-        if cs == "trade date":
-            extra_map[c] = "trade_date"
-        elif cs == "open":
-            extra_map[c] = "open"
-        elif cs == "high":
-            extra_map[c] = "high"
-        elif cs == "low":
-            extra_map[c] = "low"
-        elif cs == "close":
-            extra_map[c] = "close"
-        elif cs in {"last", "last sale"}:
-            extra_map[c] = "last"
-        elif "settle" in cs or cs == "price":
-            extra_map[c] = "settlement"
-        elif "volume" in cs:
-            extra_map[c] = "volume"
-    df = df.rename(columns=extra_map)
-    if "trade_date" in df.columns:
-        df["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce")
-    for c in ["open", "high", "low", "close", "last", "settlement", "volume"]:
-        if c in df.columns:
-            df[c] = clean_numeric_series(df[c])
-    return df
-
 
 @st.cache_data(ttl=120)
 def fetch_vix_spot() -> Optional[dict]:
@@ -377,73 +341,56 @@ def fetch_vix_spot() -> Optional[dict]:
 
 @st.cache_data(ttl=600)
 def build_monthly_curve(n_months: int = 8) -> pd.DataFrame:
-    contracts = active_monthly_contracts(n=n_months)
     live = fetch_cboe_live_table()
     live = normalize_columns(live)
     if "symbol" not in live.columns:
         raise ValueError("CBOE live table no trajo columna de símbolo.")
-    live["symbol"] = live["symbol"].astype(str).str.strip()
+
+    live = live.copy()
+    live["symbol"] = live["symbol"].astype(str).str.strip().str.upper()
     live = live[live["symbol"].apply(is_monthly_cboe_symbol)].copy()
+    if live.empty:
+        raise ValueError("La tabla scrapeada de CBOE no devolvió contratos mensuales VX.")
+
     if "expiration" in live.columns:
         live["expiration"] = pd.to_datetime(live["expiration"], errors="coerce")
+    else:
+        raise ValueError("La tabla scrapeada de CBOE no trae expiración.")
 
-    live_map = {row["symbol"]: row.to_dict() for _, row in live.iterrows()}
+    for c in ["last", "change", "high", "low", "settlement", "volume", "open", "close"]:
+        if c in live.columns:
+            live[c] = clean_numeric_series(live[c])
 
-    rows = []
-    for idx, c in enumerate(contracts, start=1):
-        hist_df = fetch_contract_daily_history(c["exp"].strftime("%Y-%m-%d"))
-        if hist_df.empty:
-            hist_row = {}
-        else:
-            hist_df = hist_df.sort_values("trade_date") if "trade_date" in hist_df.columns else hist_df
-            hist_row = hist_df.iloc[-1].to_dict()
-        lrow = live_map.get(c["slash_symbol"], {})
+    live = live.sort_values("expiration").head(n_months).reset_index(drop=True)
+    today = pd.Timestamp(date.today())
+    live["dte"] = (live["expiration"] - today).dt.days
+    live["m"] = [f"M{i}" for i in range(1, len(live) + 1)]
+    live["label"] = live["expiration"].dt.strftime("%b %y")
 
-        close_px = hist_row.get("close")
-        last_px = lrow.get("last")
-        if pd.isna(last_px) or last_px in (None, 0):
-            last_px = close_px
-        settlement_px = lrow.get("settlement") if pd.notna(lrow.get("settlement")) else hist_row.get("settlement")
-        open_px = hist_row.get("open")
-        high_px = lrow.get("high") if pd.notna(lrow.get("high")) else hist_row.get("high")
-        low_px = lrow.get("low") if pd.notna(lrow.get("low")) else hist_row.get("low")
-        volume_px = lrow.get("volume") if pd.notna(lrow.get("volume")) else hist_row.get("volume")
-        prev_close = None
-        if isinstance(hist_df, pd.DataFrame) and not hist_df.empty and len(hist_df) >= 2 and "close" in hist_df.columns:
-            prev_close = hist_df["close"].iloc[-2]
-        change_px = None
-        if pd.notna(lrow.get("change")):
-            change_px = lrow.get("change")
-        elif pd.notna(last_px) and pd.notna(prev_close):
-            change_px = float(last_px) - float(prev_close)
+    # Web table does not provide official Open or daily Close.
+    # Keep them empty instead of inventing values.
+    if "open" not in live.columns:
+        live["open"] = np.nan
+    if "close" not in live.columns:
+        live["close"] = np.nan
 
-        rows.append(
-            {
-                "m": f"M{idx}",
-                "label": c["label"],
-                "symbol": c["slash_symbol"],
-                "expiration": c["exp"],
-                "dte": c["dte"],
-                "last": last_px,
-                "close": close_px,
-                "open": open_px,
-                "high": high_px,
-                "low": low_px,
-                "settlement": settlement_px,
-                "change": change_px,
-                "volume": volume_px,
-                "prev_close": prev_close,
-                "source_last": "CBOE web scraping" if pd.notna(lrow.get("last")) else "CBOE contract CSV fallback",
-                "source_ohlc": "CBOE contract CSV + live high/low/volume when available",
-            }
-        )
+    # Derived previous close from live table when possible.
+    live["prev_close"] = np.where(live["last"].notna() & live["change"].notna(), live["last"] - live["change"], np.nan)
 
-    curve = pd.DataFrame(rows)
-    curve["term_price"] = curve["last"].where(curve["last"].notna(), curve["close"])
-    curve["contango_pct_vs_prev"] = (curve["term_price"] / curve["term_price"].shift(1) - 1) * 100
-    curve["difference_vs_prev"] = curve["term_price"] - curve["term_price"].shift(1)
-    return curve
+    # Primary curve price must be LAST of the nearest monthly future, with settlement fallback.
+    live["term_price"] = np.where(live["last"].notna(), live["last"], live["settlement"])
+    live["source_last"] = "CBOE web table"
+    live["source_ohlc"] = "CBOE web table (LAST/HIGH/LOW/SETTLEMENT/VOLUME only)"
 
+    live["contango_pct_vs_prev"] = (live["term_price"] / live["term_price"].shift(1) - 1) * 100
+    live["difference_vs_prev"] = live["term_price"] - live["term_price"].shift(1)
+
+    ordered_cols = [
+        "m", "label", "symbol", "expiration", "dte", "term_price", "last", "close", "open",
+        "high", "low", "settlement", "change", "volume", "prev_close", "source_last", "source_ohlc",
+        "contango_pct_vs_prev", "difference_vs_prev"
+    ]
+    return live[[c for c in ordered_cols if c in live.columns]].copy()
 
 # =========================================================
 # STRATEGY
