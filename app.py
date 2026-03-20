@@ -189,6 +189,7 @@ MONTH_CODES = {1:'F',2:'G',3:'H',4:'J',5:'K',6:'M',7:'N',8:'Q',9:'U',10:'V',11:'
 MONTH_NAMES_SHORT = {1:'Jan',2:'Feb',3:'Mar',4:'Apr',5:'May',6:'Jun',7:'Jul',8:'Aug',9:'Sep',10:'Oct',11:'Nov',12:'Dec'}
 MONTHLY_VX_RE = re.compile(r"^VX/[FGHJKMNQUVXZ]\d$")
 CBOE_VIX_FUTURES_URL = "https://www.cboe.com/tradable-products/vix/vix-futures/"
+CBOE_VIX_SETTLEMENT_CSV = "https://www.cboe.com/us/futures/market_statistics/settlement/csv"
 CBOE_VIX_HISTORICAL_CSV = "https://cdn.cboe.com/data/us/futures/market_statistics/historical_data/products/csv/VX/VX_{exp}.csv"
 USER_AGENT = {
     "User-Agent": (
@@ -330,11 +331,61 @@ def _normalize_live_table(df: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_data(ttl=300)
 def fetch_cboe_live_monthly_curve() -> pd.DataFrame:
-    """Read the live VX market-data table directly from Cboe and keep monthly contracts only."""
+    """
+    Primary source: official Cboe daily settlement CSV for all futures on the selected date.
+    This is more stable than scraping the rendered product page.
+    Fallback: try parsing the public VIX futures page.
+    """
+    today_str = pd.Timestamp(date.today()).strftime("%Y-%m-%d")
+
+    # Attempt 1: official settlement CSV endpoint for today
+    try:
+        resp = requests.get(
+            CBOE_VIX_SETTLEMENT_CSV,
+            params={"dt": today_str},
+            headers=USER_AGENT,
+            timeout=20,
+        )
+        resp.raise_for_status()
+        df = pd.read_csv(io.StringIO(resp.text))
+
+        # Expected columns typically include Product, Symbol, Expiration Date, Daily Settlement Price
+        rename_map = {}
+        for c in df.columns:
+            c_low = str(c).strip().lower()
+            if c_low == "symbol":
+                rename_map[c] = "Symbol"
+            elif "expiration" in c_low:
+                rename_map[c] = "Expiration"
+            elif "settlement" in c_low or c_low == "price":
+                rename_map[c] = "Settlement"
+            elif c_low == "product":
+                rename_map[c] = "Product"
+        df = df.rename(columns=rename_map)
+
+        if "Product" in df.columns:
+            df = df[df["Product"].astype(str).str.upper().eq("VX")].copy()
+        if "Symbol" in df.columns:
+            df["Symbol"] = df["Symbol"].astype(str).str.strip().str.upper()
+            df = df[df["Symbol"].apply(is_monthly_vx_symbol)].copy()
+        if "Expiration" in df.columns:
+            df["Expiration"] = pd.to_datetime(df["Expiration"], errors="coerce")
+        if "Settlement" in df.columns:
+            df["Settlement"] = df["Settlement"].apply(safe_float)
+
+        if not df.empty and {"Symbol", "Expiration", "Settlement"}.issubset(df.columns):
+            df["Last"] = np.nan
+            df["Change"] = np.nan
+            df["Price"] = df["Settlement"]
+            df = df.dropna(subset=["Expiration", "Price"]).sort_values("Expiration").reset_index(drop=True)
+            return df[["Symbol", "Expiration", "Last", "Change", "Settlement", "Price"]]
+    except Exception:
+        pass
+
+    # Attempt 2: product page scrape fallback
     resp = requests.get(CBOE_VIX_FUTURES_URL, headers=USER_AGENT, timeout=20)
     resp.raise_for_status()
 
-    # Attempt 1: HTML table parsing
     try:
         tables = pd.read_html(io.StringIO(resp.text))
     except Exception:
@@ -345,7 +396,6 @@ def fetch_cboe_live_monthly_curve() -> pd.DataFrame:
         if not normalized.empty:
             return normalized
 
-    # Attempt 2: flattened text fallback from the page body
     soup = BeautifulSoup(resp.text, "html.parser")
     text = soup.get_text("\n", strip=True)
     rows = []
@@ -372,11 +422,9 @@ def fetch_cboe_live_monthly_curve() -> pd.DataFrame:
             })
     df = pd.DataFrame(rows)
     if not df.empty:
-        df = df.sort_values("Expiration").reset_index(drop=True)
-        return df
+        return df.sort_values("Expiration").reset_index(drop=True)
 
-    raise ValueError("No se pudo extraer la tabla de futuros VX desde Cboe.")
-
+    raise ValueError("No se pudo extraer la curva mensual de VX desde Cboe.")
 
 @st.cache_data(ttl=300)
 def fetch_vix_spot():
