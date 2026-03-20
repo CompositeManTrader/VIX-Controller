@@ -49,7 +49,7 @@ st.markdown(
     .brand span {color: var(--accent);}
     .subline {color: var(--muted); font-size: 0.86rem;}
     .micro {color: var(--muted); font-size: 0.76rem;}
-    .kpi-grid {display:grid; grid-template-columns: repeat(6, minmax(140px,1fr)); gap: 0.7rem; margin: 0.6rem 0 1rem;}
+    .kpi-grid {display:grid; grid-template-columns: repeat(7, minmax(140px,1fr)); gap: 0.7rem; margin: 0.6rem 0 1rem;}
     .kpi-card {
         background: linear-gradient(180deg, rgba(12,24,41,0.96) 0%, rgba(9,19,33,0.96) 100%);
         border: 1px solid rgba(78,167,255,0.16);
@@ -377,8 +377,9 @@ def build_monthly_curve(n_months: int = 8) -> pd.DataFrame:
     # Derived previous close from live table when possible.
     live["prev_close"] = np.where(live["last"].notna() & live["change"].notna(), live["last"] - live["change"], np.nan)
 
-    # Primary curve price must be LAST of the nearest monthly future, with settlement fallback.
-    live["term_price"] = np.where(live["last"].notna(), live["last"], live["settlement"])
+    # Primary curve price must be the live LAST from the CBOE web table.
+    # We keep settlement as a reference field, but the plotted curve and M1/M2 metrics use LAST.
+    live["term_price"] = live["last"]
     live["source_last"] = "CBOE web table"
     live["source_ohlc"] = "CBOE web table (LAST/HIGH/LOW/SETTLEMENT/VOLUME only)"
 
@@ -391,6 +392,54 @@ def build_monthly_curve(n_months: int = 8) -> pd.DataFrame:
         "contango_pct_vs_prev", "difference_vs_prev"
     ]
     return live[[c for c in ordered_cols if c in live.columns]].copy()
+
+
+
+def compute_curve_metrics(curve: pd.DataFrame) -> dict:
+    metrics = {}
+    if curve is None or curve.empty:
+        return metrics
+
+    prices = curve["term_price"].astype(float)
+    for i in range(1, len(curve)):
+        left = float(prices.iloc[i-1]) if pd.notna(prices.iloc[i-1]) else np.nan
+        right = float(prices.iloc[i]) if pd.notna(prices.iloc[i]) else np.nan
+        key = f"M{i}->M{i+1}"
+        if pd.notna(left) and pd.notna(right) and left != 0:
+            metrics[f"contango_{key}"] = (right / left - 1.0) * 100.0
+            metrics[f"difference_{key}"] = right - left
+        else:
+            metrics[f"contango_{key}"] = np.nan
+            metrics[f"difference_{key}"] = np.nan
+
+    if len(curve) >= 7:
+        m4 = float(prices.iloc[3]) if pd.notna(prices.iloc[3]) else np.nan
+        m7 = float(prices.iloc[6]) if pd.notna(prices.iloc[6]) else np.nan
+        metrics["month_7_to_4_contango"] = (m7 / m4 - 1.0) * 100.0 if pd.notna(m4) and pd.notna(m7) and m4 != 0 else np.nan
+        metrics["month_7_to_4_difference"] = m7 - m4 if pd.notna(m4) and pd.notna(m7) else np.nan
+    else:
+        metrics["month_7_to_4_contango"] = np.nan
+        metrics["month_7_to_4_difference"] = np.nan
+    return metrics
+
+
+def build_contango_summary_table(curve: pd.DataFrame) -> pd.DataFrame:
+    metrics = compute_curve_metrics(curve)
+    labels = [f"M{i}→M{i+1}" for i in range(1, min(len(curve), 8))]
+    out = {"Metric": ["% Contango", "Difference (pts)"]}
+    for i, lbl in enumerate(labels, start=1):
+        key = f"M{i}->M{i+1}"
+        out[lbl] = [
+            fmt_signed(metrics.get(f"contango_{key}"), suffix="%"),
+            fmt_signed(metrics.get(f"difference_{key}")),
+        ]
+    if len(curve) >= 7:
+        out["Month 7 to 4"] = [
+            fmt_signed(metrics.get("month_7_to_4_contango"), suffix="%"),
+            fmt_signed(metrics.get("month_7_to_4_difference")),
+        ]
+    return pd.DataFrame(out)
+
 
 # =========================================================
 # STRATEGY
@@ -632,16 +681,19 @@ if curve is not None:
     m1m2_pct = ((float(m2['term_price']) / float(m1['term_price']) - 1) * 100) if m2 is not None and pd.notna(m1['term_price']) and pd.notna(m2['term_price']) else None
     vix_m1 = (float(m1['term_price']) - float(spot_last)) if (spot_last is not None and pd.notna(m1['term_price'])) else None
     total_curve = ((float(curve.iloc[-1]['term_price']) / float(m1['term_price']) - 1) * 100) if len(curve) > 1 and pd.notna(curve.iloc[-1]['term_price']) and pd.notna(m1['term_price']) else None
+    curve_metrics = compute_curve_metrics(curve)
+    m7_4_contango = curve_metrics.get("month_7_to_4_contango")
 
     st.markdown(
         f"""
 <div class="kpi-grid">
   <div class="kpi-card"><div class="kpi-label">VIX Spot</div><div class="kpi-value">{fmt_num(spot_last)}</div><div class="kpi-sub {value_class(spot.get('change') if spot else None)}">{fmt_signed(spot.get('change') if spot else None)} ({fmt_signed(spot.get('pct_change') if spot else None, suffix='%')})</div></div>
-  <div class="kpi-card"><div class="kpi-label">M1 · {m1['dte']} DTE</div><div class="kpi-value">{fmt_num(m1['term_price'])}</div><div class="kpi-sub">{m1['symbol']} · Last source: {m1['source_last']}</div></div>
+  <div class="kpi-card"><div class="kpi-label">M1 · {m1['dte']} DTE</div><div class="kpi-value">{fmt_num(m1['term_price'])}</div><div class="kpi-sub">{m1['symbol']} · Live LAST</div></div>
   <div class="kpi-card"><div class="kpi-label">M2</div><div class="kpi-value">{fmt_num(m2['term_price'] if m2 is not None else None)}</div><div class="kpi-sub">{m2['symbol'] if m2 is not None else '—'}</div></div>
   <div class="kpi-card"><div class="kpi-label">VIX ↔ M1 basis</div><div class="kpi-value {value_class(vix_m1)}">{fmt_signed(vix_m1)}</div><div class="kpi-sub">M1 minus spot</div></div>
   <div class="kpi-card"><div class="kpi-label">M1 → M2 contango</div><div class="kpi-value {value_class(m1m2_pct)}">{fmt_signed(m1m2_pct, suffix='%')}</div><div class="kpi-sub">Positive = contango</div></div>
   <div class="kpi-card"><div class="kpi-label">M1 → M8 total curve</div><div class="kpi-value {value_class(total_curve)}">{fmt_signed(total_curve, suffix='%')}</div><div class="kpi-sub">Back-end slope</div></div>
+  <div class="kpi-card"><div class="kpi-label">Month 7 to 4</div><div class="kpi-value {value_class(m7_4_contango)}">{fmt_signed(m7_4_contango, suffix='%')}</div><div class="kpi-sub">M7 vs M4 contango</div></div>
 </div>
 """,
         unsafe_allow_html=True,
@@ -660,16 +712,11 @@ with term_tab:
         col_chart, col_table = st.columns([2.0, 1.15], gap="large")
         with col_chart:
             st.plotly_chart(build_term_structure_chart(curve, spot), use_container_width=True)
-            table_contango = pd.DataFrame(
-                {
-                    "Month": curve["m"],
-                    "% Contango vs Prev": curve["contango_pct_vs_prev"].map(lambda x: fmt_signed(x, suffix="%")),
-                    "Difference vs Prev": curve["difference_vs_prev"].map(fmt_signed),
-                }
-            )
+            st.markdown('<div class="panel-title">Contango & Difference Summary</div><div class="panel-sub">Calculated off the difference between adjacent monthly contracts using live LAST prices: M1 vs M2, M2 vs M3, and so on. Month 7 to 4 is calculated as M7 relative to M4.</div>', unsafe_allow_html=True)
+            table_contango = build_contango_summary_table(curve)
             st.dataframe(table_contango, use_container_width=True, hide_index=True)
         with col_table:
-            st.markdown('<div class="panel-title">Monthly VX quote panel</div><div class="panel-sub">M1, M2 and the full curve are built from the nearest monthly VX expirations. The displayed term price uses CBOE LAST first, then CLOSE, then SETTLEMENT. OHLC columns come from the official CBOE contract history files.</div>', unsafe_allow_html=True)
+            st.markdown('<div class="panel-title">Monthly VX quote panel</div><div class="panel-sub">M1, M2 and the full curve are built from the nearest monthly VX expirations. The displayed term price uses the live CBOE LAST field. Settlement remains as a reference field only. Open and Close are intentionally left blank when the CBOE web table does not publish them.</div>', unsafe_allow_html=True)
             display = curve[["m", "label", "symbol", "expiration", "dte", "term_price", "last", "close", "open", "high", "low", "settlement", "change", "volume"]].copy()
             display["expiration"] = pd.to_datetime(display["expiration"]).dt.strftime("%Y-%m-%d")
             for c in ["term_price", "last", "close", "open", "high", "low", "settlement", "change", "volume"]:
@@ -751,4 +798,4 @@ with diag_tab:
             dbg["expiration"] = pd.to_datetime(dbg["expiration"]).dt.strftime("%Y-%m-%d")
             st.dataframe(dbg, use_container_width=True, hide_index=True)
 
-st.caption("Monthly curve uses web scraping from the official CBOE VIX Futures product page for live monthly VX rows and CBOE individual contract history CSVs for close/open plus fallback values. Strategy logic adapted from your uploaded Monitor_Operativo_v3 notebook.")
+st.caption("Monthly curve uses web scraping from the official CBOE VIX Futures product page for live monthly VX rows. The plotted term structure and all contango calculations are based on the live CBOE LAST field; settlement is shown only as a reference. Strategy logic adapted from your uploaded Monitor_Operativo_v3 notebook.")
