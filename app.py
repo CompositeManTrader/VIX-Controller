@@ -221,14 +221,14 @@ def fetch_vix_spot():
 
 
 def choose_price_col(df: pd.DataFrame) -> str:
-    preferred = ["Last", "Settle", "Close"]
+    preferred = ["Last", "Settle", "Close", "Price"]
     for c in preferred:
         if c in df.columns:
             return c
 
     for c in df.columns:
         cl = str(c).strip().lower().replace("_", " ")
-        if any(k in cl for k in ["last", "settle", "close"]):
+        if any(k in cl for k in ["last", "settle", "close", "price"]):
             return c
 
     raise ValueError("No encontré una columna de precio usable en settlement de CBOE. Columnas detectadas: " + ", ".join(map(str, df.columns)))
