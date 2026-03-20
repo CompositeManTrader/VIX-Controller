@@ -496,58 +496,88 @@ def build_strategy_snapshot(curve: pd.DataFrame) -> dict:
 # =========================================================
 # CHARTS
 # =========================================================
+
 def build_term_structure_chart(curve: pd.DataFrame, spot: Optional[dict]) -> go.Figure:
     fig = go.Figure()
     x = curve["label"].tolist()
-    y = curve["term_price"].tolist()
+
     fig.add_trace(
         go.Scatter(
             x=x,
-            y=y,
+            y=curve["term_price"],
             mode="lines+markers+text",
-            text=[fmt_num(v, 2) for v in y],
+            text=[fmt_num(v, 2) for v in curve["term_price"]],
             textposition="top center",
-            name="Last",
-            line=dict(color="#3da5ff", width=3, shape="spline"),
-            marker=dict(size=9, color="#3da5ff"),
-            hovertemplate="<b>%{x}</b><br>Last: %{y:.2f}<extra></extra>",
+            name="Last / Term Price",
+            line=dict(color="#39a0ff", width=3.2, shape="spline"),
+            marker=dict(size=8, color="#39a0ff"),
+            hovertemplate="<b>%{x}</b><br>Term Price: %{y:.2f}<extra></extra>",
         )
     )
 
-    if curve["close"].notna().any():
-        fig.add_trace(
-            go.Scatter(
-                x=x,
-                y=curve["close"],
-                mode="lines+markers",
-                name="Close",
-                line=dict(color="#98a6bd", width=1.5, dash="dot"),
-                marker=dict(size=6, color="#98a6bd"),
-                hovertemplate="<b>%{x}</b><br>Close: %{y:.2f}<extra></extra>",
+    series_meta = [
+        ("close", "Close", "#A8B3C7", "dot"),
+        ("open", "Open", "#F2C14E", "dot"),
+        ("high", "High", "#4CD7A2", "dot"),
+        ("low", "Low", "#FF7F7F", "dot"),
+    ]
+    for col, name, color, dash in series_meta:
+        if col in curve.columns and curve[col].notna().any():
+            fig.add_trace(
+                go.Scatter(
+                    x=x,
+                    y=curve[col],
+                    mode="lines+markers",
+                    name=name,
+                    line=dict(color=color, width=1.6, dash=dash),
+                    marker=dict(size=5, color=color),
+                    visible="legendonly" if name != "Close" else True,
+                    hovertemplate=f"<b>%{{x}}</b><br>{name}: %{{y:.2f}}<extra></extra>",
+                )
             )
-        )
 
     if spot and spot.get("last") is not None:
         fig.add_hline(
             y=float(spot["last"]),
             line_width=2,
-            line_color="#56d364",
+            line_color="#6DD36F",
             line_dash="dash",
             annotation_text=f"VIX Spot {spot['last']:.2f}",
             annotation_position="top right",
-            annotation_font_color="#56d364",
+            annotation_font_color="#6DD36F",
         )
 
     fig.update_layout(
-        title=dict(text="VIX Futures Term Structure", x=0.5, font=dict(size=24, color="#e8eef8")),
-        paper_bgcolor="#0b1728",
-        plot_bgcolor="#0b1728",
-        font=dict(color="#d7e4f5"),
-        height=500,
-        margin=dict(l=40, r=30, t=70, b=45),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        xaxis=dict(title="Future Month", gridcolor="rgba(144,164,195,0.08)", zeroline=False),
-        yaxis=dict(title="Volatility", gridcolor="rgba(144,164,195,0.08)", zeroline=False),
+        title=dict(text="VIX Futures Term Structure", x=0.5, font=dict(size=26, color="#F3F7FF")),
+        paper_bgcolor="#081321",
+        plot_bgcolor="#0A182A",
+        font=dict(color="#E6EEF9"),
+        height=560,
+        margin=dict(l=40, r=30, t=80, b=55),
+        legend=dict(
+            orientation="v",
+            yanchor="top",
+            y=1,
+            xanchor="left",
+            x=1.01,
+            bgcolor="rgba(8,19,33,0.7)",
+            bordercolor="rgba(61,165,255,0.15)",
+            borderwidth=1,
+        ),
+        xaxis=dict(
+            title="Future Month",
+            gridcolor="rgba(168,179,199,0.10)",
+            zeroline=False,
+            showline=True,
+            linecolor="rgba(168,179,199,0.18)",
+        ),
+        yaxis=dict(
+            title="Volatility",
+            gridcolor="rgba(168,179,199,0.10)",
+            zeroline=False,
+            showline=True,
+            linecolor="rgba(168,179,199,0.18)",
+        ),
         hovermode="x unified",
     )
     return fig
@@ -609,7 +639,7 @@ st.markdown(
         <div class="brand">VX <span>Term Structure Monitor</span></div>
         <div class="subline">Institutional dashboard for monthly VIX futures curve, regime diagnostics and short-vol execution monitor.</div>
     </div>
-    <div class="micro">{now_txt} · Live curve: CBOE VIX futures page · OHLC/Close: CBOE contract history CSV · Spot: Yahoo Finance fallback</div>
+    <div class="micro">{now_txt} · Monthly curve: CBOE official VX contract history CSVs · Settlement overlay: CBOE settlement CSV · Spot: Yahoo fallback</div>
 </div>
 """,
     unsafe_allow_html=True,
@@ -638,7 +668,7 @@ if curve is not None:
     )
 
 if curve_error:
-    st.markdown(f'<div class="warnbox"><b>No se pudo cargar la curva mensual de VIX desde CBOE.</b><br>Detalle técnico: {curve_error}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="warnbox"><b>No se pudo construir la curva mensual de VIX desde CBOE.</b><br>Detalle técnico: {curve_error}</div>', unsafe_allow_html=True)
 
 if spot_error:
     st.markdown(f'<div class="warnbox"><b>No se pudo cargar VIX spot.</b><br>Detalle técnico: {spot_error}</div>', unsafe_allow_html=True)
@@ -659,10 +689,10 @@ with term_tab:
             )
             st.dataframe(table_contango, use_container_width=True, hide_index=True)
         with col_table:
-            st.markdown('<div class="panel-title">Monthly VX quote panel</div><div class="panel-sub">M1 must use the nearest monthly contract \"Last\" from CBOE when available; otherwise the app falls back to the latest daily close from the official contract CSV.</div>', unsafe_allow_html=True)
-            display = curve[["m", "label", "symbol", "expiration", "dte", "last", "close", "open", "high", "low", "settlement", "change"]].copy()
+            st.markdown('<div class="panel-title">Monthly VX quote panel</div><div class="panel-sub">M1, M2 and the full curve are built from the nearest monthly VX expirations. The displayed term price uses CBOE LAST first, then CLOSE, then SETTLEMENT. OHLC columns come from the official CBOE contract history files.</div>', unsafe_allow_html=True)
+            display = curve[["m", "label", "symbol", "expiration", "dte", "term_price", "last", "close", "open", "high", "low", "settlement", "change"]].copy()
             display["expiration"] = pd.to_datetime(display["expiration"]).dt.strftime("%Y-%m-%d")
-            for c in ["last", "close", "open", "high", "low", "settlement", "change"]:
+            for c in ["term_price", "last", "close", "open", "high", "low", "settlement", "change"]:
                 display[c] = display[c].map(fmt_num if c != "change" else fmt_signed)
             st.dataframe(display, use_container_width=True, hide_index=True, height=500)
     else:
