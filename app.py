@@ -131,21 +131,21 @@ def fetch_cboe_vix_table() -> pd.DataFrame:
         rename_map = {}
         for c in df.columns:
             lc = c.strip().lower()
-            if lc == "symbol":
+            if lc in {"symbol", "future", "future symbol"}:
                 rename_map[c] = "Symbol"
-            elif lc == "expiration":
+            elif lc in {"expiration", "expiration date"}:
                 rename_map[c] = "Expiration"
-            elif lc == "last":
+            elif lc in {"last", "last price", "price"} or "last" in lc:
                 rename_map[c] = "Last"
-            elif lc == "change":
+            elif lc == "change" or "change" in lc:
                 rename_map[c] = "Change"
-            elif lc == "high":
+            elif lc == "high" or "high" in lc:
                 rename_map[c] = "High"
-            elif lc == "low":
+            elif lc == "low" or "low" in lc:
                 rename_map[c] = "Low"
-            elif lc == "settlement":
+            elif lc in {"settlement", "settlement price", "daily settlement price"} or "settlement" in lc:
                 rename_map[c] = "Settlement"
-            elif lc == "volume":
+            elif lc == "volume" or "volume" in lc:
                 rename_map[c] = "Volume"
         df = df.rename(columns=rename_map)
 
