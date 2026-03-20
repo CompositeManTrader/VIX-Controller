@@ -281,9 +281,11 @@ m1m2_pts = (m2 - m1) if pd.notna(m1) and pd.notna(m2) else None
 
 c1, c2, c3, c4 = st.columns(4)
 with c1:
-    st.markdown(f"<div class='metricbox'><div class='label'>M1 Last</div><div class='value'>{m1:.2f}</div></div>", unsafe_allow_html=True)
+    val = f"{m1:.2f}" if pd.notna(m1) else "N/A"
+    st.markdown(f"<div class='metricbox'><div class='label'>M1 Last</div><div class='value'>{val}</div></div>", unsafe_allow_html=True)
 with c2:
-    st.markdown(f"<div class='metricbox'><div class='label'>M2 Last</div><div class='value'>{m2:.2f}</div></div>", unsafe_allow_html=True)
+    val = f"{m2:.2f}" if pd.notna(m2) else "N/A"
+    st.markdown(f"<div class='metricbox'><div class='label'>M2 Last</div><div class='value'>{val}</div></div>", unsafe_allow_html=True)
 with c3:
     val = f"{m1m2_pct:.2f}%" if m1m2_pct is not None else "N/A"
     st.markdown(f"<div class='metricbox'><div class='label'>M1→M2 % Contango</div><div class='value'>{val}</div></div>", unsafe_allow_html=True)
@@ -296,8 +298,11 @@ with left:
     st.plotly_chart(chart_curve(curve), use_container_width=True)
 with right:
     st.markdown("<div class='section-title'>Spread Metrics</div>", unsafe_allow_html=True)
+    spreads_display = spreads.copy()
+    spreads_display["% Contango"] = spreads_display["% Contango"].apply(lambda x: f"{x:.2f}%" if pd.notna(x) else "N/A")
+    spreads_display["Difference"] = spreads_display["Difference"].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "N/A")
     st.dataframe(
-        spreads.style.format({"% Contango": "{:.2f}%", "Difference": "{:.2f}"}),
+        spreads_display,
         use_container_width=True,
         hide_index=True,
     )
@@ -311,10 +316,19 @@ with right:
 st.markdown("<div class='section-title'>Monthly VX Table</div>", unsafe_allow_html=True)
 show_df = curve[["M", "Symbol", "Expiration", "Last", "Change", "High", "Low", "Settlement", "Volume"]].copy()
 show_df["Expiration"] = show_df["Expiration"].dt.strftime("%Y-%m-%d")
+show_display = show_df.copy()
+for col, fmt in {
+    "Last": lambda x: f"{x:.2f}" if pd.notna(x) else "N/A",
+    "Change": lambda x: f"{x:.3f}" if pd.notna(x) else "N/A",
+    "High": lambda x: f"{x:.2f}" if pd.notna(x) else "N/A",
+    "Low": lambda x: f"{x:.2f}" if pd.notna(x) else "N/A",
+    "Settlement": lambda x: f"{x:.4f}" if pd.notna(x) else "N/A",
+    "Volume": lambda x: f"{x:,.0f}" if pd.notna(x) else "N/A",
+}.items():
+    show_display[col] = show_display[col].apply(fmt)
+
 st.dataframe(
-    show_df.style.format({
-        "Last": "{:.2f}", "Change": "{:.3f}", "High": "{:.2f}", "Low": "{:.2f}", "Settlement": "{:.4f}", "Volume": "{:,.0f}"
-    }),
+    show_display,
     use_container_width=True,
     hide_index=True,
 )
