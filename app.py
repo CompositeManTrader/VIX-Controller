@@ -1,353 +1,801 @@
-import re
-from datetime import datetime
-
-import pandas as pd
-import plotly.graph_objects as go
+"""
+VIX Controller — Bloomberg-Style Term Structure + Operational Monitor
+Data: CBOE Delayed Quotes via Playwright scraping (same as notebook)
+Auto-refresh: every 60 seconds
+"""
 import streamlit as st
-from selenium import webdriver
-from selenium.common.exceptions import TimeoutException, WebDriverException
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+import yfinance as yf
+from datetime import datetime, timedelta, date
+from io import StringIO
+import re, time, warnings, subprocess, sys
+warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="VIX Term Structure", page_icon="📈", layout="wide")
+st.set_page_config(page_title="VIX Controller", page_icon="🔴", layout="wide",
+                   initial_sidebar_state="collapsed")
 
-CBOE_URL = "https://www.cboe.com/tradable-products/vix/vix-futures/"
-MONTH_ORDER = {"F": 1, "G": 2, "H": 3, "J": 4, "K": 5, "M": 6, "N": 7, "Q": 8, "U": 9, "V": 10, "X": 11, "Z": 12}
-
-st.markdown(
-    """
-    <style>
-    .stApp { background: #0b1220; color: #e5e7eb; }
-    .block-container { max-width: 1280px; padding-top: 1rem; }
-    .hero {
-        padding: 1rem 1.25rem; border: 1px solid rgba(148,163,184,.18); border-radius: 14px;
-        background: linear-gradient(180deg, rgba(15,23,42,.9), rgba(2,6,23,.96));
-        margin-bottom: 1rem;
-    }
-    .hero h1 { margin: 0; font-size: 1.8rem; color: #f8fafc; }
-    .hero p { margin: .35rem 0 0 0; color: #94a3b8; }
-    .smallnote { color: #94a3b8; font-size: .88rem; }
-    .metricbox {
-        border: 1px solid rgba(148,163,184,.14); border-radius: 12px; padding: .85rem 1rem;
-        background: rgba(15,23,42,.78);
-    }
-    .metricbox .label { color: #94a3b8; font-size: .78rem; text-transform: uppercase; letter-spacing: .04em; }
-    .metricbox .value { color: #f8fafc; font-size: 1.45rem; font-weight: 700; }
-    .section-title { font-size: 1.05rem; font-weight: 700; color: #f8fafc; margin: .75rem 0; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-def is_monthly_vx(symbol: str) -> bool:
-    return bool(re.fullmatch(r"VX/[FGHJKMNQUVXZ]\d", str(symbol).strip().upper()))
-
-
-
-def infer_sort_key(symbol: str):
-    s = str(symbol).strip().upper()
-    m = re.fullmatch(r"VX/([FGHJKMNQUVXZ])(\d)", s)
-    if not m:
-        return (9999, 99)
-    month_code, year_digit = m.groups()
-    # assume current decade for single-digit CBOE symbol style, adequate for near-term VX curve
-    current_decade = (datetime.utcnow().year // 10) * 10
-    year = current_decade + int(year_digit)
-    if year < datetime.utcnow().year - 1:
-        year += 10
-    return (year, MONTH_ORDER.get(month_code, 99))
-
-
-
-def build_driver() -> webdriver.Chrome:
-    options = Options()
-    options.binary_location = "/usr/bin/chromium"
-    options.add_argument("--headless=new")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--window-size=1600,1200")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
-
-    service = Service("/usr/bin/chromedriver")
-    return webdriver.Chrome(service=service, options=options)
-
-
-@st.cache_data(ttl=120)
-def fetch_cboe_vix_table() -> pd.DataFrame:
-    driver = None
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ENSURE PLAYWRIGHT IS INSTALLED (runs once)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+@st.cache_resource
+def install_playwright():
+    """Install Playwright Chromium browser (runs once per deployment)."""
     try:
-        driver = build_driver()
-        driver.get(CBOE_URL)
+        from playwright.sync_api import sync_playwright
+        # Quick check if browser is already installed
+        with sync_playwright() as p:
+            b = p.chromium.launch(headless=True, args=['--no-sandbox'])
+            b.close()
+        return True
+    except Exception:
+        try:
+            subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"],
+                          capture_output=True, timeout=120)
+            subprocess.run([sys.executable, "-m", "playwright", "install-deps", "chromium"],
+                          capture_output=True, timeout=120)
+            return True
+        except Exception as e:
+            return False
 
-        WebDriverWait(driver, 45).until(
-            EC.presence_of_element_located((By.TAG_NAME, "table"))
-        )
+pw_ok = install_playwright()
 
-        WebDriverWait(driver, 45).until(
-            lambda d: d.execute_script(
-                """
-                const tables = document.querySelectorAll('table');
-                for (const table of tables) {
-                    const rows = [...table.querySelectorAll('tbody tr')];
-                    for (const r of rows) {
-                        const txt = (r.innerText || '').trim();
-                        if (txt.includes('VX/')) return true;
-                    }
-                }
-                return false;
-                """
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# BLOOMBERG CSS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Inter:wght@400;500;600;700;800&display=swap');
+:root{--bg:#0D1117;--card:#161B22;--border:#30363D;--g:#3FB950;--r:#F85149;--y:#D29922;--b:#58A6FF;--c:#39D2C0;--t:#C9D1D9;--dim:#8B949E;--w:#F0F6FC;--gbg:#0B2E13;--rbg:#3B1218;}
+.stApp{background:var(--bg);}
+#MainMenu,footer,header{visibility:hidden;}
+.block-container{padding:0.5rem 1.5rem;max-width:1400px;}
+.hdr{display:flex;align-items:center;padding:0.5rem 0;border-bottom:2px solid #F7931A;margin-bottom:0.8rem;}
+.hdr .logo{font-family:'Inter',sans-serif;font-weight:800;font-size:1.3rem;color:#F7931A;letter-spacing:1px;}
+.hdr .sub{font-family:'JetBrains Mono',monospace;font-size:0.7rem;color:var(--dim);margin-left:auto;}
+.mrow{display:flex;gap:4px;margin-bottom:0.6rem;flex-wrap:wrap;}
+.mpill{background:var(--card);border:1px solid var(--border);border-radius:4px;padding:0.4rem 0.7rem;flex:1;min-width:120px;text-align:center;}
+.mpill .ml{font-family:'JetBrains Mono',monospace;font-size:0.58rem;color:var(--dim);text-transform:uppercase;letter-spacing:0.6px;}
+.mpill .mv{font-family:'Inter',sans-serif;font-weight:700;font-size:1.15rem;}
+.mv.up{color:var(--g);}.mv.dn{color:var(--r);}.mv.nt{color:var(--b);}
+.ctx{width:100%;border-collapse:collapse;font-family:'JetBrains Mono',monospace;font-size:0.78rem;margin:0.4rem 0;}
+.ctx td,.ctx th{padding:0.35rem 0.5rem;text-align:center;border:1px solid var(--border);}
+.ctx th{background:#1C2128;color:var(--dim);font-weight:500;font-size:0.65rem;text-transform:uppercase;}
+.ctx .pos{color:var(--g);}.ctx .neg{color:var(--r);}
+.ctx .hdr-cell{background:var(--card);color:var(--t);font-weight:600;text-align:left;width:120px;}
+.dtbl{width:100%;border-collapse:collapse;font-family:'JetBrains Mono',monospace;font-size:0.75rem;margin-top:0.5rem;}
+.dtbl th{color:var(--b);font-weight:500;padding:0.4rem 0.6rem;border-bottom:1px solid var(--border);font-size:0.62rem;text-transform:uppercase;letter-spacing:0.5px;text-align:center;}
+.dtbl td{padding:0.35rem 0.6rem;text-align:center;color:var(--t);border-bottom:1px solid rgba(255,255,255,0.03);}
+.dtbl tr:hover td{background:rgba(88,166,255,0.04);}
+.sig-box{border-radius:6px;padding:1rem;text-align:center;border-width:2px;border-style:solid;}
+.sig-long{background:var(--gbg);border-color:var(--g);}
+.sig-cash{background:var(--rbg);border-color:var(--r);}
+.sig-box .sl{font-family:'Inter',sans-serif;font-weight:800;font-size:2rem;}
+.sig-box .sd{font-family:'JetBrains Mono',monospace;font-size:0.7rem;color:var(--dim);margin-top:2px;}
+.chk{display:flex;align-items:center;gap:0.5rem;padding:0.3rem 0;font-family:'JetBrains Mono',monospace;font-size:0.82rem;color:var(--t);}
+.chk .ok{color:var(--g);font-weight:700;}.chk .no{color:var(--r);font-weight:700;}
+.icard{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:0.8rem 1rem;margin-bottom:0.5rem;}
+.icard .ic-title{font-family:'Inter',sans-serif;font-weight:700;font-size:0.85rem;color:var(--w);margin-bottom:0.5rem;border-bottom:1px solid var(--border);padding-bottom:0.3rem;}
+.icard .ic-row{display:flex;justify-content:space-between;padding:0.2rem 0;font-family:'JetBrains Mono',monospace;font-size:0.8rem;}
+.icard .ic-label{color:var(--dim);}.icard .ic-val{color:var(--t);font-weight:500;}
+.stTabs [data-baseweb="tab-list"]{gap:0;border-bottom:1px solid var(--border);}
+.stTabs [data-baseweb="tab"]{font-family:'Inter',sans-serif;font-weight:600;font-size:0.82rem;color:var(--dim);padding:0.5rem 1.5rem;}
+.stTabs [aria-selected="true"]{color:#F7931A !important;border-bottom:2px solid #F7931A !important;}
+[data-testid="stSidebar"]{background:var(--card);}
+</style>
+""", unsafe_allow_html=True)
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CONSTANTS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CBOE_URL = 'https://www.cboe.com/delayed_quotes/futures/future_quotes'
+MONTHLY_RE = re.compile(r'^VX/[A-Z]\d+$')
+MN = {1:'Jan',2:'Feb',3:'Mar',4:'Apr',5:'May',6:'Jun',7:'Jul',8:'Aug',9:'Sep',10:'Oct',11:'Nov',12:'Dec'}
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# DATA LAYER — PLAYWRIGHT SCRAPING (from your working notebook)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@st.cache_data(ttl=55)
+def scrape_cboe_futures() -> pd.DataFrame:
+    """
+    Scrape CBOE delayed quotes page using Playwright (headless Chromium).
+    Returns DataFrame with only MONTHLY VX contracts.
+    Exact same logic as CBOE_VIX_Futures_Monthly_v4.ipynb
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return pd.DataFrame()
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
             )
-        )
-
-        payload = driver.execute_script(
-            """
-            const allTables = document.querySelectorAll('table');
-            let found = null;
-            allTables.forEach((table, idx) => {
-              const headers = [...table.querySelectorAll('th')].map(h => h.innerText.trim());
-              const rows = [...table.querySelectorAll('tbody tr')].map(r =>
-                [...r.querySelectorAll('td')].map(c => c.innerText.trim())
-              ).filter(r => r.some(c => c.includes('VX/')));
-              if (rows.length > 0 && !found) {
-                found = { index: idx, headers, rows };
-              }
-            });
-            return found;
-            """
-        )
-
-        if not payload or not payload.get("rows"):
-            raise RuntimeError("No encontré una tabla renderizada con filas VX/ en CBOE.")
-
-        headers = [str(h).strip().title() for h in payload["headers"]]
-        df = pd.DataFrame(payload["rows"], columns=headers)
-
-        rename_map = {}
-        for c in df.columns:
-            lc = c.strip().lower()
-            if lc in {"symbol", "future", "future symbol"}:
-                rename_map[c] = "Symbol"
-            elif lc in {"expiration", "expiration date"}:
-                rename_map[c] = "Expiration"
-            elif lc in {"last", "last price", "price"} or "last" in lc:
-                rename_map[c] = "Last"
-            elif lc == "change" or "change" in lc:
-                rename_map[c] = "Change"
-            elif lc == "high" or "high" in lc:
-                rename_map[c] = "High"
-            elif lc == "low" or "low" in lc:
-                rename_map[c] = "Low"
-            elif lc in {"settlement", "settlement price", "daily settlement price"} or "settlement" in lc:
-                rename_map[c] = "Settlement"
-            elif lc == "volume" or "volume" in lc:
-                rename_map[c] = "Volume"
-        df = df.rename(columns=rename_map)
-
-        required = ["Symbol", "Expiration", "Last", "Change", "High", "Low", "Settlement", "Volume"]
-        missing = [c for c in required if c not in df.columns]
-        if missing:
-            raise RuntimeError(f"La tabla renderizada no trajo las columnas esperadas. Faltan: {', '.join(missing)}. Detectadas: {list(df.columns)}")
-
-        df = df[df["Symbol"].apply(is_monthly_vx)].copy()
-        if df.empty:
-            raise RuntimeError("La tabla renderizada no devolvió contratos mensuales VX válidos.")
-
-        for col in ["Last", "Change", "High", "Low", "Settlement"]:
-            df[col] = (
-                df[col].astype(str).str.replace(",", "", regex=False).replace({"": None, "-": None, "--": None, "----": None})
+            ctx = browser.new_context(
+                user_agent=(
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                    'AppleWebKit/537.36 (KHTML, like Gecko) '
+                    'Chrome/120.0.0.0 Safari/537.36'
+                ),
+                viewport={'width': 1920, 'height': 1080},
+                locale='en-US',
             )
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+            page = ctx.new_page()
 
-        df["Volume"] = (
-            df["Volume"].astype(str).str.replace(",", "", regex=False).replace({"": None, "-": None, "--": None})
-        )
-        df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce")
-        df["Expiration"] = pd.to_datetime(df["Expiration"], errors="coerce")
+            # 1. Navigate
+            page.goto(CBOE_URL, wait_until='domcontentloaded', timeout=45000)
 
-        df = df.sort_values(["Expiration", "Symbol"]).reset_index(drop=True)
-        df["M"] = [f"M{i}" for i in range(1, len(df) + 1)]
-        df["term_price"] = df["Last"]
-        return df
-    except TimeoutException as e:
-        raise RuntimeError("Timeout esperando a que CBOE renderizara la tabla de VIX futures.") from e
-    except WebDriverException as e:
-        raise RuntimeError(f"No pude iniciar Chromium/ChromeDriver en el entorno de deploy: {e}") from e
-    finally:
-        if driver is not None:
-            driver.quit()
+            # 2. Wait for table to render (JS)
+            selectors = [
+                'table[class*="future"]', 'table[class*="quote"]',
+                '[class*="table-responsive"] table', 'main table', 'table',
+            ]
+            found = False
+            for sel in selectors:
+                try:
+                    page.wait_for_selector(sel, timeout=45000)
+                    found = True
+                    break
+                except:
+                    continue
+
+            if not found:
+                browser.close()
+                return pd.DataFrame()
+
+            # 3. Extra wait for all rows to load
+            page.wait_for_timeout(3000)
+
+            # 4. Get HTML
+            html = page.content()
+            browser.close()
+
+    except Exception as e:
+        st.sidebar.warning(f"Playwright error: {e}")
+        return pd.DataFrame()
+
+    # 5. Parse HTML tables
+    try:
+        all_tables = pd.read_html(StringIO(html))
+    except Exception:
+        return pd.DataFrame()
+
+    # 6. Find the VX table
+    df_vx = pd.DataFrame()
+    for df in all_tables:
+        cols_upper = [str(c).upper().strip() for c in df.columns]
+        if 'SYMBOL' in cols_upper and 'EXPIRATION' in cols_upper:
+            sym_col = df.columns[cols_upper.index('SYMBOL')]
+            if df[sym_col].astype(str).str.startswith('VX').any():
+                df_vx = df.copy()
+                break
+
+    if df_vx.empty:
+        return pd.DataFrame()
+
+    # 7. Normalize columns
+    df_vx.columns = [str(c).strip().upper() for c in df_vx.columns]
+    rename = {
+        'SYMBOL': 'Symbol', 'EXPIRATION': 'Expiration',
+        'LAST': 'Last', 'CHANGE': 'Change',
+        'HIGH': 'High', 'LOW': 'Low',
+        'SETTLEMENT': 'Settlement', 'VOLUME': 'Volume',
+    }
+    df_vx.rename(columns={k: v for k, v in rename.items() if k in df_vx.columns}, inplace=True)
+
+    # 8. Filter MONTHLY only (VX/K6, VX/M6 — NOT VX12/H6, VX13/J6)
+    if 'Symbol' in df_vx.columns:
+        mask = df_vx['Symbol'].astype(str).str.match(r'^VX/[A-Z]\d+$')
+        df_vx = df_vx[mask].reset_index(drop=True)
+
+    # 9. Convert types
+    if 'Expiration' in df_vx.columns:
+        df_vx['Expiration'] = pd.to_datetime(df_vx['Expiration'], errors='coerce')
+        df_vx = df_vx.sort_values('Expiration').reset_index(drop=True)
+
+    for col in ['Last', 'Change', 'High', 'Low', 'Settlement', 'Volume']:
+        if col in df_vx.columns:
+            df_vx[col] = pd.to_numeric(
+                df_vx[col].astype(str).str.replace(',', '', regex=False),
+                errors='coerce'
+            )
+
+    # 10. Derived columns
+    today = pd.Timestamp('today').normalize()
+    if 'Expiration' in df_vx.columns:
+        df_vx['DTE'] = (df_vx['Expiration'] - today).dt.days
+
+    # Price = Last if > 0, else Settlement
+    df_vx['Price'] = df_vx.apply(
+        lambda r: r['Last'] if pd.notna(r.get('Last')) and r.get('Last', 0) > 0
+                  else r.get('Settlement', 0), axis=1
+    )
+
+    df_vx['Scraped_At'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    return df_vx
 
 
-
-def compute_spreads(df: pd.DataFrame) -> pd.DataFrame:
-    rows = []
-    for i in range(len(df) - 1):
-        cur = df.iloc[i]
-        nxt = df.iloc[i + 1]
-        if pd.notna(cur["Last"]) and pd.notna(nxt["Last"]) and cur["Last"] != 0:
-            pct = (nxt["Last"] / cur["Last"] - 1) * 100
-            pts = nxt["Last"] - cur["Last"]
-        else:
-            pct = None
-            pts = None
-        rows.append({
-            "Spread": f"{cur['M']}→{nxt['M']}",
-            "% Contango": pct,
-            "Difference": pts,
-        })
-    return pd.DataFrame(rows)
+@st.cache_data(ttl=55)
+def fetch_vix_spot():
+    try:
+        h = yf.Ticker("^VIX").history(period="5d")
+        if not h.empty:
+            c = round(float(h['Close'].iloc[-1]), 2)
+            p = round(float(h['Close'].iloc[-2]), 2) if len(h) > 1 else c
+            return dict(price=c, prev=p, chg=round(c - p, 2))
+    except: pass
+    return None
 
 
+@st.cache_data(ttl=55)
+def fetch_etps():
+    out = {}
+    for name, sym in [("VXX","VXX"),("SVXY","SVXY"),("SVIX","SVIX"),("SPY","SPY")]:
+        try:
+            h = yf.Ticker(sym).history(period="5d")
+            if not h.empty:
+                out[name] = dict(
+                    close=round(float(h['Close'].iloc[-1]), 2),
+                    open=round(float(h['Open'].iloc[-1]), 2),
+                    prev=round(float(h['Close'].iloc[-2]), 2) if len(h) > 1 else None,
+                )
+        except: continue
+    return out
 
-def month_7_to_4(df: pd.DataFrame):
-    if len(df) < 7:
-        return None, None
-    m4 = df.iloc[3]["Last"]
-    m7 = df.iloc[6]["Last"]
-    if pd.isna(m4) or pd.isna(m7) or m4 == 0:
-        return None, None
-    return (m7 / m4 - 1) * 100, m7 - m4
+
+@st.cache_data(ttl=55)
+def fetch_bb_data():
+    end = datetime.now()
+    start = end - timedelta(days=300)
+    syms = {"VXX":"VXX","SVXY":"SVXY","SVIX":"SVIX","VIX":"^VIX","SPY":"SPY"}
+    data = pd.DataFrame()
+    for name, sym in syms.items():
+        try:
+            df_t = yf.download(sym, start=start, end=end, progress=False)
+            if isinstance(df_t.columns, pd.MultiIndex):
+                df_t.columns = df_t.columns.get_level_values(0)
+            if len(df_t) > 0:
+                data[f"{name}_Close"] = df_t["Close"]
+                data[f"{name}_Open"] = df_t["Open"]
+        except: continue
+    if data.empty: return None
+    data = data.sort_index()
+    vxx = data["VXX_Close"]
+    data["SMA20"] = vxx.rolling(20).mean()
+    data["STD20"] = vxx.rolling(20).std()
+    data["BB_Upper"] = data["SMA20"] + 2.0 * data["STD20"]
+    data["BB_Lower"] = data["SMA20"] - 2.0 * data["STD20"]
+    clean = data.dropna(subset=["SMA20"]).copy()
+    pos = 0
+    bb_list = []
+    for i in range(len(clean)):
+        cp = clean["VXX_Close"].iloc[i]
+        s = clean["SMA20"].iloc[i]
+        u = clean["BB_Upper"].iloc[i]
+        if pd.isna(s) or pd.isna(u) or pd.isna(cp):
+            bb_list.append(pos); continue
+        if pos == 0 and cp < s: pos = 1
+        elif pos == 1 and cp > u: pos = 0
+        bb_list.append(pos)
+    clean["bb_sig"] = bb_list
+    return clean
 
 
+def cpct(p1, p2):
+    if p1 and p2 and p1 > 0:
+        return round((p2 - p1) / p1 * 100, 2)
+    return None
 
-def chart_curve(df: pd.DataFrame) -> go.Figure:
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CHARTS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def build_term_chart(vix_spot, df_vx, show_prev=True):
+    """VIXCentral-faithful term structure chart using scraped CBOE data."""
     fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=df["M"],
-            y=df["Last"],
-            mode="lines+markers+text",
-            text=[f"{x:.2f}" if pd.notna(x) else "N/A" for x in df["Last"]],
-            textposition="top center",
-            line=dict(width=3),
-            marker=dict(size=10),
-            hovertemplate="%{x}<br>Last: %{y:.2f}<extra></extra>",
-            name="VIX Futures Last",
-        )
-    )
+    if df_vx.empty:
+        return fig
+
+    # Month labels from expiration
+    labels = []
+    for _, r in df_vx.iterrows():
+        exp = r.get('Expiration')
+        if pd.notna(exp):
+            labels.append(MN.get(exp.month, str(exp.month)[:3]))
+        else:
+            labels.append(str(r.get('Symbol','')))
+
+    xpos = list(range(len(df_vx)))
+    prices = df_vx['Price'].tolist()
+
+    # Previous close = Price - Change
+    prev_prices = []
+    for _, r in df_vx.iterrows():
+        p = r['Price']
+        c = r.get('Change', 0)
+        if pd.notna(p) and p > 0 and pd.notna(c):
+            prev_prices.append(round(p - c, 4))
+        else:
+            prev_prices.append(None)
+
+    # Today's curve
+    vx = [x for x, y in zip(xpos, prices) if pd.notna(y) and y > 0]
+    vy = [y for y in prices if pd.notna(y) and y > 0]
+
+    if vy:
+        fig.add_trace(go.Scatter(
+            x=vx, y=vy, mode='lines+markers+text',
+            name='Last', line=dict(color='#4A90D9', width=3, shape='spline'),
+            marker=dict(size=9, color='#4A90D9', line=dict(width=2, color='#0D1117')),
+            text=[f"{v:.3f}" for v in vy],
+            textposition='top center',
+            textfont=dict(size=10, color='#C9D1D9', family='JetBrains Mono'),
+            hovertemplate='%{text}<extra></extra>',
+        ))
+
+    # Previous day
+    if show_prev:
+        pvx = [x for x, y in zip(xpos, prev_prices) if y and y > 0]
+        pvy = [y for y in prev_prices if y and y > 0]
+        if len(pvy) >= 2:
+            fig.add_trace(go.Scatter(
+                x=pvx, y=pvy, mode='lines+markers',
+                name='Previous Close',
+                line=dict(color='#8B949E', width=1.5, dash='dot', shape='spline'),
+                marker=dict(size=5, color='#8B949E', symbol='diamond'),
+                hovertemplate='Prev: %{y:.3f}<extra></extra>',
+            ))
+
+    # VIX Index dashed line
+    if vix_spot:
+        fig.add_hline(y=vix_spot['price'], line_dash="dash", line_color="#3FB950", line_width=2,
+                      annotation_text=f"  {vix_spot['price']:.2f}",
+                      annotation_position="right",
+                      annotation_font=dict(size=12, color="#3FB950", family="Inter"))
+        fig.add_trace(go.Scatter(x=[None], y=[None], mode='lines', name='VIX Index',
+                                 line=dict(color='#3FB950', width=2, dash='dash'), showlegend=True))
+
+    all_y = vy + ([vix_spot['price']] if vix_spot else [])
+    y_min = min(all_y) - 1.5 if all_y else 15
+    y_max = max(all_y) + 1.5 if all_y else 30
+
     fig.update_layout(
-        template="plotly_dark",
-        height=520,
-        margin=dict(l=20, r=20, t=35, b=20),
-        paper_bgcolor="#0f172a",
-        plot_bgcolor="#0f172a",
-        title="VIX Monthly Term Structure (CBOE Last)",
-        xaxis_title="Contract Month",
-        yaxis_title="Price",
-        legend_title_text="",
+        title=dict(
+            text="<b>VIX Futures Term Structure</b><br><sup>Source: CBOE Delayed Quotes · vixcontroller</sup>",
+            font=dict(size=15, color='#C9D1D9', family='Inter'), x=0.5),
+        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
+        height=420, margin=dict(l=50, r=30, t=65, b=50),
+        xaxis=dict(tickvals=xpos, ticktext=labels,
+                   tickfont=dict(size=11, color='#8B949E', family='JetBrains Mono'),
+                   gridcolor='#21262D', showline=True, linecolor='#30363D',
+                   title=dict(text="Future Month", font=dict(size=11, color='#8B949E', family='Inter'))),
+        yaxis=dict(range=[y_min, y_max],
+                   title=dict(text="Volatility", font=dict(size=11, color='#8B949E', family='Inter')),
+                   tickfont=dict(size=11, color='#8B949E', family='JetBrains Mono'),
+                   gridcolor='#21262D', showline=True, linecolor='#30363D'),
+        legend=dict(orientation='v', yanchor='top', y=0.99, xanchor='right', x=0.99,
+                    bgcolor='rgba(22,27,34,0.9)', bordercolor='#30363D', borderwidth=1,
+                    font=dict(size=10, color='#C9D1D9', family='JetBrains Mono')),
+        hoverlabel=dict(bgcolor='#1C2128', bordercolor='#58A6FF',
+                        font=dict(size=11, family='JetBrains Mono', color='#C9D1D9')),
+        hovermode='x unified',
     )
-    fig.update_xaxes(showgrid=False)
-    fig.update_yaxes(gridcolor="rgba(148,163,184,0.15)")
     return fig
 
 
-st.markdown(
-    f"""
-    <div class='hero'>
-      <h1>VIX Term Structure Dashboard</h1>
-      <p>Curva mensual de futuros VX extraída de la tabla renderizada de CBOE. La curva usa <b>Last</b>, no Settlement.</p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+def build_bb_chart(clean, window=120):
+    p = clean.tail(window).copy()
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=p.index, y=p["BB_Upper"], mode='lines', name='BB Upper',
+                             line=dict(color='#F85149', width=1.2)))
+    fig.add_trace(go.Scatter(x=p.index, y=p["BB_Lower"], mode='lines', name='BB Lower',
+                             line=dict(color='#F85149', width=0.5),
+                             fill='tonexty', fillcolor='rgba(88,166,255,0.03)', showlegend=False))
+    fig.add_trace(go.Scatter(x=p.index, y=p["SMA20"], mode='lines', name='SMA(20)',
+                             line=dict(color='#58A6FF', width=1.5, dash='dash')))
+    fig.add_trace(go.Scatter(x=p.index, y=p["VXX_Close"], mode='lines', name='VXX Close',
+                             line=dict(color='#F0F6FC', width=2)))
+    for i in range(1, len(p)):
+        clr = 'rgba(63,185,80,0.06)' if p["bb_sig"].iloc[i] == 1 else 'rgba(248,81,73,0.03)'
+        fig.add_vrect(x0=p.index[i-1], x1=p.index[i], fillcolor=clr, layer="below", line_width=0)
+    for i in range(1, len(p)):
+        if p["bb_sig"].iloc[i] == 1 and p["bb_sig"].iloc[i-1] == 0:
+            fig.add_annotation(x=p.index[i], y=p["VXX_Close"].iloc[i],
+                text="▲ ENTRY", showarrow=True, arrowhead=2, arrowcolor="#3FB950",
+                font=dict(size=9, color="#3FB950", family="JetBrains Mono"), ax=0, ay=25)
+        elif p["bb_sig"].iloc[i] == 0 and p["bb_sig"].iloc[i-1] == 1:
+            fig.add_annotation(x=p.index[i], y=p["VXX_Close"].iloc[i],
+                text="▼ EXIT", showarrow=True, arrowhead=2, arrowcolor="#F85149",
+                font=dict(size=9, color="#F85149", family="JetBrains Mono"), ax=0, ay=-25)
+    fig.add_trace(go.Scatter(x=[p.index[-1]], y=[p["VXX_Close"].iloc[-1]],
+        mode='markers', name='Today',
+        marker=dict(size=12, color='#D29922', line=dict(width=2, color='white')), showlegend=False))
+    fig.update_layout(
+        title=dict(text="<b>VXX + Bollinger Bands</b><sup>  (BB timing — contango from term structure)</sup>",
+                   font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
+        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
+        height=380, margin=dict(l=50, r=30, t=55, b=40),
+        xaxis=dict(gridcolor='#21262D', tickfont=dict(size=10, color='#8B949E', family='JetBrains Mono')),
+        yaxis=dict(title=dict(text="VXX", font=dict(size=11, color='#8B949E')),
+                   gridcolor='#21262D', tickfont=dict(size=10, color='#8B949E', family='JetBrains Mono')),
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, bgcolor='rgba(0,0,0,0)',
+                    font=dict(size=9, color='#8B949E', family='JetBrains Mono')),
+        hovermode='x unified')
+    return fig
 
-col_a, col_b = st.columns([1, 4])
-with col_a:
-    refresh = st.button("Refresh data", use_container_width=True)
-with col_b:
-    st.markdown("<div class='smallnote'>Si actualizaste archivos en Streamlit Cloud, haz un reboot de la app además del refresh.</div>", unsafe_allow_html=True)
 
-if refresh:
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# AUTO-REFRESH
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+if "last_refresh" not in st.session_state:
+    st.session_state.last_refresh = time.time()
+
+elapsed = time.time() - st.session_state.last_refresh
+if elapsed > 60:
+    st.session_state.last_refresh = time.time()
     st.cache_data.clear()
+    st.rerun()
 
-try:
-    curve = fetch_cboe_vix_table()
-except Exception as e:
-    st.error(f"No se pudo construir la curva mensual de VIX desde CBOE.\n\nDetalle técnico: {e}")
-    st.stop()
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# HEADER
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+next_ref = max(0, 60 - int(elapsed))
+st.markdown(f"""
+<div class="hdr">
+    <div class="logo">VIX CONTROLLER</div>
+    <div class="sub">{now_str} · Auto-refresh in {next_ref}s · Source: CBOE Delayed Quotes (Playwright)</div>
+</div>
+""", unsafe_allow_html=True)
 
-spreads = compute_spreads(curve)
-m7_pct, m7_pts = month_7_to_4(curve)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# SIDEBAR
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+with st.sidebar:
+    st.markdown("### ⚙️ Settings")
+    N_MONTHS = st.slider("Max futures months", 4, 12, 8)
+    SHOW_PREV = st.checkbox("Show previous day", True)
+    SHOW_TABLE = st.checkbox("Show data table", True)
+    if st.button("🔄 Refresh Now"):
+        st.session_state.last_refresh = time.time()
+        st.cache_data.clear()
+        st.rerun()
 
-m1 = curve.iloc[0]["Last"] if len(curve) > 0 else None
-m2 = curve.iloc[1]["Last"] if len(curve) > 1 else None
-m1m2_pct = ((m2 / m1 - 1) * 100) if pd.notna(m1) and pd.notna(m2) and m1 else None
-m1m2_pts = (m2 - m1) if pd.notna(m1) and pd.notna(m2) else None
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# FETCH DATA
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+with st.spinner("🌐 Scraping CBOE delayed quotes…"):
+    df_vx = scrape_cboe_futures()
 
-c1, c2, c3, c4 = st.columns(4)
-with c1:
-    val = f"{m1:.2f}" if pd.notna(m1) else "N/A"
-    st.markdown(f"<div class='metricbox'><div class='label'>M1 Last</div><div class='value'>{val}</div></div>", unsafe_allow_html=True)
-with c2:
-    val = f"{m2:.2f}" if pd.notna(m2) else "N/A"
-    st.markdown(f"<div class='metricbox'><div class='label'>M2 Last</div><div class='value'>{val}</div></div>", unsafe_allow_html=True)
-with c3:
-    val = f"{m1m2_pct:.2f}%" if m1m2_pct is not None else "N/A"
-    st.markdown(f"<div class='metricbox'><div class='label'>M1→M2 % Contango</div><div class='value'>{val}</div></div>", unsafe_allow_html=True)
-with c4:
-    val = f"{m7_pct:.2f}%" if m7_pct is not None else "N/A"
-    st.markdown(f"<div class='metricbox'><div class='label'>Month 7 to 4 %</div><div class='value'>{val}</div></div>", unsafe_allow_html=True)
+vix_spot = fetch_vix_spot()
+etps = fetch_etps()
 
-left, right = st.columns([2.1, 1])
-with left:
-    st.plotly_chart(chart_curve(curve), use_container_width=True)
-with right:
-    st.markdown("<div class='section-title'>Spread Metrics</div>", unsafe_allow_html=True)
-    spreads_display = spreads.copy()
-    spreads_display["% Contango"] = spreads_display["% Contango"].apply(lambda x: f"{x:.2f}%" if pd.notna(x) else "N/A")
-    spreads_display["Difference"] = spreads_display["Difference"].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "N/A")
-    st.dataframe(
-        spreads_display,
-        use_container_width=True,
-        hide_index=True,
-    )
-    extra = pd.DataFrame([
-        {"Metric": "M1→M2 Difference", "Value": None if m1m2_pts is None else round(m1m2_pts, 2)},
-        {"Metric": "Month 7 to 4 % Contango", "Value": None if m7_pct is None else round(m7_pct, 2)},
-        {"Metric": "Month 7 to 4 Difference", "Value": None if m7_pts is None else round(m7_pts, 2)},
-    ])
-    st.dataframe(extra, use_container_width=True, hide_index=True)
+# Limit to N_MONTHS
+if not df_vx.empty and len(df_vx) > N_MONTHS:
+    df_vx = df_vx.head(N_MONTHS).reset_index(drop=True)
 
-st.markdown("<div class='section-title'>Monthly VX Table</div>", unsafe_allow_html=True)
-show_df = curve[["M", "Symbol", "Expiration", "Last", "Change", "High", "Low", "Settlement", "Volume"]].copy()
-show_df["Expiration"] = show_df["Expiration"].dt.strftime("%Y-%m-%d")
-show_display = show_df.copy()
-for col, fmt in {
-    "Last": lambda x: f"{x:.2f}" if pd.notna(x) else "N/A",
-    "Change": lambda x: f"{x:.3f}" if pd.notna(x) else "N/A",
-    "High": lambda x: f"{x:.2f}" if pd.notna(x) else "N/A",
-    "Low": lambda x: f"{x:.2f}" if pd.notna(x) else "N/A",
-    "Settlement": lambda x: f"{x:.4f}" if pd.notna(x) else "N/A",
-    "Volume": lambda x: f"{x:,.0f}" if pd.notna(x) else "N/A",
-}.items():
-    show_display[col] = show_display[col].apply(fmt)
+# Extract M1/M2 prices
+m1p = df_vx['Price'].iloc[0] if not df_vx.empty and pd.notna(df_vx['Price'].iloc[0]) else None
+m2p = df_vx['Price'].iloc[1] if len(df_vx) > 1 and pd.notna(df_vx['Price'].iloc[1]) else None
+front_ct = cpct(m1p, m2p)
 
-st.dataframe(
-    show_display,
-    use_container_width=True,
-    hide_index=True,
-)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# HELPERS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def fv(v):
+    return f"{v:.2f}" if v is not None and pd.notna(v) and v != 0 else "—"
+def vc(v):
+    if v is None: return "nt"
+    return "up" if v >= 0 else "dn"
+def fp(v):
+    if v is None: return "—"
+    return f"{'+' if v >= 0 else ''}{v:.2f}%"
 
-with st.expander("Ideas para agregar a la app"):
-    st.markdown(
-        """
-- Overlay de curvas históricas: hoy vs ayer vs 1 semana vs 1 mes.
-- Basis del spot VIX vs M1 y M2.
-- Curvature: `M3 - 2*M2 + M1`.
-- Semáforo de régimen: contango, flat, backwardation.
-- Alertas cuando `M2 < M1` o cuando el `Month 7 to 4` cambie de signo.
-- Dashboard de instrumentos ligados a vol: SVXY, SVIX, VXX, UVXY.
-- Exportación a Excel/CSV y snapshot PNG para distribución institucional.
-- Histórico diario guardado en un archivo local o bucket para backtesting.
-        """
-    )
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TABS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+tab1, tab2, tab3 = st.tabs(["📈  Term Structure", "🎯  Monitor Operativo", "ℹ️  Help"])
 
-with st.expander("Diagnóstico"):
-    st.write("Fuente:", CBOE_URL)
-    st.write("Hora UTC:", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
-    st.dataframe(curve, use_container_width=True, hide_index=True)
+# ━━━━━━━━━━━━━━━━━ TAB 1: TERM STRUCTURE ━━━━━━━━━━━━━━━━━━
+with tab1:
+    vix_p = vix_spot['price'] if vix_spot else None
+
+    # Metrics
+    last_price_col = df_vx['Price'].tolist() if not df_vx.empty else []
+    total_ct = cpct(vix_p, last_price_col[-1]) if vix_p and last_price_col else None
+    spot_m1 = cpct(vix_p, m1p)
+
+    m1_lbl = ""
+    m1_dte = "?"
+    m2_lbl = ""
+    if not df_vx.empty:
+        exp1 = df_vx['Expiration'].iloc[0]
+        if pd.notna(exp1):
+            m1_lbl = MN.get(exp1.month, "")
+            m1_dte = df_vx['DTE'].iloc[0] if 'DTE' in df_vx.columns else "?"
+        if len(df_vx) > 1:
+            exp2 = df_vx['Expiration'].iloc[1]
+            if pd.notna(exp2):
+                m2_lbl = MN.get(exp2.month, "")
+
+    st.markdown(f"""
+    <div class="mrow">
+        <div class="mpill"><div class="ml">VIX Index</div><div class="mv nt">{fv(vix_p)}</div></div>
+        <div class="mpill"><div class="ml">M1 · {m1_lbl} · {m1_dte} DTE</div><div class="mv nt">{fv(m1p)}</div></div>
+        <div class="mpill"><div class="ml">M2 · {m2_lbl}</div><div class="mv nt">{fv(m2p)}</div></div>
+        <div class="mpill"><div class="ml">VIX → M1</div><div class="mv {vc(spot_m1)}">{fp(spot_m1)}</div></div>
+        <div class="mpill"><div class="ml">M1 → M2 Contango</div><div class="mv {vc(front_ct)}">{fp(front_ct)}</div></div>
+        <div class="mpill"><div class="ml">Total Curve</div><div class="mv {vc(total_ct)}">{fp(total_ct)}</div></div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Chart
+    fig = build_term_chart(vix_spot, df_vx, show_prev=SHOW_PREV)
+    st.plotly_chart(fig, use_container_width=True, config=dict(displayModeBar=True, displaylogo=False))
+
+    # Contango & Difference table (VIXCentral style)
+    if len(df_vx) >= 2:
+        ct_cells = ""
+        diff_cells = ""
+        for i in range(len(df_vx) - 1):
+            n = i + 1
+            p1 = df_vx['Price'].iloc[i]
+            p2 = df_vx['Price'].iloc[i + 1]
+            ct = cpct(p1, p2)
+            diff = round(p2 - p1, 2) if pd.notna(p1) and pd.notna(p2) and p1 > 0 and p2 > 0 else None
+            ct_cls = "pos" if ct and ct >= 0 else "neg"
+            diff_cls = "pos" if diff and diff >= 0 else "neg"
+            ct_cells += f'<td>{n}</td><td class="{ct_cls}">{fp(ct)}</td>'
+            diff_cells += f'<td>{n}</td><td class="{diff_cls}">{fv(diff)}</td>'
+
+        m74_ct, m74_diff = None, None
+        if len(df_vx) >= 7:
+            p4 = df_vx['Price'].iloc[3]
+            p7 = df_vx['Price'].iloc[6]
+            if pd.notna(p4) and pd.notna(p7) and p4 > 0 and p7 > 0:
+                m74_ct = cpct(p4, p7)
+                m74_diff = round(p7 - p4, 2)
+
+        st.markdown(f"""
+        <table class="ctx">
+        <tr><td class="hdr-cell">% Contango</td>{ct_cells}</tr>
+        <tr><td class="hdr-cell">Difference</td>{diff_cells}</tr>
+        </table>
+        """, unsafe_allow_html=True)
+
+        if m74_ct is not None:
+            m74_cls = "pos" if m74_ct >= 0 else "neg"
+            st.markdown(f"""
+            <table class="ctx" style="width:auto;margin-top:4px;">
+            <tr><td class="hdr-cell">Month 7 to 4 contango</td>
+            <td class="{m74_cls}">{fp(m74_ct)}</td><td class="{m74_cls}">{fv(m74_diff)}</td></tr>
+            </table>""", unsafe_allow_html=True)
+
+    # Data table
+    if SHOW_TABLE and not df_vx.empty:
+        rows = ""
+        prev_p = vix_p
+        for _, r in df_vx.iterrows():
+            sym = r.get('Symbol', '')
+            exp = r.get('Expiration')
+            exp_s = exp.strftime('%m/%d/%Y') if pd.notna(exp) else "—"
+            last = r.get('Last', 0)
+            chg = r.get('Change', 0)
+            hi = r.get('High', 0)
+            lo = r.get('Low', 0)
+            settle = r.get('Settlement', 0)
+            vol = r.get('Volume', 0)
+            price = r.get('Price', 0)
+            dte = r.get('DTE', '')
+
+            ct = cpct(prev_p, price) if prev_p and pd.notna(price) and price > 0 else None
+            chg_c = "color:var(--g)" if pd.notna(chg) and chg > 0 else "color:var(--r)" if pd.notna(chg) and chg < 0 else ""
+            ct_c = "color:var(--g)" if ct and ct >= 0 else "color:var(--r)" if ct else ""
+            last_s = f"{last:.2f}" if pd.notna(last) and last > 0 else "—"
+            chg_s = f"{chg:+.3f}" if pd.notna(chg) and chg != 0 else "—"
+            hi_s = f"{hi:.2f}" if pd.notna(hi) and hi > 0 else "—"
+            lo_s = f"{lo:.2f}" if pd.notna(lo) and lo > 0 else "—"
+            settle_s = f"{settle:.4f}" if pd.notna(settle) and settle > 0 else "—"
+            vol_s = f"{int(vol):,}" if pd.notna(vol) and vol > 0 else "0"
+
+            rows += f"""<tr>
+                <td style="color:var(--b);font-weight:600">{sym}</td>
+                <td>{exp_s}</td>
+                <td style="font-weight:600">{last_s}</td>
+                <td style="{chg_c}">{chg_s}</td>
+                <td>{hi_s}</td><td>{lo_s}</td>
+                <td>{settle_s}</td>
+                <td style="{ct_c}">{fp(ct) if ct else '—'}</td>
+                <td>{dte}</td>
+                <td>{vol_s}</td>
+            </tr>"""
+            if pd.notna(price) and price > 0:
+                prev_p = price
+
+        st.markdown(f"""
+        <table class="dtbl">
+            <thead><tr><th>Symbol</th><th>Expiration</th><th>Last</th><th>Change</th>
+            <th>High</th><th>Low</th><th>Settlement</th><th>Contango</th><th>DTE</th><th>Volume</th></tr></thead>
+            <tbody>{rows}</tbody>
+        </table>""", unsafe_allow_html=True)
+
+    if df_vx.empty:
+        st.warning("⚠️ No se pudieron obtener precios de futuros VIX del CBOE.")
+        if not pw_ok:
+            st.error("❌ Playwright/Chromium no se instaló correctamente. Verifica packages.txt y requirements.txt")
+        st.info("💡 La página CBOE carga datos por JavaScript. Se necesita Playwright + Chromium para renderizarla.")
+
+    if not df_vx.empty:
+        scraped = df_vx['Scraped_At'].iloc[0] if 'Scraped_At' in df_vx.columns else "?"
+        st.caption(f"Contratos: {len(df_vx)} mensuales · Scraped: {scraped} · CBOE Delayed Quotes")
+
+
+# ━━━━━━━━━━━━━━━━━ TAB 2: MONITOR OPERATIVO ━━━━━━━━━━━━━━━
+with tab2:
+    bb_data = fetch_bb_data()
+
+    if bb_data is not None and len(bb_data) > 0:
+        last = bb_data.iloc[-1]
+        last_date = bb_data.index[-1]
+        vxx_close = last["VXX_Close"]
+        sma20 = last["SMA20"]
+        bb_upper = last["BB_Upper"]
+        vix_close = last.get("VIX_Close", vix_spot['price'] if vix_spot else 0)
+        svxy_close = last.get("SVXY_Close", 0)
+        svix_close = last.get("SVIX_Close", 0)
+        spy_close = last.get("SPY_Close", 0)
+
+        # Auto contango from term structure
+        auto_m1 = m1p
+        auto_m2 = m2p
+        auto_m1_sym = df_vx['Symbol'].iloc[0] if not df_vx.empty else "?"
+        auto_m2_sym = df_vx['Symbol'].iloc[1] if len(df_vx) > 1 else "?"
+        contango_pct_val = cpct(auto_m1, auto_m2) if auto_m1 and auto_m2 else None
+        in_contango = contango_pct_val is not None and contango_pct_val > 0
+
+        bb_sig = int(bb_data["bb_sig"].iloc[-1])
+        vxx_below_sma = vxx_close < sma20
+        final_signal = bb_sig * int(in_contango) if contango_pct_val is not None else 0
+        pct_to_sma = (vxx_close / sma20 - 1) * 100
+        pct_to_bb = (vxx_close / bb_upper - 1) * 100
+        bb_sig_prev = int(bb_data["bb_sig"].iloc[-2]) if len(bb_data) >= 2 else bb_sig
+        bb_changed = bb_sig != bb_sig_prev
+        ct_val = f"{contango_pct_val:+.2f}%" if contango_pct_val is not None else "N/A"
+
+        c1, c2, c3 = st.columns([1.2, 1.5, 1.3])
+
+        with c1:
+            sig_cls = "sig-long" if final_signal else "sig-cash"
+            sig_txt = "LONG" if final_signal else "CASH"
+            sig_clr = "var(--g)" if final_signal else "var(--r)"
+            st.markdown(f"""
+            <div class="sig-box {sig_cls}">
+                <div class="sl" style="color:{sig_clr}">{sig_txt}</div>
+                <div class="sd">{last_date.strftime('%Y-%m-%d')}</div>
+            </div>""", unsafe_allow_html=True)
+            st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+            bb_ok = "ok" if bb_sig == 1 else "no"
+            bb_mark = "✓ OK" if bb_sig == 1 else "✗ NO"
+            ct_ok = "ok" if in_contango else "no"
+            ct_mark = "✓ OK" if in_contango else "✗ NO"
+            st.markdown(f"""
+            <div class="chk"><span class="{bb_ok}">{bb_mark}</span> BB Timing — VXX &lt; SMA(20)</div>
+            <div class="chk"><span class="{ct_ok}">{ct_mark}</span> Contango — M2 &gt; M1 ({ct_val})</div>
+            """, unsafe_allow_html=True)
+            if bb_changed:
+                st.markdown('<div class="chk"><span style="color:var(--y)">⚠</span> BB cambió hoy</div>', unsafe_allow_html=True)
+
+        with c2:
+            sma_clr = "var(--g)" if vxx_below_sma else "var(--r)"
+            sma_lbl = "DEBAJO" if vxx_below_sma else "ENCIMA"
+            bb_clr = "var(--g)" if vxx_close <= bb_upper else "var(--r)"
+            bb_lbl = "DEBAJO" if vxx_close <= bb_upper else "ENCIMA"
+            bb_state = "LONG" if bb_sig else "CASH"
+            bb_st_clr = "var(--g)" if bb_sig else "var(--r)"
+            st.markdown(f"""
+            <div class="icard">
+                <div class="ic-title">VXX — Timing (Bollinger Band)</div>
+                <div class="ic-row"><span class="ic-label">VXX Close</span><span class="ic-val" style="font-weight:700">${vxx_close:.2f}</span></div>
+                <div class="ic-row"><span class="ic-label">SMA(20)</span><span class="ic-val" style="color:{sma_clr}">${sma20:.2f} ({pct_to_sma:+.1f}% {sma_lbl})</span></div>
+                <div class="ic-row"><span class="ic-label">BB Superior</span><span class="ic-val" style="color:{bb_clr}">${bb_upper:.2f} ({pct_to_bb:+.1f}% {bb_lbl})</span></div>
+                <div class="ic-row"><span class="ic-label">Distancia a BB</span><span class="ic-val">${bb_upper - vxx_close:.2f} ({abs(pct_to_bb):.1f}%)</span></div>
+                <div class="ic-row"><span class="ic-label">BB Estado</span><span class="ic-val" style="color:{bb_st_clr};font-weight:700;font-size:1rem">{bb_state}</span></div>
+            </div>""", unsafe_allow_html=True)
+
+        with c3:
+            ct_clr = "var(--g)" if in_contango else "var(--r)"
+            ct_estado = "CONTANGO" if in_contango else "BACKWARDATION"
+            if vix_close < 15: regime, r_clr = "BAJO (óptimo)", "var(--g)"
+            elif vix_close < 20: regime, r_clr = "NORMAL (bueno)", "var(--g)"
+            elif vix_close < 28: regime, r_clr = "ELEVADO (precaución)", "var(--y)"
+            else: regime, r_clr = "CRISIS (peligro)", "var(--r)"
+            m1_s = f"${auto_m1:.2f}" if auto_m1 else "N/A"
+            m2_s = f"${auto_m2:.2f}" if auto_m2 else "N/A"
+            st.markdown(f"""
+            <div class="icard">
+                <div class="ic-title">Contango + VIX</div>
+                <div class="ic-row"><span class="ic-label">M1 ({auto_m1_sym})</span><span class="ic-val">{m1_s}</span></div>
+                <div class="ic-row"><span class="ic-label">M2 ({auto_m2_sym})</span><span class="ic-val">{m2_s}</span></div>
+                <div class="ic-row"><span class="ic-label">Contango</span><span class="ic-val" style="color:{ct_clr};font-weight:700">{ct_val} {ct_estado}</span></div>
+                <div class="ic-row"><span class="ic-label">VIX</span><span class="ic-val" style="color:{r_clr}">{vix_close:.1f} {regime}</span></div>
+            </div>
+            <div class="icard">
+                <div class="ic-title">Vehículos</div>
+                <div class="ic-row"><span class="ic-label">SVXY (-0.5x)</span><span class="ic-val" style="color:var(--c);font-weight:700">${svxy_close:.2f}</span></div>
+                <div class="ic-row"><span class="ic-label">SVIX (-1x agresivo)</span><span class="ic-val" style="color:var(--c);font-weight:700">${svix_close:.2f}</span></div>
+                <div class="ic-row"><span class="ic-label">SPY</span><span class="ic-val">${spy_close:.2f}</span></div>
+            </div>""", unsafe_allow_html=True)
+
+        # Alerts
+        alerts = []
+        if final_signal and abs(pct_to_bb) < 3:
+            alerts.append(f"⚠️ VXX cerca de BB Superior ({abs(pct_to_bb):.1f}%) — posible salida pronto")
+        if contango_pct_val is not None and 0 < contango_pct_val < 1:
+            alerts.append(f"⚠️ Contango muy bajo ({contango_pct_val:.1f}%) — monitorear")
+        if not final_signal and abs(pct_to_sma) < 2 and in_contango:
+            alerts.append(f"🔔 Posible entrada pronto — VXX a {abs(pct_to_sma):.1f}% de SMA")
+        for a in alerts:
+            st.warning(a)
+
+        # BB Chart
+        fig_bb = build_bb_chart(bb_data)
+        st.plotly_chart(fig_bb, use_container_width=True, config=dict(displayModeBar=True, displaylogo=False))
+
+        # Execution line
+        exec_date = last_date + timedelta(days=1)
+        while exec_date.weekday() >= 5:
+            exec_date += timedelta(days=1)
+        st.markdown(f"""
+        <div class="icard" style="text-align:center">
+            <span style="font-family:'JetBrains Mono';font-size:0.8rem;color:var(--dim)">
+                SEÑAL: <b style="color:{'var(--g)' if final_signal else 'var(--r)'}">{'LONG' if final_signal else 'CASH'}</b>
+                · BB: <b>{'LONG' if bb_sig else 'CASH'}</b> × Contango: <b>{'SÍ' if in_contango else 'NO'}</b>
+                · Ejecución: <b>{exec_date.strftime('%Y-%m-%d')}</b> al OPEN
+            </span>
+        </div>""", unsafe_allow_html=True)
+    else:
+        st.error("No se pudieron descargar datos de Yahoo Finance para el monitor operativo.")
+
+
+# ━━━━━━━━━━━━━━━━━ TAB 3: HELP ━━━━━━━━━━━━━━━━━━━━━━━━━━━
+with tab3:
+    st.markdown("""
+    ### VIX Controller — Guía
+
+    **Tab 1: Term Structure** — Réplica de VIXCentral.com
+    - Datos scrapeados directamente de la tabla CBOE Delayed Quotes via **Playwright + Chromium**
+    - Solo contratos mensuales (regex `^VX/[A-Z]\\d+$` — filtra weeklys como VX12, VX13, etc.)
+    - Muestra columnas: **Last, Change, High, Low, Settlement, Volume** (como la tabla CBOE)
+    - Tabla de contango/diferencia entre meses (estilo VIXCentral)
+    - Month 7 to 4 contango
+    - Auto-refresh cada 60 segundos
+
+    **Tab 2: Monitor Operativo** — Señal BB × Contango
+    - **BB Timing**: VXX < SMA(20) = LONG, VXX > BB Superior = EXIT
+    - **Contango**: se alimenta automáticamente del term structure scrapeado
+    - **Señal Final** = BB × Contango
+    - Gráfico VXX + BB con zonas y flechas ENTRY/EXIT
+
+    ---
+
+    **Fuentes:**
+    - `cboe.com/delayed_quotes/futures/future_quotes` — scrapeado con Playwright
+    - Yahoo Finance — VIX spot, VXX, SVXY, SVIX, SPY
+
+    **Para Streamlit Cloud necesitas:**
+    - `packages.txt` con dependencias de Chromium
+    - `requirements.txt` con playwright
+    """)
+
+st.markdown(f"""
+<div style="text-align:center;padding:0.8rem 0 0.3rem;border-top:1px solid #30363D;margin-top:1rem;">
+    <span style="font-family:'JetBrains Mono',monospace;font-size:0.6rem;color:#484F58;">
+        VIX CONTROLLER · Alberto Alarcón González · Not financial advice
+    </span>
+</div>""", unsafe_allow_html=True)
