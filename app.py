@@ -818,16 +818,30 @@ def build_term_chart(vix_spot, df_vx, show_prev=True):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 REFRESH_INTERVAL = 60  # segundos
 
+# Auto-refresh server-side: no recarga la página, solo hace rerun de Streamlit
+# Esto evita que Playwright vuelva a lanzarse por un full page reload
+try:
+    from streamlit_autorefresh import st_autorefresh
+    st_autorefresh(interval=REFRESH_INTERVAL * 1000, key="autorefresh")
+except ImportError:
+    pass  # Si no está instalado, el refresh manual del sidebar sigue funcionando
+
 if "last_refresh" not in st.session_state:
     st.session_state.last_refresh = time.time()
 
 elapsed = time.time() - st.session_state.last_refresh
 if elapsed > REFRESH_INTERVAL:
     st.session_state.last_refresh = time.time()
-    st.cache_data.clear()
+    # Solo limpiar cache de datos live (CBOE + yfinance)
+    # NO tocar load_master_csv ni get_strategy_data — son pesados y tienen TTL propio
+    scrape_cboe_futures.clear()
+    fetch_vix_spot.clear()
+    fetch_etps.clear()
+    fetch_today_prices.clear()
     st.rerun()
 
-# JS countdown + page reload automático cada 60s sin interacción
+# JS countdown visual SOLO — no recarga la página
+# El server-side rerun (arriba) es el que ejecuta el refresh real
 st.components.v1.html(f"""
 <script>
 (function() {{
@@ -836,10 +850,7 @@ st.components.v1.html(f"""
         remaining--;
         var el = window.parent.document.getElementById('refresh-countdown');
         if (el) el.textContent = remaining + 's';
-        if (remaining <= 0) {{
-            clearInterval(timer);
-            window.parent.location.reload();
-        }}
+        if (remaining <= 0) clearInterval(timer);
     }}, 1000);
 }})();
 </script>
@@ -866,7 +877,14 @@ with st.sidebar:
     SHOW_TABLE = st.checkbox("Show data table", True)
     if st.button("🔄 Refresh Now"):
         st.session_state.last_refresh = time.time()
-        st.cache_data.clear()
+        scrape_cboe_futures.clear()
+        fetch_vix_spot.clear()
+        fetch_etps.clear()
+        fetch_today_prices.clear()
+        st.rerun()
+    if st.button("🗄️ Recargar CSV"):
+        load_master_csv.clear()
+        get_strategy_data.clear()
         st.rerun()
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
