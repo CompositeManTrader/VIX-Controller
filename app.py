@@ -434,7 +434,20 @@ def calc_metrics(bt: pd.DataFrame) -> dict:
 
 def build_bb_chart(bt: pd.DataFrame, window: int = 120) -> go.Figure:
     """Gráfico VXX + Bollinger Bands con zonas y flechas ENTRY/EXIT."""
-    p   = bt.tail(window).copy()
+    p = bt.tail(window).copy()
+
+    # Normalizar nombres de columna — compatibilidad con ambos esquemas
+    if 'SMA20' in p.columns and 'BB_SMA20' not in p.columns:
+        p['BB_SMA20'] = p['SMA20']
+    if 'BB_Upper' not in p.columns and 'BB_Upper_20' in p.columns:
+        p['BB_Upper'] = p['BB_Upper_20']
+    if 'BB_Lower' not in p.columns and 'BB_Lower_20' in p.columns:
+        p['BB_Lower'] = p['BB_Lower_20']
+    if 'sig_final' not in p.columns and 'bb_sig' in p.columns:
+        p['sig_final'] = p['bb_sig']
+    if 'VXX_Close' not in p.columns and 'VXX' in p.columns:
+        p['VXX_Close'] = p['VXX']
+
     sig = p['sig_final']
     fig = go.Figure()
 
