@@ -694,6 +694,19 @@ def build_operational_chart(bt: pd.DataFrame, col_price: str,
     return fig
 
 
+@st.cache_data(ttl=300)  # mismo TTL que el CSV — solo recalcula si el CSV cambia
+def get_strategy_data(df_master: pd.DataFrame):
+    """
+    Procesa todo el histórico de una vez y cachea el resultado.
+    Se recalcula solo cuando el CSV cambia (TTL 5 min).
+    Retorna bt, trades_df, metrics como tupla.
+    """
+    bt        = build_strategy(df_master)
+    trades_df = extract_trades(bt)
+    metrics   = calc_metrics(bt)
+    return bt, trades_df, metrics
+
+
 def cpct(p1, p2):
     if p1 and p2 and p1 > 0:
         return round((p2 - p1) / p1 * 100, 2)
@@ -1051,10 +1064,8 @@ with tab2:
         st.error("❌ No se pudo cargar el CSV desde Google Drive. Verifica que el archivo sea público.")
         st.stop()
 
-    # ── Aplicar estrategia sobre histórico ───────────────────
-    bt = build_strategy(df_master)
-    trades_df = extract_trades(bt)
-    metrics = calc_metrics(bt)
+    # ── Aplicar estrategia sobre histórico (cacheado — no recalcula en cada rerun) ──
+    bt, trades_df, metrics = get_strategy_data(df_master)
 
     # ── Señal de HOY ─────────────────────────────────────────
     # BB: basado en histórico CSV + precio VXX de hoy (yfinance)
@@ -1265,7 +1276,7 @@ with tab2:
         fig_svix = build_operational_chart(
             bt, col_price='SVIX_Close', label='SVIX', color='#E91E63',
             trades_df=trades_df,
-            today_price=svix_today, today_sig=final_sig_today,
+            today_price=None, today_sig=0,   # solo histórico CSV
         )
         st.plotly_chart(fig_svix, use_container_width=True,
                         config=dict(displayModeBar=True, displaylogo=False,
@@ -1279,7 +1290,7 @@ with tab2:
     fig_svxy = build_operational_chart(
         bt, col_price='SVXY_Close', label='SVXY', color='#39D2C0',
         trades_df=trades_df,
-        today_price=svxy_today, today_sig=final_sig_today,
+        today_price=None, today_sig=0,   # solo histórico CSV
     )
     st.plotly_chart(fig_svxy, use_container_width=True,
                     config=dict(displayModeBar=True, displaylogo=False,
