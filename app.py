@@ -1,6 +1,6 @@
 """
 VIX Controller — Bloomberg-Style Term Structure + Operational Monitor
-Data: CBOE Delayed Quotes via Playwright (persistent browser — lanza una sola vez)
+Data: CBOE Delayed Quotes via Playwright (browser por llamada, install cacheado)
 Auto-refresh: every 60 seconds via JS injection
 """
 import streamlit as st
@@ -12,38 +12,39 @@ from datetime import datetime, timedelta, date
 from io import StringIO
 import re, time, warnings, logging
 warnings.filterwarnings("ignore")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s"
-)
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 
 st.set_page_config(page_title="VIX Controller", page_icon="🔴", layout="wide",
                    initial_sidebar_state="collapsed")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# PLAYWRIGHT — instancia persistente (lanza browser UNA sola vez)
+# PLAYWRIGHT — solo verifica instalación UNA vez (no lanza browser aquí)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 @st.cache_resource
-def get_playwright_browser():
+def check_playwright_installed() -> bool:
     """
-    Lanza Chromium UNA vez y lo reutiliza en todos los refreshes.
-    @cache_resource = singleton por despliegue en Streamlit Cloud.
-    Elimina el overhead de lanzar/cerrar browser en cada llamada.
+    Verifica que Playwright y Chromium estén disponibles.
+    Se ejecuta UNA sola vez por deployment (cache_resource).
+    NO lanza el browser aquí — solo importa y verifica el ejecutable.
     """
+    log = logging.getLogger("vix_controller")
     try:
         from playwright.sync_api import sync_playwright
-        pw = sync_playwright().start()
-        browser = pw.chromium.launch(
-            headless=True,
-            args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
-                  '--disable-extensions', '--disable-background-networking',
-                  '--no-first-run'],
-        )
-        return browser
-    except Exception:
-        return None
+        # Verificación mínima: solo lanzar y cerrar inmediatamente
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+            )
+            browser.close()
+        log.info("Playwright check: Chromium OK ✅")
+        return True
+    except Exception as e:
+        log.error(f"Playwright check failed: {e}")
+        return False
 
-browser_instance = get_playwright_browser()
+pw_ready = check_playwright_installed()
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # BLOOMBERG CSS
@@ -101,88 +102,102 @@ MN = {1:'Jan',2:'Feb',3:'Mar',4:'Apr',5:'May',6:'Jun',7:'Jul',8:'Aug',9:'Sep',10
 # DATA LAYER — PLAYWRIGHT (browser persistente, sin relanzar)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# DATA LAYER — PLAYWRIGHT (browser abre y cierra en el mismo thread)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+@st.cache_data(ttl=55)
 def scrape_cboe_futures() -> pd.DataFrame:
-    """Versión sin cache para diagnóstico — el cache estaba ocultando los errores."""
-    import logging
+    """
+    Lanza Chromium, scrapea, cierra — todo en el mismo thread.
+    Cache de 55s evita relanzar el browser en cada rerun de Streamlit.
+    El check_playwright_installed() ya validó que Chromium existe.
+    """
     log = logging.getLogger("vix_controller")
 
-    browser = browser_instance
-    if browser is None:
-        log.error("CBOE_SCRAPE: browser_instance is None — Playwright no inicializó")
-        st.session_state["scrape_debug"] = "❌ browser_instance = None. Playwright no arrancó."
+    if not pw_ready:
+        log.error("CBOE_SCRAPE: Playwright no disponible")
+        st.session_state["scrape_debug"] = "❌ Playwright/Chromium no instalado"
         return pd.DataFrame()
 
-    log.info("CBOE_SCRAPE: browser OK, abriendo page...")
-    page = None
+    from playwright.sync_api import sync_playwright
+
+    html = ""
     try:
-        page = browser.new_page(
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            viewport={'width': 1920, 'height': 1080},
-            locale='en-US',
-            java_script_enabled=True,
-        )
-        page.route("**/analytics**",        lambda r: r.abort())
-        page.route("**/googletagmanager**", lambda r: r.abort())
-
-        log.info("CBOE_SCRAPE: navegando a CBOE...")
-        page.goto('https://www.cboe.com/delayed_quotes/futures/future_quotes',
-                  wait_until='networkidle', timeout=45000)
-
-        log.info("CBOE_SCRAPE: página cargada, esperando VX/...")
-        try:
-            page.wait_for_function(
-                "() => document.body.innerText.includes('VX/')",
-                timeout=25000
+        log.info("CBOE_SCRAPE: lanzando Chromium...")
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
+                      '--disable-extensions', '--no-first-run'],
             )
-            log.info("CBOE_SCRAPE: VX/ encontrado en página ✅")
-        except Exception as e2:
-            log.warning(f"CBOE_SCRAPE: wait_for_function timeout — {e2}")
+            page = browser.new_page(
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                           'AppleWebKit/537.36 (KHTML, like Gecko) '
+                           'Chrome/120.0.0.0 Safari/537.36',
+                viewport={'width': 1920, 'height': 1080},
+                locale='en-US',
+            )
+            # Bloquear solo trackers — no CSS ni JS de CBOE
+            page.route("**/googletagmanager**", lambda r: r.abort())
+            page.route("**/google-analytics**", lambda r: r.abort())
+            page.route("**/doubleclick**",       lambda r: r.abort())
 
-        html = page.content()
-        vx_count  = html.count('VX/')
-        html_size = len(html)
-        log.info(f"CBOE_SCRAPE: HTML {html_size:,} chars · VX/ occurrences: {vx_count}")
+            log.info("CBOE_SCRAPE: navegando...")
+            page.goto(
+                'https://www.cboe.com/delayed_quotes/futures/future_quotes',
+                wait_until='networkidle', timeout=45000
+            )
+
+            # Esperar texto VX/ en página
+            try:
+                page.wait_for_function(
+                    "() => document.body.innerText.includes('VX/')",
+                    timeout=25000
+                )
+                log.info("CBOE_SCRAPE: VX/ detectado ✅")
+            except Exception:
+                log.warning("CBOE_SCRAPE: VX/ no apareció en 25s — tomando HTML igual")
+
+            html = page.content()
+            browser.close()
+
+        vx_n = html.count('VX/')
+        log.info(f"CBOE_SCRAPE: HTML {len(html):,} chars · VX/ hits: {vx_n}")
         st.session_state["scrape_debug"] = (
-            f"HTML: {html_size:,} chars · 'VX/' en HTML: {vx_count} · "
-            f"Scrapeado: {datetime.now().strftime('%H:%M:%S')}"
+            f"HTML: {len(html):,} chars · 'VX/' en HTML: {vx_n} · "
+            f"{datetime.now().strftime('%H:%M:%S')}"
         )
 
     except Exception as e:
-        log.error(f"CBOE_SCRAPE: Playwright error — {e}")
-        st.session_state["scrape_debug"] = f"❌ Playwright error: {e}"
+        log.error(f"CBOE_SCRAPE: error — {e}")
+        st.session_state["scrape_debug"] = f"❌ Error: {e}"
         return pd.DataFrame()
-    finally:
-        if page:
-            try: page.close()
-            except Exception: pass
 
-    # Parsear tablas
+    # Parsear tablas HTML
     try:
         all_tables = pd.read_html(StringIO(html))
-        log.info(f"CBOE_SCRAPE: {len(all_tables)} tablas encontradas en HTML")
+        log.info(f"CBOE_SCRAPE: {len(all_tables)} tablas en HTML")
     except Exception as e:
-        log.error(f"CBOE_SCRAPE: pd.read_html error — {e}")
+        log.error(f"CBOE_SCRAPE: read_html error — {e}")
         st.session_state["scrape_debug"] += f" | read_html error: {e}"
         return pd.DataFrame()
 
-    table_info = []
     df_vx = pd.DataFrame()
+    table_info = []
     for i, df in enumerate(all_tables):
         cols_upper = [str(c).upper().strip() for c in df.columns]
-        table_info.append(f"T{i}: {cols_upper[:5]} ({len(df)} rows)")
+        table_info.append(f"T{i}:{cols_upper[:4]}")
         if 'SYMBOL' in cols_upper and 'EXPIRATION' in cols_upper:
             sym_col = df.columns[cols_upper.index('SYMBOL')]
             if df[sym_col].astype(str).str.startswith('VX').any():
                 df_vx = df.copy()
-                log.info(f"CBOE_SCRAPE: tabla VX encontrada en índice {i} ✅")
+                log.info(f"CBOE_SCRAPE: tabla VX en índice {i} ✅")
                 break
 
-    log.info(f"CBOE_SCRAPE: tablas parseadas — {' | '.join(table_info)}")
-    st.session_state["scrape_debug"] += f" | Tables: {len(all_tables)} — {' | '.join(table_info[:4])}"
+    st.session_state["scrape_debug"] += f" | {len(all_tables)} tables: {' '.join(table_info[:4])}"
 
     if df_vx.empty:
-        log.warning("CBOE_SCRAPE: ninguna tabla con SYMBOL+EXPIRATION+VX")
-        # Guardar fragmento HTML para diagnóstico
+        log.warning("CBOE_SCRAPE: tabla VX no encontrada")
         st.session_state["scrape_html_sample"] = html[1500:2500]
         return pd.DataFrame()
 
@@ -219,7 +234,7 @@ def scrape_cboe_futures() -> pd.DataFrame:
                   else r.get('Settlement', 0), axis=1
     )
     df_vx['Scraped_At'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    log.info(f"CBOE_SCRAPE: {len(df_vx)} contratos mensuales OK ✅")
+    log.info(f"CBOE_SCRAPE: {len(df_vx)} contratos mensuales ✅")
     return df_vx
 
 
@@ -662,7 +677,7 @@ with tab1:
 
     if df_vx.empty:
         st.warning("⚠️ No se pudieron obtener precios de futuros VIX del CBOE.")
-        if browser_instance is None:
+        if not pw_ready:
             st.error("❌ Playwright/Chromium no se pudo inicializar. Verifica packages.txt y requirements.txt")
         st.info("💡 La página CBOE carga datos por JavaScript. Se necesita Playwright + Chromium para renderizarla.")
 
