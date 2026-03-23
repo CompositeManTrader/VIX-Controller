@@ -88,6 +88,10 @@ st.markdown("""
 .stTabs [data-baseweb="tab"]{font-family:'Inter',sans-serif;font-weight:600;font-size:0.82rem;color:var(--dim);padding:0.5rem 1.5rem;}
 .stTabs [aria-selected="true"]{color:#F7931A !important;border-bottom:2px solid #F7931A !important;}
 [data-testid="stSidebar"]{background:var(--card);}
+/* Evitar que Plotly capture el scroll de la página */
+.js-plotly-plot .plotly, .js-plotly-plot .plotly div{pointer-events:auto;}
+iframe[title="streamlit_component"]{pointer-events:none;}
+.element-container:has(.stPlotlyChart) .stPlotlyChart{overflow:visible;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -532,7 +536,8 @@ def build_equity_chart(equity: pd.Series) -> go.Figure:
         legend=dict(orientation='h', yanchor='bottom', y=1.02,
                     bgcolor='rgba(0,0,0,0)',
                     font=dict(size=9, color='#8B949E', family='JetBrains Mono')),
-        hovermode='x unified')
+        hovermode='x unified',
+        dragmode=False)
     return fig
 
 
@@ -1225,11 +1230,13 @@ with tab2:
         with col_eq:
             fig_eq = build_equity_chart(m['equity'])
             st.plotly_chart(fig_eq, use_container_width=True,
-                            config=dict(displayModeBar=False, displaylogo=False))
+                            config=dict(displayModeBar=False, displaylogo=False,
+                                        scrollZoom=False))
         with col_yr:
             fig_yr = build_yearly_heatmap(m['yearly'])
             st.plotly_chart(fig_yr, use_container_width=True,
-                            config=dict(displayModeBar=False, displaylogo=False))
+                            config=dict(displayModeBar=False, displaylogo=False,
+                                        scrollZoom=False))
 
     # ═══════════════════════════════════════════
     # SECCIÓN 3 — GRÁFICAS OPERATIVAS
@@ -1244,9 +1251,10 @@ with tab2:
     st.markdown("<div style='font-family:JetBrains Mono;font-size:0.72rem;"
                 "color:#8B949E;margin-bottom:0.2rem'>SEÑAL DE TIMING · VXX vs BB(20, 2σ)</div>",
                 unsafe_allow_html=True)
-    fig_vxx = build_bb_chart(bt, window=len(bt))   # todo el histórico
+    fig_vxx = build_bb_chart(bt, window=len(bt))
     st.plotly_chart(fig_vxx, use_container_width=True,
                     config=dict(displayModeBar=True, displaylogo=False,
+                                scrollZoom=False,
                                 modeBarButtonsToRemove=['select2d','lasso2d']))
 
     # ── Gráfica 2: SVIX operativa ──────────────────────────────
@@ -1261,6 +1269,7 @@ with tab2:
         )
         st.plotly_chart(fig_svix, use_container_width=True,
                         config=dict(displayModeBar=True, displaylogo=False,
+                                    scrollZoom=False,
                                     modeBarButtonsToRemove=['select2d','lasso2d']))
 
     # ── Gráfica 3: SVXY operativa ──────────────────────────────
@@ -1274,6 +1283,7 @@ with tab2:
     )
     st.plotly_chart(fig_svxy, use_container_width=True,
                     config=dict(displayModeBar=True, displaylogo=False,
+                                scrollZoom=False,
                                 modeBarButtonsToRemove=['select2d','lasso2d']))
 
     # ═══════════════════════════════════════════
