@@ -7,3 +7,4 @@ playwright>=1.40.0
 lxml>=4.9.0
 html5lib>=1.1
 gdown>=4.7.3
+streamlit-autorefresh>=1.0.1
