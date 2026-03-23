@@ -99,11 +99,6 @@ MN = {1:'Jan',2:'Feb',3:'Mar',4:'Apr',5:'May',6:'Jun',7:'Jul',8:'Aug',9:'Sep',10
 
 @st.cache_data(ttl=55)
 def scrape_cboe_futures() -> pd.DataFrame:
-    """
-    Scrape CBOE usando el browser persistente (no lanza/cierra Chromium cada vez).
-    Cada refresh abre solo una nueva page, navega, extrae y la cierra.
-    Tiempo estimado: 5-10 seg por refresh vs 3-5 min antes.
-    """
     browser = browser_instance
     if browser is None:
         st.sidebar.error("❌ Playwright no disponible")
@@ -117,19 +112,31 @@ def scrape_cboe_futures() -> pd.DataFrame:
             locale='en-US',
             java_script_enabled=True,
         )
-        # Bloquear recursos innecesarios para acelerar carga
-        page.route("**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,css}", lambda r: r.abort())
+
+        # NO bloquear CSS/recursos — CBOE puede necesitarlos para renderizar la tabla
+        # Solo bloquear trackers pesados
         page.route("**/analytics**", lambda r: r.abort())
-        page.route("**/gtm**", lambda r: r.abort())
-        page.route("**/google**", lambda r: r.abort())
+        page.route("**/gtm.js**",    lambda r: r.abort())
+        page.route("**/googletagmanager**", lambda r: r.abort())
 
         page.goto('https://www.cboe.com/delayed_quotes/futures/future_quotes',
-                  wait_until='domcontentloaded', timeout=30000)
+                  wait_until='networkidle', timeout=45000)
 
-        # Esperar tabla real — sin timeout hardcodeado
-        page.wait_for_selector('table', timeout=20000)
+        # Esperar hasta que haya al menos una fila con "VX" en la página
+        try:
+            page.wait_for_function(
+                "() => document.body.innerText.includes('VX/')",
+                timeout=20000
+            )
+        except Exception:
+            # Fallback: esperar tabla genérica
+            page.wait_for_selector('table', timeout=15000)
 
         html = page.content()
+
+        # Debug info en sidebar
+        vx_count = html.count('VX/')
+        st.sidebar.info(f"🔍 HTML size: {len(html):,} chars · 'VX/' occurrences: {vx_count}")
 
     except Exception as e:
         st.sidebar.warning(f"Playwright error: {e}")
@@ -144,19 +151,26 @@ def scrape_cboe_futures() -> pd.DataFrame:
     # Parsear HTML
     try:
         all_tables = pd.read_html(StringIO(html))
-    except Exception:
+        st.sidebar.info(f"📋 Tables found in HTML: {len(all_tables)}")
+    except Exception as e:
+        st.sidebar.warning(f"pd.read_html error: {e}")
         return pd.DataFrame()
 
     df_vx = pd.DataFrame()
-    for df in all_tables:
+    for i, df in enumerate(all_tables):
         cols_upper = [str(c).upper().strip() for c in df.columns]
+        st.sidebar.caption(f"Table {i}: cols={cols_upper[:6]}, rows={len(df)}")
         if 'SYMBOL' in cols_upper and 'EXPIRATION' in cols_upper:
             sym_col = df.columns[cols_upper.index('SYMBOL')]
             if df[sym_col].astype(str).str.startswith('VX').any():
                 df_vx = df.copy()
+                st.sidebar.success(f"✅ VX table found at index {i}")
                 break
 
     if df_vx.empty:
+        st.sidebar.warning("⚠️ No table with SYMBOL+EXPIRATION+VX found")
+        # Show first 500 chars of HTML for clues
+        st.sidebar.code(html[2000:2500], language="html")
         return pd.DataFrame()
 
     df_vx.columns = [str(c).strip().upper() for c in df_vx.columns]
@@ -168,7 +182,6 @@ def scrape_cboe_futures() -> pd.DataFrame:
     }
     df_vx.rename(columns={k: v for k, v in rename.items() if k in df_vx.columns}, inplace=True)
 
-    # Solo contratos mensuales: VX/K6, VX/M6 — NO VX12/H6, VX13/J6
     if 'Symbol' in df_vx.columns:
         mask = df_vx['Symbol'].astype(str).str.match(r'^VX/[A-Z]\d+$')
         df_vx = df_vx[mask].reset_index(drop=True)
