@@ -10,8 +10,12 @@ import plotly.graph_objects as go
 import yfinance as yf
 from datetime import datetime, timedelta, date
 from io import StringIO
-import re, time, warnings
+import re, time, warnings, logging
 warnings.filterwarnings("ignore")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s"
+)
 
 st.set_page_config(page_title="VIX Controller", page_icon="🔴", layout="wide",
                    initial_sidebar_state="collapsed")
@@ -97,13 +101,18 @@ MN = {1:'Jan',2:'Feb',3:'Mar',4:'Apr',5:'May',6:'Jun',7:'Jul',8:'Aug',9:'Sep',10
 # DATA LAYER — PLAYWRIGHT (browser persistente, sin relanzar)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-@st.cache_data(ttl=55)
 def scrape_cboe_futures() -> pd.DataFrame:
+    """Versión sin cache para diagnóstico — el cache estaba ocultando los errores."""
+    import logging
+    log = logging.getLogger("vix_controller")
+
     browser = browser_instance
     if browser is None:
-        st.sidebar.error("❌ Playwright no disponible")
+        log.error("CBOE_SCRAPE: browser_instance is None — Playwright no inicializó")
+        st.session_state["scrape_debug"] = "❌ browser_instance = None. Playwright no arrancó."
         return pd.DataFrame()
 
+    log.info("CBOE_SCRAPE: browser OK, abriendo page...")
     page = None
     try:
         page = browser.new_page(
@@ -112,65 +121,69 @@ def scrape_cboe_futures() -> pd.DataFrame:
             locale='en-US',
             java_script_enabled=True,
         )
-
-        # NO bloquear CSS/recursos — CBOE puede necesitarlos para renderizar la tabla
-        # Solo bloquear trackers pesados
-        page.route("**/analytics**", lambda r: r.abort())
-        page.route("**/gtm.js**",    lambda r: r.abort())
+        page.route("**/analytics**",        lambda r: r.abort())
         page.route("**/googletagmanager**", lambda r: r.abort())
 
+        log.info("CBOE_SCRAPE: navegando a CBOE...")
         page.goto('https://www.cboe.com/delayed_quotes/futures/future_quotes',
                   wait_until='networkidle', timeout=45000)
 
-        # Esperar hasta que haya al menos una fila con "VX" en la página
+        log.info("CBOE_SCRAPE: página cargada, esperando VX/...")
         try:
             page.wait_for_function(
                 "() => document.body.innerText.includes('VX/')",
-                timeout=20000
+                timeout=25000
             )
-        except Exception:
-            # Fallback: esperar tabla genérica
-            page.wait_for_selector('table', timeout=15000)
+            log.info("CBOE_SCRAPE: VX/ encontrado en página ✅")
+        except Exception as e2:
+            log.warning(f"CBOE_SCRAPE: wait_for_function timeout — {e2}")
 
         html = page.content()
-
-        # Debug info en sidebar
-        vx_count = html.count('VX/')
-        st.sidebar.info(f"🔍 HTML size: {len(html):,} chars · 'VX/' occurrences: {vx_count}")
+        vx_count  = html.count('VX/')
+        html_size = len(html)
+        log.info(f"CBOE_SCRAPE: HTML {html_size:,} chars · VX/ occurrences: {vx_count}")
+        st.session_state["scrape_debug"] = (
+            f"HTML: {html_size:,} chars · 'VX/' en HTML: {vx_count} · "
+            f"Scrapeado: {datetime.now().strftime('%H:%M:%S')}"
+        )
 
     except Exception as e:
-        st.sidebar.warning(f"Playwright error: {e}")
+        log.error(f"CBOE_SCRAPE: Playwright error — {e}")
+        st.session_state["scrape_debug"] = f"❌ Playwright error: {e}"
         return pd.DataFrame()
     finally:
         if page:
-            try:
-                page.close()
-            except Exception:
-                pass
+            try: page.close()
+            except Exception: pass
 
-    # Parsear HTML
+    # Parsear tablas
     try:
         all_tables = pd.read_html(StringIO(html))
-        st.sidebar.info(f"📋 Tables found in HTML: {len(all_tables)}")
+        log.info(f"CBOE_SCRAPE: {len(all_tables)} tablas encontradas en HTML")
     except Exception as e:
-        st.sidebar.warning(f"pd.read_html error: {e}")
+        log.error(f"CBOE_SCRAPE: pd.read_html error — {e}")
+        st.session_state["scrape_debug"] += f" | read_html error: {e}"
         return pd.DataFrame()
 
+    table_info = []
     df_vx = pd.DataFrame()
     for i, df in enumerate(all_tables):
         cols_upper = [str(c).upper().strip() for c in df.columns]
-        st.sidebar.caption(f"Table {i}: cols={cols_upper[:6]}, rows={len(df)}")
+        table_info.append(f"T{i}: {cols_upper[:5]} ({len(df)} rows)")
         if 'SYMBOL' in cols_upper and 'EXPIRATION' in cols_upper:
             sym_col = df.columns[cols_upper.index('SYMBOL')]
             if df[sym_col].astype(str).str.startswith('VX').any():
                 df_vx = df.copy()
-                st.sidebar.success(f"✅ VX table found at index {i}")
+                log.info(f"CBOE_SCRAPE: tabla VX encontrada en índice {i} ✅")
                 break
 
+    log.info(f"CBOE_SCRAPE: tablas parseadas — {' | '.join(table_info)}")
+    st.session_state["scrape_debug"] += f" | Tables: {len(all_tables)} — {' | '.join(table_info[:4])}"
+
     if df_vx.empty:
-        st.sidebar.warning("⚠️ No table with SYMBOL+EXPIRATION+VX found")
-        # Show first 500 chars of HTML for clues
-        st.sidebar.code(html[2000:2500], language="html")
+        log.warning("CBOE_SCRAPE: ninguna tabla con SYMBOL+EXPIRATION+VX")
+        # Guardar fragmento HTML para diagnóstico
+        st.session_state["scrape_html_sample"] = html[1500:2500]
         return pd.DataFrame()
 
     df_vx.columns = [str(c).strip().upper() for c in df_vx.columns]
@@ -206,6 +219,7 @@ def scrape_cboe_futures() -> pd.DataFrame:
                   else r.get('Settlement', 0), axis=1
     )
     df_vx['Scraped_At'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    log.info(f"CBOE_SCRAPE: {len(df_vx)} contratos mensuales OK ✅")
     return df_vx
 
 
@@ -480,6 +494,19 @@ with st.sidebar:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 with st.spinner("🌐 Scraping CBOE delayed quotes…"):
     df_vx = scrape_cboe_futures()
+
+# Mostrar diagnóstico en sidebar siempre
+with st.sidebar:
+    debug_msg = st.session_state.get("scrape_debug", "")
+    if debug_msg:
+        if debug_msg.startswith("❌"):
+            st.error(debug_msg)
+        else:
+            st.info(f"🔍 {debug_msg}")
+    html_sample = st.session_state.get("scrape_html_sample", "")
+    if html_sample:
+        st.warning("⚠️ No se encontró tabla VX — fragmento HTML:")
+        st.code(html_sample[:600], language="html")
 
 vix_spot = fetch_vix_spot()
 etps = fetch_etps()
