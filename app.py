@@ -664,45 +664,7 @@ def build_term_chart(vix_spot, df_vx, show_prev=True):
     return fig
 
 
-def build_bb_chart(clean, window=120):
-    p = clean.tail(window).copy()
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=p.index, y=p["BB_Upper"], mode='lines', name='BB Upper',
-                             line=dict(color='#F85149', width=1.2)))
-    fig.add_trace(go.Scatter(x=p.index, y=p["BB_Lower"], mode='lines', name='BB Lower',
-                             line=dict(color='#F85149', width=0.5),
-                             fill='tonexty', fillcolor='rgba(88,166,255,0.03)', showlegend=False))
-    fig.add_trace(go.Scatter(x=p.index, y=p["SMA20"], mode='lines', name='SMA(20)',
-                             line=dict(color='#58A6FF', width=1.5, dash='dash')))
-    fig.add_trace(go.Scatter(x=p.index, y=p["VXX_Close"], mode='lines', name='VXX Close',
-                             line=dict(color='#F0F6FC', width=2)))
-    for i in range(1, len(p)):
-        clr = 'rgba(63,185,80,0.06)' if p["bb_sig"].iloc[i] == 1 else 'rgba(248,81,73,0.03)'
-        fig.add_vrect(x0=p.index[i-1], x1=p.index[i], fillcolor=clr, layer="below", line_width=0)
-    for i in range(1, len(p)):
-        if p["bb_sig"].iloc[i] == 1 and p["bb_sig"].iloc[i-1] == 0:
-            fig.add_annotation(x=p.index[i], y=p["VXX_Close"].iloc[i],
-                text="▲ ENTRY", showarrow=True, arrowhead=2, arrowcolor="#3FB950",
-                font=dict(size=9, color="#3FB950", family="JetBrains Mono"), ax=0, ay=25)
-        elif p["bb_sig"].iloc[i] == 0 and p["bb_sig"].iloc[i-1] == 1:
-            fig.add_annotation(x=p.index[i], y=p["VXX_Close"].iloc[i],
-                text="▼ EXIT", showarrow=True, arrowhead=2, arrowcolor="#F85149",
-                font=dict(size=9, color="#F85149", family="JetBrains Mono"), ax=0, ay=-25)
-    fig.add_trace(go.Scatter(x=[p.index[-1]], y=[p["VXX_Close"].iloc[-1]],
-        mode='markers', name='Today',
-        marker=dict(size=12, color='#D29922', line=dict(width=2, color='white')), showlegend=False))
-    fig.update_layout(
-        title=dict(text="<b>VXX + Bollinger Bands</b><sup>  (BB timing — contango from term structure)</sup>",
-                   font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
-        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
-        height=380, margin=dict(l=50, r=30, t=55, b=40),
-        xaxis=dict(gridcolor='#21262D', tickfont=dict(size=10, color='#8B949E', family='JetBrains Mono')),
-        yaxis=dict(title=dict(text="VXX", font=dict(size=11, color='#8B949E')),
-                   gridcolor='#21262D', tickfont=dict(size=10, color='#8B949E', family='JetBrains Mono')),
-        legend=dict(orientation='h', yanchor='bottom', y=1.02, bgcolor='rgba(0,0,0,0)',
-                    font=dict(size=9, color='#8B949E', family='JetBrains Mono')),
-        hovermode='x unified')
-    return fig
+
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1248,3 +1210,4 @@ st.markdown(f"""
         VIX CONTROLLER · Alberto Alarcón González · Not financial advice
     </span>
 </div>""", unsafe_allow_html=True)
+
