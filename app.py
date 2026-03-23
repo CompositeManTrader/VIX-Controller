@@ -818,27 +818,32 @@ def build_term_chart(vix_spot, df_vx, show_prev=True):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 REFRESH_INTERVAL = 60  # segundos
 
-# Auto-refresh server-side: no recarga la página, solo hace rerun de Streamlit
-# Esto evita que Playwright vuelva a lanzarse por un full page reload
-try:
-    from streamlit_autorefresh import st_autorefresh
-    st_autorefresh(interval=REFRESH_INTERVAL * 1000, key="autorefresh")
-except ImportError:
-    pass  # Si no está instalado, el refresh manual del sidebar sigue funcionando
-
 if "last_refresh" not in st.session_state:
     st.session_state.last_refresh = time.time()
 
 elapsed = time.time() - st.session_state.last_refresh
 if elapsed > REFRESH_INTERVAL:
     st.session_state.last_refresh = time.time()
-    # Solo limpiar cache de datos live (CBOE + yfinance)
-    # NO tocar load_master_csv ni get_strategy_data — son pesados y tienen TTL propio
     scrape_cboe_futures.clear()
     fetch_vix_spot.clear()
     fetch_etps.clear()
     fetch_today_prices.clear()
     st.rerun()
+
+# JS: solo countdown visual, NO recarga la página
+st.components.v1.html(f"""
+<script>
+(function() {{
+    var remaining = {REFRESH_INTERVAL};
+    var timer = setInterval(function() {{
+        remaining--;
+        var el = window.parent.document.getElementById('refresh-countdown');
+        if (el) el.textContent = remaining + 's';
+        if (remaining <= 0) clearInterval(timer);
+    }}, 1000);
+}})();
+</script>
+""", height=0)
 
 # JS countdown visual SOLO — no recarga la página
 # El server-side rerun (arriba) es el que ejecuta el refresh real
@@ -890,21 +895,57 @@ with st.sidebar:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # FETCH DATA
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-with st.spinner("🌐 Scraping CBOE delayed quotes…"):
-    df_vx = scrape_cboe_futures()
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# FETCH DATA — no-blocking: CBOE en thread, CSV en paralelo
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+import threading
 
-# Mostrar diagnóstico en sidebar siempre
+# yfinance es rápido — siempre directo
+vix_spot = fetch_vix_spot()
+etps     = fetch_etps()
+
+# CBOE (Playwright ~30s): solo lanzar si no hay datos en cache
+# Si hay datos previos en session_state los usamos inmediatamente
+if "df_vx_cache" not in st.session_state:
+    st.session_state["df_vx_cache"]      = pd.DataFrame()
+    st.session_state["cboe_loading"]     = False
+
+def _run_cboe_scrape():
+    """Corre el scraping en background thread y guarda en session_state."""
+    try:
+        result = scrape_cboe_futures()
+        st.session_state["df_vx_cache"]  = result
+    except Exception as e:
+        pass
+    finally:
+        st.session_state["cboe_loading"] = False
+
+# Si el cache tiene TTL vencido o está vacío, lanzar scraping en background
+cboe_cache_age = time.time() - st.session_state.get("cboe_last_fetch", 0)
+cboe_needs_refresh = cboe_cache_age > 55 or st.session_state["df_vx_cache"].empty
+
+if cboe_needs_refresh and not st.session_state.get("cboe_loading", False):
+    st.session_state["cboe_loading"] = True
+    st.session_state["cboe_last_fetch"] = time.time()
+    t = threading.Thread(target=_run_cboe_scrape, daemon=True)
+    t.start()
+
+# Usar datos disponibles — pueden ser vacíos en la primera carga
+df_vx = st.session_state["df_vx_cache"]
+
+# Mostrar estado del scraping
 with st.sidebar:
+    if st.session_state.get("cboe_loading", False):
+        st.info("🔄 Cargando datos CBOE…")
     debug_msg = st.session_state.get("scrape_debug", "")
-    if debug_msg:
-        if debug_msg.startswith("❌"):
-            st.error(debug_msg)
-        else:
-            st.info(f"🔍 {debug_msg}")
+    if debug_msg and not debug_msg.startswith("❌"):
+        st.caption(f"🔍 {debug_msg}")
+    elif debug_msg.startswith("❌"):
+        st.error(debug_msg)
     html_sample = st.session_state.get("scrape_html_sample", "")
     if html_sample:
-        st.warning("⚠️ No se encontró tabla VX — fragmento HTML:")
-        st.code(html_sample[:600], language="html")
+        st.warning("⚠️ No se encontró tabla VX:")
+        st.code(html_sample[:400], language="html")
 
 vix_spot = fetch_vix_spot()
 etps = fetch_etps()
@@ -1069,21 +1110,51 @@ with tab1:
         st.caption(f"Contratos: {len(df_vx)} mensuales · Scraped: {scraped} · CBOE Delayed Quotes")
 
 
+# CSV del Drive — lanzar en thread para no bloquear Tab 1
+# get_strategy_data lo cachea, así que solo tarda la primera vez
+if "df_master_cache" not in st.session_state:
+    st.session_state["df_master_cache"]   = pd.DataFrame()
+    st.session_state["csv_loading"]       = False
+    st.session_state["strategy_cache"]    = None
+
+def _run_csv_load():
+    try:
+        df = load_master_csv()
+        if not df.empty:
+            bt_, td_, mt_ = get_strategy_data(df)
+            st.session_state["df_master_cache"] = df
+            st.session_state["strategy_cache"]  = (bt_, td_, mt_)
+    except Exception:
+        pass
+    finally:
+        st.session_state["csv_loading"] = False
+
+csv_cache_age   = time.time() - st.session_state.get("csv_last_fetch", 0)
+csv_needs_refresh = csv_cache_age > 300 or st.session_state["df_master_cache"].empty
+
+if csv_needs_refresh and not st.session_state.get("csv_loading", False):
+    st.session_state["csv_loading"]   = True
+    st.session_state["csv_last_fetch"] = time.time()
+    t2 = threading.Thread(target=_run_csv_load, daemon=True)
+    t2.start()
+
 # ━━━━━━━━━━━━━━━━━ TAB 2: MONITOR OPERATIVO ━━━━━━━━━━━━━━━
 with tab2:
 
-    # ── Cargar datos ──────────────────────────────────────────
-    with st.spinner("📂 Cargando histórico desde Google Drive…"):
-        df_master = load_master_csv()
-
     today_px = fetch_today_prices()
+    strategy_ready = st.session_state.get("strategy_cache") is not None
 
-    if df_master.empty:
-        st.error("❌ No se pudo cargar el CSV desde Google Drive. Verifica que el archivo sea público.")
+    if not strategy_ready:
+        if st.session_state.get("csv_loading", False):
+            st.info("⏳ Cargando histórico desde Google Drive por primera vez… (~60s). "
+                    "El Tab 1 ya está disponible.")
+        else:
+            st.warning("❌ No se pudo cargar el CSV desde Google Drive. "
+                       "Verifica que el archivo sea público.")
         st.stop()
 
-    # ── Aplicar estrategia sobre histórico (cacheado — no recalcula en cada rerun) ──
-    bt, trades_df, metrics = get_strategy_data(df_master)
+    # Datos listos desde session_state — no recalcula
+    bt, trades_df, metrics = st.session_state["strategy_cache"]
 
     # ── Señal de HOY ─────────────────────────────────────────
     # BB: basado en histórico CSV + precio VXX de hoy (yfinance)
