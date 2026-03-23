@@ -1,7 +1,7 @@
 """
 VIX Controller — Bloomberg-Style Term Structure + Operational Monitor
-Data: CBOE Delayed Quotes via Playwright scraping (same as notebook)
-Auto-refresh: every 60 seconds
+Data: CBOE Delayed Quotes via Playwright (persistent browser — lanza una sola vez)
+Auto-refresh: every 60 seconds via JS injection
 """
 import streamlit as st
 import pandas as pd
@@ -10,36 +10,36 @@ import plotly.graph_objects as go
 import yfinance as yf
 from datetime import datetime, timedelta, date
 from io import StringIO
-import re, time, warnings, subprocess, sys
+import re, time, warnings
 warnings.filterwarnings("ignore")
 
 st.set_page_config(page_title="VIX Controller", page_icon="🔴", layout="wide",
                    initial_sidebar_state="collapsed")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# ENSURE PLAYWRIGHT IS INSTALLED (runs once)
+# PLAYWRIGHT — instancia persistente (lanza browser UNA sola vez)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 @st.cache_resource
-def install_playwright():
-    """Install Playwright Chromium browser (runs once per deployment)."""
+def get_playwright_browser():
+    """
+    Lanza Chromium UNA vez y lo reutiliza en todos los refreshes.
+    @cache_resource = singleton por despliegue en Streamlit Cloud.
+    Elimina el overhead de lanzar/cerrar browser en cada llamada.
+    """
     try:
         from playwright.sync_api import sync_playwright
-        # Quick check if browser is already installed
-        with sync_playwright() as p:
-            b = p.chromium.launch(headless=True, args=['--no-sandbox'])
-            b.close()
-        return True
+        pw = sync_playwright().start()
+        browser = pw.chromium.launch(
+            headless=True,
+            args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
+                  '--disable-extensions', '--disable-background-networking',
+                  '--no-first-run'],
+        )
+        return browser
     except Exception:
-        try:
-            subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"],
-                          capture_output=True, timeout=120)
-            subprocess.run([sys.executable, "-m", "playwright", "install-deps", "chromium"],
-                          capture_output=True, timeout=120)
-            return True
-        except Exception as e:
-            return False
+        return None
 
-pw_ok = install_playwright()
+browser_instance = get_playwright_browser()
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # BLOOMBERG CSS
@@ -94,77 +94,59 @@ MONTHLY_RE = re.compile(r'^VX/[A-Z]\d+$')
 MN = {1:'Jan',2:'Feb',3:'Mar',4:'Apr',5:'May',6:'Jun',7:'Jul',8:'Aug',9:'Sep',10:'Oct',11:'Nov',12:'Dec'}
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# DATA LAYER — PLAYWRIGHT SCRAPING (from your working notebook)
+# DATA LAYER — PLAYWRIGHT (browser persistente, sin relanzar)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @st.cache_data(ttl=55)
 def scrape_cboe_futures() -> pd.DataFrame:
     """
-    Scrape CBOE delayed quotes page using Playwright (headless Chromium).
-    Returns DataFrame with only MONTHLY VX contracts.
-    Exact same logic as CBOE_VIX_Futures_Monthly_v4.ipynb
+    Scrape CBOE usando el browser persistente (no lanza/cierra Chromium cada vez).
+    Cada refresh abre solo una nueva page, navega, extrae y la cierra.
+    Tiempo estimado: 5-10 seg por refresh vs 3-5 min antes.
     """
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
+    browser = browser_instance
+    if browser is None:
+        st.sidebar.error("❌ Playwright no disponible")
         return pd.DataFrame()
 
+    page = None
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
-            )
-            ctx = browser.new_context(
-                user_agent=(
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                    'AppleWebKit/537.36 (KHTML, like Gecko) '
-                    'Chrome/120.0.0.0 Safari/537.36'
-                ),
-                viewport={'width': 1920, 'height': 1080},
-                locale='en-US',
-            )
-            page = ctx.new_page()
+        page = browser.new_page(
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            viewport={'width': 1920, 'height': 1080},
+            locale='en-US',
+            java_script_enabled=True,
+        )
+        # Bloquear recursos innecesarios para acelerar carga
+        page.route("**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,css}", lambda r: r.abort())
+        page.route("**/analytics**", lambda r: r.abort())
+        page.route("**/gtm**", lambda r: r.abort())
+        page.route("**/google**", lambda r: r.abort())
 
-            # 1. Navigate
-            page.goto(CBOE_URL, wait_until='domcontentloaded', timeout=45000)
+        page.goto('https://www.cboe.com/delayed_quotes/futures/future_quotes',
+                  wait_until='domcontentloaded', timeout=30000)
 
-            # 2. Wait for table to render (JS)
-            selectors = [
-                'table[class*="future"]', 'table[class*="quote"]',
-                '[class*="table-responsive"] table', 'main table', 'table',
-            ]
-            found = False
-            for sel in selectors:
-                try:
-                    page.wait_for_selector(sel, timeout=45000)
-                    found = True
-                    break
-                except:
-                    continue
+        # Esperar tabla real — sin timeout hardcodeado
+        page.wait_for_selector('table', timeout=20000)
 
-            if not found:
-                browser.close()
-                return pd.DataFrame()
-
-            # 3. Extra wait for all rows to load
-            page.wait_for_timeout(3000)
-
-            # 4. Get HTML
-            html = page.content()
-            browser.close()
+        html = page.content()
 
     except Exception as e:
         st.sidebar.warning(f"Playwright error: {e}")
         return pd.DataFrame()
+    finally:
+        if page:
+            try:
+                page.close()
+            except Exception:
+                pass
 
-    # 5. Parse HTML tables
+    # Parsear HTML
     try:
         all_tables = pd.read_html(StringIO(html))
     except Exception:
         return pd.DataFrame()
 
-    # 6. Find the VX table
     df_vx = pd.DataFrame()
     for df in all_tables:
         cols_upper = [str(c).upper().strip() for c in df.columns]
@@ -177,7 +159,6 @@ def scrape_cboe_futures() -> pd.DataFrame:
     if df_vx.empty:
         return pd.DataFrame()
 
-    # 7. Normalize columns
     df_vx.columns = [str(c).strip().upper() for c in df_vx.columns]
     rename = {
         'SYMBOL': 'Symbol', 'EXPIRATION': 'Expiration',
@@ -187,12 +168,11 @@ def scrape_cboe_futures() -> pd.DataFrame:
     }
     df_vx.rename(columns={k: v for k, v in rename.items() if k in df_vx.columns}, inplace=True)
 
-    # 8. Filter MONTHLY only (VX/K6, VX/M6 — NOT VX12/H6, VX13/J6)
+    # Solo contratos mensuales: VX/K6, VX/M6 — NO VX12/H6, VX13/J6
     if 'Symbol' in df_vx.columns:
         mask = df_vx['Symbol'].astype(str).str.match(r'^VX/[A-Z]\d+$')
         df_vx = df_vx[mask].reset_index(drop=True)
 
-    # 9. Convert types
     if 'Expiration' in df_vx.columns:
         df_vx['Expiration'] = pd.to_datetime(df_vx['Expiration'], errors='coerce')
         df_vx = df_vx.sort_values('Expiration').reset_index(drop=True)
@@ -204,19 +184,15 @@ def scrape_cboe_futures() -> pd.DataFrame:
                 errors='coerce'
             )
 
-    # 10. Derived columns
     today = pd.Timestamp('today').normalize()
     if 'Expiration' in df_vx.columns:
         df_vx['DTE'] = (df_vx['Expiration'] - today).dt.days
 
-    # Price = Last if > 0, else Settlement
     df_vx['Price'] = df_vx.apply(
         lambda r: r['Last'] if pd.notna(r.get('Last')) and r.get('Last', 0) > 0
                   else r.get('Settlement', 0), axis=1
     )
-
     df_vx['Scraped_At'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
     return df_vx
 
 
@@ -431,26 +407,45 @@ def build_bb_chart(clean, window=120):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# AUTO-REFRESH
+# AUTO-REFRESH — JS real timer (no requiere interacción del usuario)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+REFRESH_INTERVAL = 60  # segundos
+
 if "last_refresh" not in st.session_state:
     st.session_state.last_refresh = time.time()
 
 elapsed = time.time() - st.session_state.last_refresh
-if elapsed > 60:
+if elapsed > REFRESH_INTERVAL:
     st.session_state.last_refresh = time.time()
     st.cache_data.clear()
     st.rerun()
+
+# JS countdown + page reload automático cada 60s sin interacción
+st.components.v1.html(f"""
+<script>
+(function() {{
+    var remaining = {REFRESH_INTERVAL};
+    var timer = setInterval(function() {{
+        remaining--;
+        var el = window.parent.document.getElementById('refresh-countdown');
+        if (el) el.textContent = remaining + 's';
+        if (remaining <= 0) {{
+            clearInterval(timer);
+            window.parent.location.reload();
+        }}
+    }}, 1000);
+}})();
+</script>
+""", height=0)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # HEADER
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-next_ref = max(0, 60 - int(elapsed))
 st.markdown(f"""
 <div class="hdr">
     <div class="logo">VIX CONTROLLER</div>
-    <div class="sub">{now_str} · Auto-refresh in {next_ref}s · Source: CBOE Delayed Quotes (Playwright)</div>
+    <div class="sub">{now_str} · Auto-refresh in <span id="refresh-countdown">{REFRESH_INTERVAL}s</span> · Source: CBOE Delayed Quotes</div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -627,8 +622,8 @@ with tab1:
 
     if df_vx.empty:
         st.warning("⚠️ No se pudieron obtener precios de futuros VIX del CBOE.")
-        if not pw_ok:
-            st.error("❌ Playwright/Chromium no se instaló correctamente. Verifica packages.txt y requirements.txt")
+        if browser_instance is None:
+            st.error("❌ Playwright/Chromium no se pudo inicializar. Verifica packages.txt y requirements.txt")
         st.info("💡 La página CBOE carga datos por JavaScript. Se necesita Playwright + Chromium para renderizarla.")
 
     if not df_vx.empty:
