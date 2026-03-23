@@ -561,6 +561,134 @@ def build_yearly_heatmap(yearly: dict) -> go.Figure:
     return fig
 
 
+def build_operational_chart(bt: pd.DataFrame, col_price: str,
+                            label: str, color: str,
+                            trades_df: pd.DataFrame,
+                            today_price: float = None,
+                            today_sig: int = 0) -> go.Figure:
+    """
+    Gráfica operativa genérica para VXX, SVXY o SVIX.
+    Muestra precio histórico + zonas LONG/CASH + flechas entrada/salida
+    + punto de hoy si hay precio live.
+    col_price : columna del DataFrame (e.g. 'VXX_Close', 'SVXY_Close')
+    """
+    # Usar solo filas donde existe el precio
+    p = bt[bt[col_price].notna()].copy()
+    sig = p['sig_final']
+    price_s = p[col_price]
+
+    fig = go.Figure()
+
+    # ── Zonas LONG / CASH ──────────────────────────────────────
+    for i in range(1, len(p)):
+        clr = 'rgba(63,185,80,0.07)' if sig.iloc[i] == 1 else 'rgba(248,81,73,0.025)'
+        fig.add_vrect(x0=p.index[i-1], x1=p.index[i],
+                      fillcolor=clr, layer="below", line_width=0)
+
+    # ── Precio ─────────────────────────────────────────────────
+    fig.add_trace(go.Scatter(
+        x=price_s.index, y=price_s.values,
+        mode='lines', name=label,
+        line=dict(color=color, width=2),
+        hovertemplate='%{x|%Y-%m-%d}<br>' + label + ': $%{y:.2f}<extra></extra>',
+    ))
+
+    # ── Flechas ENTRY / EXIT desde trades_df ──────────────────
+    closed = trades_df[trades_df['Salida'] != '🔴 ABIERTO']
+    open_t = trades_df[trades_df['Salida'] == '🔴 ABIERTO']
+
+    for _, t in closed.iterrows():
+        entry_d = pd.Timestamp(t['Entrada'])
+        exit_d  = pd.Timestamp(t['Salida'])
+        # Buscar precio más cercano a esa fecha
+        if entry_d in price_s.index:
+            ep = price_s.loc[entry_d]
+        elif len(price_s.loc[price_s.index >= entry_d]) > 0:
+            ep = price_s.loc[price_s.index >= entry_d].iloc[0]
+        else:
+            continue
+        if exit_d in price_s.index:
+            xp = price_s.loc[exit_d]
+        elif len(price_s.loc[price_s.index >= exit_d]) > 0:
+            xp = price_s.loc[price_s.index >= exit_d].iloc[0]
+        else:
+            continue
+
+        fig.add_annotation(x=entry_d, y=ep,
+            text="▲", showarrow=False,
+            font=dict(size=13, color="#3FB950", family="JetBrains Mono"),
+            yshift=-16)
+        fig.add_annotation(x=exit_d, y=xp,
+            text="▼", showarrow=False,
+            font=dict(size=13, color="#F85149", family="JetBrains Mono"),
+            yshift=16)
+
+    # Trade abierto actualmente
+    for _, t in open_t.iterrows():
+        entry_d = pd.Timestamp(t['Entrada'])
+        if entry_d in price_s.index:
+            ep = price_s.loc[entry_d]
+        elif len(price_s.loc[price_s.index >= entry_d]) > 0:
+            ep = price_s.loc[price_s.index >= entry_d].iloc[0]
+        else:
+            continue
+        fig.add_annotation(x=entry_d, y=ep,
+            text="▲ OPEN", showarrow=True,
+            arrowhead=2, arrowcolor="#3FB950",
+            font=dict(size=9, color="#3FB950", family="JetBrains Mono"),
+            ax=0, ay=30)
+
+    # ── Punto de hoy ───────────────────────────────────────────
+    if today_price and today_price > 0:
+        today_clr = '#3FB950' if today_sig == 1 else '#F85149'
+        today_lbl = '🟢 HOY — LONG' if today_sig == 1 else '🔴 HOY — CASH'
+        fig.add_trace(go.Scatter(
+            x=[pd.Timestamp.now().normalize()],
+            y=[today_price],
+            mode='markers+text',
+            name=today_lbl,
+            text=[f"${today_price:.2f}"],
+            textposition='top center',
+            textfont=dict(size=10, color=today_clr, family='JetBrains Mono'),
+            marker=dict(size=14, color=today_clr,
+                        line=dict(width=2, color='white'), symbol='diamond'),
+        ))
+
+    fig.update_layout(
+        title=dict(
+            text=f"<b>{label} — Operativa</b>"
+                 f"<sup>  Verde=LONG SVXY · Rojo=CASH · ▲Entrada · ▼Salida</sup>",
+            font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
+        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
+        height=400, margin=dict(l=55, r=30, t=55, b=40),
+        xaxis=dict(
+            gridcolor='#21262D', rangeslider=dict(visible=False),
+            tickfont=dict(size=10, color='#8B949E', family='JetBrains Mono'),
+            rangeselector=dict(
+                buttons=[
+                    dict(count=3,  label="3M",  step="month", stepmode="backward"),
+                    dict(count=6,  label="6M",  step="month", stepmode="backward"),
+                    dict(count=1,  label="1A",  step="year",  stepmode="backward"),
+                    dict(count=3,  label="3A",  step="year",  stepmode="backward"),
+                    dict(step="all", label="Todo"),
+                ],
+                bgcolor='#161B22', activecolor='#F7931A',
+                font=dict(size=9, color='#C9D1D9', family='JetBrains Mono'),
+            ),
+        ),
+        yaxis=dict(
+            title=dict(text=f"{label} ($)", font=dict(size=11, color='#8B949E')),
+            gridcolor='#21262D',
+            tickfont=dict(size=10, color='#8B949E', family='JetBrains Mono'),
+        ),
+        legend=dict(orientation='h', yanchor='bottom', y=1.02,
+                    bgcolor='rgba(0,0,0,0)',
+                    font=dict(size=9, color='#8B949E', family='JetBrains Mono')),
+        hovermode='x unified',
+    )
+    return fig
+
+
 def cpct(p1, p2):
     if p1 and p2 and p1 > 0:
         return round((p2 - p1) / p1 * 100, 2)
@@ -1104,18 +1232,54 @@ with tab2:
                             config=dict(displayModeBar=False, displaylogo=False))
 
     # ═══════════════════════════════════════════
-    # SECCIÓN 3 — GRÁFICO VXX + BB
+    # SECCIÓN 3 — GRÁFICAS OPERATIVAS
     # ═══════════════════════════════════════════
-    st.markdown("<div style='border-top:1px solid #30363D;margin:0.6rem 0'></div>",
+    st.markdown("<div style='border-top:1px solid #30363D;margin:0.8rem 0 0.5rem'></div>",
                 unsafe_allow_html=True)
-    fig_bb = build_bb_chart(bt, window=150)
-    st.plotly_chart(fig_bb, use_container_width=True,
-                    config=dict(displayModeBar=True, displaylogo=False))
+    st.markdown("<div style='font-family:Inter;font-weight:700;font-size:0.9rem;"
+                "color:#F0F6FC;margin-bottom:0.6rem'>📊 Gráficas Operativas</div>",
+                unsafe_allow_html=True)
+
+    # ── Gráfica 1: VXX + BB ────────────────────────────────────
+    st.markdown("<div style='font-family:JetBrains Mono;font-size:0.72rem;"
+                "color:#8B949E;margin-bottom:0.2rem'>SEÑAL DE TIMING · VXX vs BB(20, 2σ)</div>",
+                unsafe_allow_html=True)
+    fig_vxx = build_bb_chart(bt, window=len(bt))   # todo el histórico
+    st.plotly_chart(fig_vxx, use_container_width=True,
+                    config=dict(displayModeBar=True, displaylogo=False,
+                                modeBarButtonsToRemove=['select2d','lasso2d']))
+
+    # ── Gráfica 2: SVIX operativa ──────────────────────────────
+    if 'SVIX_Close' in bt.columns and bt['SVIX_Close'].notna().sum() > 10:
+        st.markdown("<div style='font-family:JetBrains Mono;font-size:0.72rem;"
+                    "color:#8B949E;margin:0.6rem 0 0.2rem'>VEHÍCULO AGRESIVO · SVIX (-1x)</div>",
+                    unsafe_allow_html=True)
+        fig_svix = build_operational_chart(
+            bt, col_price='SVIX_Close', label='SVIX', color='#E91E63',
+            trades_df=trades_df,
+            today_price=svix_today, today_sig=final_sig_today,
+        )
+        st.plotly_chart(fig_svix, use_container_width=True,
+                        config=dict(displayModeBar=True, displaylogo=False,
+                                    modeBarButtonsToRemove=['select2d','lasso2d']))
+
+    # ── Gráfica 3: SVXY operativa ──────────────────────────────
+    st.markdown("<div style='font-family:JetBrains Mono;font-size:0.72rem;"
+                "color:#8B949E;margin:0.6rem 0 0.2rem'>VEHÍCULO PRINCIPAL · SVXY (-0.5x)</div>",
+                unsafe_allow_html=True)
+    fig_svxy = build_operational_chart(
+        bt, col_price='SVXY_Close', label='SVXY', color='#39D2C0',
+        trades_df=trades_df,
+        today_price=svxy_today, today_sig=final_sig_today,
+    )
+    st.plotly_chart(fig_svxy, use_container_width=True,
+                    config=dict(displayModeBar=True, displaylogo=False,
+                                modeBarButtonsToRemove=['select2d','lasso2d']))
 
     # ═══════════════════════════════════════════
     # SECCIÓN 4 — HISTORIAL DE OPERACIONES
     # ═══════════════════════════════════════════
-    st.markdown("<div style='border-top:1px solid #30363D;margin:0.6rem 0'></div>",
+    st.markdown("<div style='border-top:1px solid #30363D;margin:0.8rem 0 0.5rem'></div>",
                 unsafe_allow_html=True)
     st.markdown("<div style='font-family:Inter;font-weight:700;font-size:0.9rem;"
                 "color:#F0F6FC;margin-bottom:0.4rem'>📋 Historial de Operaciones</div>",
@@ -1137,15 +1301,15 @@ with tab2:
             {mcard("Duración media", f"{avg_dur:.0f}d" if not pd.isna(avg_dur) else "—", "nt")}
         </div>""", unsafe_allow_html=True)
 
-        # Tabla HTML de trades (descendente — el más reciente arriba)
+        # Tabla HTML scrolleable
         rows_html = ""
         for _, t in trades_df.iloc[::-1].iterrows():
-            ret      = t['Retorno']
-            is_open  = t['Salida'] == '🔴 ABIERTO'
-            ret_clr  = "color:var(--g)" if ret > 0 else "color:var(--r)"
-            sal_clr  = "color:var(--y);font-weight:700" if is_open else ""
-            vix_e    = f"{t['VIX entrada']:.1f}" if pd.notna(t.get('VIX entrada')) else "—"
-            ct_e     = f"{t['Contango entr.']:+.2f}%" if pd.notna(t.get('Contango entr.')) else "—"
+            ret     = t['Retorno']
+            is_open = t['Salida'] == '🔴 ABIERTO'
+            ret_clr = "color:var(--g)" if ret > 0 else "color:var(--r)"
+            sal_clr = "color:var(--y);font-weight:700" if is_open else ""
+            vix_e   = f"{t['VIX entrada']:.1f}" if pd.notna(t.get('VIX entrada')) else "—"
+            ct_e    = f"{t['Contango entr.']:+.2f}%" if pd.notna(t.get('Contango entr.')) else "—"
             rows_html += f"""<tr>
                 <td style="color:var(--b);font-weight:600">{t['Entrada']}</td>
                 <td style="{sal_clr}">{t['Salida']}</td>
@@ -1157,9 +1321,10 @@ with tab2:
             </tr>"""
 
         st.markdown(f"""
-        <div style="max-height:380px;overflow-y:auto;margin-top:0.4rem">
+        <div style="max-height:400px;overflow-y:auto;margin-top:0.4rem;
+                    border:1px solid #30363D;border-radius:4px">
         <table class="dtbl">
-            <thead><tr>
+            <thead style="position:sticky;top:0;background:#1C2128;z-index:1"><tr>
                 <th>Entrada</th><th>Salida</th><th>Días</th>
                 <th>Retorno</th><th>Razón salida</th>
                 <th>VIX entrada</th><th>Contango entr.</th>
@@ -1167,9 +1332,11 @@ with tab2:
             <tbody>{rows_html}</tbody>
         </table></div>""", unsafe_allow_html=True)
 
-        st.caption(f"Histórico desde {bt.index[0].strftime('%Y-%m-%d')} · "
-                   f"CSV actualizado: {last_date.strftime('%Y-%m-%d')} · "
-                   f"Precios hoy: yfinance · Contango: {ct_source}")
+        st.caption(
+            f"Histórico desde {bt.index[0].strftime('%Y-%m-%d')} · "
+            f"CSV actualizado: {last_date.strftime('%Y-%m-%d')} · "
+            f"Contango live: {ct_source}"
+        )
     else:
         st.info("No se encontraron trades en el histórico.")
 
@@ -1210,4 +1377,3 @@ st.markdown(f"""
         VIX CONTROLLER · Alberto Alarcón González · Not financial advice
     </span>
 </div>""", unsafe_allow_html=True)
-
