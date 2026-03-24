@@ -279,30 +279,33 @@ def fetch_etps():
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# MONITOR OPERATIVO — DATA LAYER
+# MONITOR OPERATIVO — DATA LAYER (parquet local del repo)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-DRIVE_FILE_ID = "12fzSq4BgkppRjoupeMjM67jCB8Qwo8Yz"
-DRIVE_URL     = f"https://drive.google.com/uc?id={DRIVE_FILE_ID}"
+PARQUET_PATH = "data/master.parquet"
 
-@st.cache_data(ttl=300)  # Refrescar cada 5 min (el CSV no cambia tan rápido)
-def load_master_csv() -> pd.DataFrame:
-    """Descarga el CSV maestro desde Google Drive vía gdown."""
+@st.cache_data(ttl=3600)
+def load_master_parquet() -> pd.DataFrame:
+    """
+    Lee el histórico desde data/master.parquet (repo de GitHub).
+    Instantáneo — sin red, sin Drive, sin gdown.
+    El notebook exporta: df.to_parquet('data/master.parquet') y hace push.
+    Columnas clave: VXX_Close, M1_Price, In_Contango, Contango_pct, VIX_Close
+    """
     log = logging.getLogger("vix_controller")
-    tmp = "/tmp/master_historico.csv"
     try:
-        import gdown
-        gdown.download(DRIVE_URL, tmp, quiet=True, fuzzy=True)
-        df = pd.read_csv(tmp, index_col=0, parse_dates=True).sort_index()
-        log.info(f"CSV cargado: {len(df):,} filas · {df.index[-1].strftime('%Y-%m-%d')}")
+        df = pd.read_parquet(PARQUET_PATH)
+        df.index = pd.to_datetime(df.index)
+        df = df.sort_index()
+        log.info(f"Parquet: {len(df):,} filas · {df.index[-1].strftime('%Y-%m-%d')}")
         return df
     except Exception as e:
-        log.error(f"Error cargando CSV: {e}")
+        log.error(f"Error parquet: {e}")
         return pd.DataFrame()
 
 
 @st.cache_data(ttl=55)
 def fetch_today_prices():
-    """Precios del día de yfinance: VXX, SVXY, SVIX, VIX, SPY."""
+    """Precios del día: VXX, SVXY, SVIX, VIX, SPY."""
     out = {}
     for name, sym in [("VXX","VXX"),("SVXY","SVXY"),("SVIX","SVIX"),
                        ("VIX","^VIX"),("SPY","SPY")]:
@@ -319,24 +322,26 @@ def fetch_today_prices():
     return out
 
 
-def build_strategy(df: pd.DataFrame) -> pd.DataFrame:
+@st.cache_data(ttl=3600)
+def build_strategy_cached(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Aplica la estrategia BB(20, 2σ) + Contango Rule sobre el DataFrame histórico.
-    Retorna el DataFrame con columnas de señal, indicadores y trades.
+    Aplica BB(20, 2σ) + Contango Rule sobre el histórico completo.
+    Cacheado 1h — mismo TTL que el parquet.
+
     Lógica exacta del notebook:
-      Entrada: VXX < SMA(20) → pos=1
-      Salida:  VXX > BB_Upper(2σ) → pos=0
-      Filtro:  In_Contango == 1
-      Ejecución: shift(1) — señal de hoy se ejecuta mañana
+      Entrada : VXX < SMA(20)       → pos=1 (BB timing)
+      Salida  : VXX > BB_Upper(2σ)  → pos=0 (salida por BB)
+               O In_Contango == 0   → pos=0 (salida por CT)
+      Filtro  : contango_filter = In_Contango (sin shift — es dato del cierre)
+      sig_final = sig_bb × ct_filter  (shift ya aplicado en sig_bb)
     """
-    bt = df[df['VXX_Close'].notna() & df['SVXY_Close'].notna() &
-            df['M1_Price'].notna()].copy()
+    bt = df[df['VXX_Close'].notna() & df['M1_Price'].notna()].copy()
 
     vxx = bt['VXX_Close']
-    bt['BB_SMA20']   = vxx.rolling(20).mean()
-    bt['BB_STD20']   = vxx.rolling(20).std()
-    bt['BB_Upper']   = bt['BB_SMA20'] + 2.0 * bt['BB_STD20']
-    bt['BB_Lower']   = bt['BB_SMA20'] - 2.0 * bt['BB_STD20']
+    bt['BB_SMA20'] = vxx.rolling(20).mean()
+    bt['BB_STD20'] = vxx.rolling(20).std()
+    bt['BB_Upper'] = bt['BB_SMA20'] + 2.0 * bt['BB_STD20']
+    bt['BB_Lower'] = bt['BB_SMA20'] - 2.0 * bt['BB_STD20']
 
     # Señal BB pura
     sig = pd.Series(0, index=bt.index)
@@ -347,353 +352,159 @@ def build_strategy(df: pd.DataFrame) -> pd.DataFrame:
         u = bt['BB_Upper'].iloc[i]
         if pd.isna(s) or pd.isna(u) or pd.isna(p):
             sig.iloc[i] = pos; continue
-        if pos == 0 and p < s: pos = 1
+        if pos == 0 and p < s:   pos = 1
         elif pos == 1 and p > u: pos = 0
         sig.iloc[i] = pos
 
-    bt['sig_bb']      = sig.shift(1).fillna(0)
-    bt['ct_filter']   = bt['In_Contango'].fillna(0).astype(int)
-    bt['sig_final']   = (bt['sig_bb'] * bt['ct_filter']).astype(int)
-
-    # Retorno estrategia
-    bt['strat_ret'] = bt['SVXY_ret'] * bt['sig_final']
-    bt['equity']    = (1 + bt['strat_ret'].fillna(0)).cumprod()
-
+    bt['sig_bb']    = sig.shift(1).fillna(0).astype(int)
+    bt['ct_filter'] = bt['In_Contango'].fillna(0).astype(int)
+    bt['sig_final'] = (bt['sig_bb'] * bt['ct_filter']).astype(int)
     return bt
 
 
-def extract_trades(bt: pd.DataFrame) -> pd.DataFrame:
-    """Extrae todos los trades (entrada/salida) del histórico."""
-    sig = bt['sig_final']
-    trades = []
-    entry_date = None
-
-    for i in range(1, len(sig)):
-        # Entrada: 0 → 1
-        if sig.iloc[i] == 1 and sig.iloc[i-1] == 0:
-            entry_date = sig.index[i]
-        # Salida: 1 → 0
-        elif sig.iloc[i] == 0 and sig.iloc[i-1] == 1 and entry_date is not None:
-            exit_date = sig.index[i]
-            rets = bt['SVXY_ret'].loc[entry_date:exit_date].dropna()
-            if len(rets) == 0:
-                entry_date = None; continue
-
-            trade_ret = (1 + rets).prod() - 1
-            duration  = len(rets)
-
-            # Razón de salida
-            prev = sig.index[i-1]
-            bb_exit = bt.loc[prev, 'VXX_Close'] > bt.loc[prev, 'BB_Upper'] if prev in bt.index else False
-            ct_exit = bt.loc[prev, 'In_Contango'] == 0 if prev in bt.index else False
-            if ct_exit and bb_exit: reason = 'Ambas'
-            elif ct_exit:           reason = 'Contango Rule'
-            else:                   reason = 'BB Superior'
-
-            trades.append({
-                'Entrada'        : entry_date.strftime('%Y-%m-%d'),
-                'Salida'         : exit_date.strftime('%Y-%m-%d'),
-                'Días'           : duration,
-                'Retorno'        : round(trade_ret * 100, 2),
-                'Razón salida'   : reason,
-                'VIX entrada'    : round(bt.loc[entry_date, 'VIX_Close'], 1) if entry_date in bt.index else None,
-                'Contango entr.' : round(bt.loc[entry_date, 'Contango_pct'], 2) if entry_date in bt.index else None,
-            })
-            entry_date = None
-
-    # Trade abierto actualmente
-    if entry_date is not None:
-        rets = bt['SVXY_ret'].loc[entry_date:].dropna()
-        trade_ret = (1 + rets).prod() - 1 if len(rets) > 0 else 0
-        trades.append({
-            'Entrada'        : entry_date.strftime('%Y-%m-%d'),
-            'Salida'         : '🔴 ABIERTO',
-            'Días'           : len(rets),
-            'Retorno'        : round(trade_ret * 100, 2),
-            'Razón salida'   : '—',
-            'VIX entrada'    : round(bt.loc[entry_date, 'VIX_Close'], 1) if entry_date in bt.index else None,
-            'Contango entr.' : round(bt.loc[entry_date, 'Contango_pct'], 2) if entry_date in bt.index else None,
-        })
-
-    return pd.DataFrame(trades)
-
-
-def calc_metrics(bt: pd.DataFrame) -> dict:
-    """Calcula métricas clave del backtest."""
-    sr = bt['strat_ret'].dropna()
-    if len(sr) < 50: return {}
-    eq     = (1 + sr).cumprod()
-    years  = len(eq) / 252
-    cagr   = (eq.iloc[-1] ** (1/years) - 1) * 100
-    peak   = eq.cummax()
-    mdd    = ((eq - peak) / peak).min() * 100
-    sharpe = sr.mean() / sr.std() * np.sqrt(252) if sr.std() > 0 else 0
-    calmar = abs(cagr / mdd) if mdd != 0 else 0
-    trades_in = (sr != 0)
-    wr     = (sr[trades_in] > 0).mean() * 100 if trades_in.sum() > 0 else 0
-    exp    = bt['sig_final'].mean() * 100
-    # Retornos anuales
-    yearly = {}
-    for yr in sorted(set(eq.index.year)):
-        yr_r = sr[sr.index.year == yr]
-        if len(yr_r) > 20:
-            yearly[yr] = round(((1 + yr_r).cumprod().iloc[-1] - 1) * 100, 1)
-    return dict(cagr=round(cagr,1), mdd=round(mdd,1), sharpe=round(sharpe,2),
-                calmar=round(calmar,2), wr=round(wr,1), exp=round(exp,1),
-                yearly=yearly, equity=eq)
-
-
-def build_bb_chart(bt: pd.DataFrame, window: int = 250) -> go.Figure:
-    """Gráfico VXX + Bollinger Bands con zonas y flechas ENTRY/EXIT."""
-    p = bt.tail(window).copy()
-
-    # Normalizar nombres de columna — compatibilidad con ambos esquemas
-    if 'SMA20' in p.columns and 'BB_SMA20' not in p.columns:
-        p['BB_SMA20'] = p['SMA20']
-    if 'BB_Upper' not in p.columns and 'BB_Upper_20' in p.columns:
-        p['BB_Upper'] = p['BB_Upper_20']
-    if 'BB_Lower' not in p.columns and 'BB_Lower_20' in p.columns:
-        p['BB_Lower'] = p['BB_Lower_20']
-    if 'sig_final' not in p.columns and 'bb_sig' in p.columns:
-        p['sig_final'] = p['bb_sig']
-    if 'VXX_Close' not in p.columns and 'VXX' in p.columns:
-        p['VXX_Close'] = p['VXX']
-
-    sig = p['sig_final']
-    fig = go.Figure()
-
-    # Zonas colored — agregar como trace con fill (mucho más eficiente que vrect)
-    # Crear columna de precio que solo existe cuando LONG para fill
-    p['long_zone'] = np.where(sig == 1, p['VXX_Close'].max() * 1.15, np.nan)
-    p['cash_zone'] = np.where(sig == 0, p['VXX_Close'].max() * 1.15, np.nan)
-    fig.add_trace(go.Scatter(x=p.index, y=p['long_zone'], mode='none',
-        fill='tozeroy', fillcolor='rgba(63,185,80,0.06)', showlegend=False,
-        hoverinfo='skip'))
-    fig.add_trace(go.Scatter(x=p.index, y=p['cash_zone'], mode='none',
-        fill='tozeroy', fillcolor='rgba(248,81,73,0.03)', showlegend=False,
-        hoverinfo='skip'))
-
-    # BB band fill
-    fig.add_trace(go.Scatter(x=p.index, y=p['BB_Upper'], mode='lines',
-        name='BB 2σ', line=dict(color='#F85149', width=1.2)))
-    fig.add_trace(go.Scatter(x=p.index, y=p['BB_Lower'], mode='lines',
-        name='BB Lower', line=dict(color='#F85149', width=0.5),
-        fill='tonexty', fillcolor='rgba(88,166,255,0.03)', showlegend=False))
-    fig.add_trace(go.Scatter(x=p.index, y=p['BB_SMA20'], mode='lines',
-        name='SMA(20)', line=dict(color='#58A6FF', width=1.5, dash='dash')))
-    fig.add_trace(go.Scatter(x=p.index, y=p['VXX_Close'], mode='lines',
-        name='VXX', line=dict(color='#F0F6FC', width=2)))
-
-    # ENTRY / EXIT arrows
-    for i in range(1, len(p)):
-        if sig.iloc[i] == 1 and sig.iloc[i-1] == 0:
-            fig.add_annotation(x=p.index[i], y=p['VXX_Close'].iloc[i],
-                text="▲ ENTRY", showarrow=True, arrowhead=2, arrowcolor="#3FB950",
-                font=dict(size=9, color="#3FB950", family="JetBrains Mono"), ax=0, ay=25)
-        elif sig.iloc[i] == 0 and sig.iloc[i-1] == 1:
-            fig.add_annotation(x=p.index[i], y=p['VXX_Close'].iloc[i],
-                text="▼ EXIT", showarrow=True, arrowhead=2, arrowcolor="#F85149",
-                font=dict(size=9, color="#F85149", family="JetBrains Mono"), ax=0, ay=-25)
-
-    # Today marker
-    fig.add_trace(go.Scatter(x=[p.index[-1]], y=[p['VXX_Close'].iloc[-1]],
-        mode='markers', name='Hoy',
-        marker=dict(size=12, color='#D29922', line=dict(width=2, color='white')),
-        showlegend=False))
-
-    fig.update_layout(
-        title=dict(text="<b>VXX + Bollinger Bands</b><sup>  BB(20, 2σ) · Verde=LONG SVXY · Rojo=CASH</sup>",
-                   font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
-        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
-        height=420, margin=dict(l=50, r=30, t=55, b=40),
-        xaxis=dict(gridcolor='#21262D',
-                   tickfont=dict(size=10, color='#8B949E', family='JetBrains Mono'),
-                   rangeselector=dict(
-                       buttons=[
-                           dict(count=3,  label="3M",  step="month", stepmode="backward"),
-                           dict(count=6,  label="6M",  step="month", stepmode="backward"),
-                           dict(count=1,  label="1A",  step="year",  stepmode="backward"),
-                           dict(count=3,  label="3A",  step="year",  stepmode="backward"),
-                           dict(step="all", label="Todo"),
-                       ],
-                       bgcolor='#161B22', activecolor='#F7931A',
-                       font=dict(size=9, color='#C9D1D9', family='JetBrains Mono'),
-                   )),
-        yaxis=dict(title=dict(text="VXX", font=dict(size=11, color='#8B949E')),
-                   gridcolor='#21262D',
-                   tickfont=dict(size=10, color='#8B949E', family='JetBrains Mono')),
-        legend=dict(orientation='h', yanchor='bottom', y=1.02,
-                    bgcolor='rgba(0,0,0,0)',
-                    font=dict(size=9, color='#8B949E', family='JetBrains Mono')),
-        hovermode='x unified', dragmode=False)
-    return fig
-
-
-def build_equity_chart(equity: pd.Series) -> go.Figure:
-    """Equity curve con drawdown."""
-    peak = equity.cummax()
-    dd   = (equity - peak) / peak * 100
-
-    fig = go.Figure()
-    # Drawdown fill
-    fig.add_trace(go.Scatter(x=equity.index, y=dd, mode='lines',
-        name='Drawdown %', line=dict(color='#F85149', width=1),
-        fill='tozeroy', fillcolor='rgba(248,81,73,0.12)',
-        yaxis='y2'))
-    # Equity
-    fig.add_trace(go.Scatter(x=equity.index, y=equity, mode='lines',
-        name='Equity ($1)', line=dict(color='#3FB950', width=2.5)))
-
-    fig.update_layout(
-        title=dict(text="<b>Equity Curve — SVXY BB(2σ) + Contango</b><sup>  Base $1 · 2018–hoy</sup>",
-                   font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
-        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
-        height=340, margin=dict(l=50, r=60, t=55, b=40),
-        xaxis=dict(gridcolor='#21262D',
-                   tickfont=dict(size=10, color='#8B949E', family='JetBrains Mono')),
-        yaxis=dict(title='Equity ($)', gridcolor='#21262D',
-                   tickfont=dict(size=10, color='#8B949E', family='JetBrains Mono')),
-        yaxis2=dict(title='Drawdown %', overlaying='y', side='right',
-                    tickfont=dict(size=9, color='#F85149', family='JetBrains Mono'),
-                    showgrid=False),
-        legend=dict(orientation='h', yanchor='bottom', y=1.02,
-                    bgcolor='rgba(0,0,0,0)',
-                    font=dict(size=9, color='#8B949E', family='JetBrains Mono')),
-        hovermode='x unified')
-    return fig
-
-
-def build_yearly_heatmap(yearly: dict) -> go.Figure:
-    """Heatmap simple de retornos anuales."""
-    years = sorted(yearly.keys())
-    vals  = [yearly[y] for y in years]
-    colors = ['#3FB950' if v >= 0 else '#F85149' for v in vals]
-
-    fig = go.Figure(go.Bar(
-        x=[str(y) for y in years], y=vals,
-        marker_color=colors,
-        text=[f"{v:+.1f}%" for v in vals],
-        textposition='outside',
-        textfont=dict(size=10, family='JetBrains Mono', color='#C9D1D9'),
-    ))
-    fig.update_layout(
-        title=dict(text="<b>Retorno Anual</b>",
-                   font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
-        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
-        height=280, margin=dict(l=40, r=20, t=50, b=30),
-        xaxis=dict(tickfont=dict(size=10, color='#8B949E', family='JetBrains Mono')),
-        yaxis=dict(tickfont=dict(size=10, color='#8B949E', family='JetBrains Mono'),
-                   gridcolor='#21262D', zeroline=True, zerolinecolor='#30363D'),
-        showlegend=False)
-    return fig
-
-
-def build_operational_chart(bt: pd.DataFrame, col_price: str,
-                            label: str, color: str,
-                            trades_df: pd.DataFrame,
-                            today_price: float = None,
-                            today_sig: int = 0) -> go.Figure:
+def build_vxx_operational_chart(bt: pd.DataFrame,
+                                 vxx_today: float,
+                                 final_sig_today: int,
+                                 ct_today: float | None) -> go.Figure:
     """
-    Gráfica operativa genérica para VXX, SVXY o SVIX.
-    Muestra precio histórico + zonas LONG/CASH + flechas entrada/salida
-    + punto de hoy si hay precio live.
-    col_price : columna del DataFrame (e.g. 'VXX_Close', 'SVXY_Close')
+    Gráfica operativa VXX con dos subpaneles:
+
+    Panel 1 — VXX + SMA(20) + BB 2σ:
+      · Zona verde      : LONG activo (sig_final==1)
+      · Zona roja tenue : Backwardation (sig_bb==1 pero ct==0)
+      · ▲ verde         : Entrada (sig_final 0→1)
+      · ▼ naranja       : Salida por BB (VXX cruzó BB_Upper)
+      · ▼ rojo          : Salida por Contango Rule (CT se apagó)
+      · 💎 hoy          : precio actual (verde=LONG, rojo=CASH)
+
+    Panel 2 — Contango % histórico (barras verdes/rojas del CSV)
+              + punto de hoy en CBOE live
     """
-    # Usar solo filas donde existe el precio
-    p = bt[bt[col_price].notna()].copy()
-    sig = p['sig_final']
-    price_s = p[col_price]
+    from plotly.subplots import make_subplots
 
-    fig = go.Figure()
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        row_heights=[0.68, 0.32],
+        vertical_spacing=0.03,
+    )
 
-    # ── Zonas LONG / CASH (eficiente, sin vrect loop) ────────
-    p_plot = p.copy()
-    p_plot['long_zone'] = np.where(sig == 1, price_s.max() * 1.15, np.nan)
-    fig.add_trace(go.Scatter(x=p_plot.index, y=p_plot['long_zone'], mode='none',
-        fill='tozeroy', fillcolor='rgba(63,185,80,0.06)', showlegend=False,
-        hoverinfo='skip'))
+    sig    = bt['sig_final']
+    sig_bb = bt['sig_bb']
+    ct     = bt['ct_filter']
+    vxx    = bt['VXX_Close']
+    y_top  = vxx.max() * 1.25
 
-    # ── Precio ─────────────────────────────────────────────────
+    # ── Zona LONG (verde) ─────────────────────────────────────
+    long_y = np.where(sig == 1, y_top, np.nan)
     fig.add_trace(go.Scatter(
-        x=price_s.index, y=price_s.values,
-        mode='lines', name=label,
-        line=dict(color=color, width=2),
-        hovertemplate='%{x|%Y-%m-%d}<br>' + label + ': $%{y:.2f}<extra></extra>',
-    ))
+        x=bt.index, y=long_y, mode='none',
+        fill='tozeroy', fillcolor='rgba(63,185,80,0.09)',
+        showlegend=True, name='LONG activo', hoverinfo='skip',
+    ), row=1, col=1)
 
-    # ── Flechas ENTRY / EXIT desde trades_df ──────────────────
-    closed = trades_df[trades_df['Salida'] != '🔴 ABIERTO']
-    open_t = trades_df[trades_df['Salida'] == '🔴 ABIERTO']
+    # ── Zona Backwardation (rojo tenue) ───────────────────────
+    bkwd_y = np.where((sig_bb == 1) & (ct == 0), y_top, np.nan)
+    fig.add_trace(go.Scatter(
+        x=bt.index, y=bkwd_y, mode='none',
+        fill='tozeroy', fillcolor='rgba(248,81,73,0.07)',
+        showlegend=True, name='Backwardation', hoverinfo='skip',
+    ), row=1, col=1)
 
-    for _, t in closed.iterrows():
-        entry_d = pd.Timestamp(t['Entrada'])
-        exit_d  = pd.Timestamp(t['Salida'])
-        # Buscar precio más cercano a esa fecha
-        if entry_d in price_s.index:
-            ep = price_s.loc[entry_d]
-        elif len(price_s.loc[price_s.index >= entry_d]) > 0:
-            ep = price_s.loc[price_s.index >= entry_d].iloc[0]
-        else:
-            continue
-        if exit_d in price_s.index:
-            xp = price_s.loc[exit_d]
-        elif len(price_s.loc[price_s.index >= exit_d]) > 0:
-            xp = price_s.loc[price_s.index >= exit_d].iloc[0]
-        else:
-            continue
+    # ── BB + SMA + VXX ────────────────────────────────────────
+    fig.add_trace(go.Scatter(x=bt.index, y=bt['BB_Upper'],
+        mode='lines', name='BB 2σ',
+        line=dict(color='#F85149', width=1, dash='dot')), row=1, col=1)
+    fig.add_trace(go.Scatter(x=bt.index, y=bt['BB_Lower'],
+        mode='lines', showlegend=False,
+        line=dict(color='#F85149', width=0.5, dash='dot'),
+        fill='tonexty', fillcolor='rgba(248,81,73,0.03)'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=bt.index, y=bt['BB_SMA20'],
+        mode='lines', name='SMA(20)',
+        line=dict(color='#58A6FF', width=1.5, dash='dash')), row=1, col=1)
+    fig.add_trace(go.Scatter(x=bt.index, y=vxx,
+        mode='lines', name='VXX',
+        line=dict(color='#F0F6FC', width=2),
+        hovertemplate='%{x|%Y-%m-%d}  VXX: $%{y:.2f}<extra></extra>'), row=1, col=1)
 
-        fig.add_annotation(x=entry_d, y=ep,
-            text="▲", showarrow=False,
-            font=dict(size=13, color="#3FB950", family="JetBrains Mono"),
-            yshift=-16)
-        fig.add_annotation(x=exit_d, y=xp,
-            text="▼", showarrow=False,
-            font=dict(size=13, color="#F85149", family="JetBrains Mono"),
-            yshift=16)
+    # ── Flechas ───────────────────────────────────────────────
+    for i in range(1, len(sig)):
+        date     = sig.index[i]
+        y_val    = vxx.iloc[i]
+        prev_sig = sig.iloc[i-1];   cur_sig  = sig.iloc[i]
+        prev_bb  = sig_bb.iloc[i-1]; cur_bb  = sig_bb.iloc[i]
+        prev_ct  = ct.iloc[i-1];    cur_ct   = ct.iloc[i]
 
-    # Trade abierto actualmente
-    for _, t in open_t.iterrows():
-        entry_d = pd.Timestamp(t['Entrada'])
-        if entry_d in price_s.index:
-            ep = price_s.loc[entry_d]
-        elif len(price_s.loc[price_s.index >= entry_d]) > 0:
-            ep = price_s.loc[price_s.index >= entry_d].iloc[0]
-        else:
-            continue
-        fig.add_annotation(x=entry_d, y=ep,
-            text="▲ OPEN", showarrow=True,
-            arrowhead=2, arrowcolor="#3FB950",
-            font=dict(size=9, color="#3FB950", family="JetBrains Mono"),
-            ax=0, ay=30)
+        if cur_sig == 1 and prev_sig == 0:
+            # Entrada
+            fig.add_annotation(x=date, y=y_val, yshift=-22,
+                text="▲", showarrow=False,
+                font=dict(size=16, color='#3FB950', family='JetBrains Mono'),
+                row=1, col=1)
+        elif cur_sig == 0 and prev_sig == 1:
+            if cur_bb == 0 and prev_bb == 1:
+                # Salida por BB (naranja)
+                fig.add_annotation(x=date, y=y_val, yshift=22,
+                    text="▼", showarrow=False,
+                    font=dict(size=16, color='#D29922', family='JetBrains Mono'),
+                    row=1, col=1)
+            elif cur_ct == 0 and prev_ct == 1:
+                # Salida por Contango Rule (rojo)
+                fig.add_annotation(x=date, y=y_val, yshift=22,
+                    text="▼", showarrow=False,
+                    font=dict(size=16, color='#F85149', family='JetBrains Mono'),
+                    row=1, col=1)
+            else:
+                # Ambas (naranja — BB dominó)
+                fig.add_annotation(x=date, y=y_val, yshift=22,
+                    text="▼", showarrow=False,
+                    font=dict(size=16, color='#D29922', family='JetBrains Mono'),
+                    row=1, col=1)
 
-    # ── Punto de hoy ───────────────────────────────────────────
-    if today_price and today_price > 0:
-        today_clr = '#3FB950' if today_sig == 1 else '#F85149'
-        today_lbl = '🟢 HOY — LONG' if today_sig == 1 else '🔴 HOY — CASH'
-        fig.add_trace(go.Scatter(
-            x=[pd.Timestamp.now().normalize()],
-            y=[today_price],
-            mode='markers+text',
-            name=today_lbl,
-            text=[f"${today_price:.2f}"],
-            textposition='top center',
-            textfont=dict(size=10, color=today_clr, family='JetBrains Mono'),
-            marker=dict(size=14, color=today_clr,
-                        line=dict(width=2, color='white'), symbol='diamond'),
-        ))
+    # Punto de hoy
+    today_clr = '#3FB950' if final_sig_today else '#F85149'
+    fig.add_trace(go.Scatter(
+        x=[bt.index[-1]], y=[vxx_today],
+        mode='markers', name='HOY — LONG' if final_sig_today else 'HOY — CASH',
+        marker=dict(size=14, color=today_clr,
+                    line=dict(width=2, color='white'), symbol='diamond'),
+        hovertemplate=f'HOY: ${vxx_today:.2f}<extra></extra>',
+    ), row=1, col=1)
 
+    # ── Panel 2: Contango histórico ───────────────────────────
+    if 'Contango_pct' in bt.columns:
+        ct_hist  = bt['Contango_pct'].fillna(0)
+        bar_clrs = ['#3FB950' if v > 0 else '#F85149' for v in ct_hist]
+        fig.add_trace(go.Bar(
+            x=bt.index, y=ct_hist,
+            name='Contango %', marker_color=bar_clrs, opacity=0.7,
+            hovertemplate='%{x|%Y-%m-%d}  CT: %{y:+.2f}%<extra></extra>',
+        ), row=2, col=1)
+        if ct_today is not None:
+            ct_clr = '#3FB950' if ct_today > 0 else '#F85149'
+            fig.add_trace(go.Scatter(
+                x=[bt.index[-1]], y=[ct_today],
+                mode='markers', name=f'CT hoy: {ct_today:+.2f}%',
+                marker=dict(size=10, color=ct_clr, symbol='diamond',
+                            line=dict(width=2, color='white')),
+            ), row=2, col=1)
+        fig.add_hline(y=0, line_color='#484F58', line_width=1, row=2, col=1)
+
+    # ── Layout ────────────────────────────────────────────────
     fig.update_layout(
         title=dict(
-            text=f"<b>{label} — Operativa</b>"
-                 f"<sup>  Verde=LONG SVXY · Rojo=CASH · ▲Entrada · ▼Salida</sup>",
-            font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
+            text="<b>VXX — Monitor Operativo BB(20, 2σ) + Contango Rule</b>"
+                 "<sup>  ▲=Entrada  ▼🟡=Salida BB  ▼🔴=Salida CT  💎=Hoy</sup>",
+            font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5,
+        ),
         template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
-        height=400, margin=dict(l=55, r=30, t=55, b=40),
+        height=560, margin=dict(l=55, r=30, t=65, b=40),
         xaxis=dict(
-            gridcolor='#21262D', rangeslider=dict(visible=False),
+            gridcolor='#21262D',
             tickfont=dict(size=10, color='#8B949E', family='JetBrains Mono'),
             rangeselector=dict(
                 buttons=[
+                    dict(count=1,  label="1M",  step="month", stepmode="backward"),
                     dict(count=3,  label="3M",  step="month", stepmode="backward"),
                     dict(count=6,  label="6M",  step="month", stepmode="backward"),
                     dict(count=1,  label="1A",  step="year",  stepmode="backward"),
@@ -704,26 +515,21 @@ def build_operational_chart(bt: pd.DataFrame, col_price: str,
                 font=dict(size=9, color='#C9D1D9', family='JetBrains Mono'),
             ),
         ),
-        yaxis=dict(
-            title=dict(text=f"{label} ($)", font=dict(size=11, color='#8B949E')),
-            gridcolor='#21262D',
-            tickfont=dict(size=10, color='#8B949E', family='JetBrains Mono'),
-        ),
-        legend=dict(orientation='h', yanchor='bottom', y=1.02,
+        xaxis2=dict(gridcolor='#21262D',
+                    tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
+        yaxis=dict(title=dict(text="VXX ($)", font=dict(size=11, color='#8B949E')),
+                   gridcolor='#21262D',
+                   tickfont=dict(size=10, color='#8B949E', family='JetBrains Mono')),
+        yaxis2=dict(title=dict(text="Contango %", font=dict(size=10, color='#8B949E')),
+                    gridcolor='#21262D',
+                    tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono'),
+                    zeroline=True, zerolinecolor='#30363D'),
+        legend=dict(orientation='h', yanchor='bottom', y=1.05,
                     bgcolor='rgba(0,0,0,0)',
                     font=dict(size=9, color='#8B949E', family='JetBrains Mono')),
-        hovermode='x unified',
+        hovermode='x unified', dragmode=False, bargap=0,
     )
     return fig
-
-
-@st.cache_data(ttl=300)
-def get_strategy_data(df: pd.DataFrame):
-    """Cacheado con mismo TTL que el CSV. Solo recalcula si el CSV cambia."""
-    bt        = build_strategy(df)
-    trades_df = extract_trades(bt)
-    metrics   = calc_metrics(bt)
-    return bt, trades_df, metrics
 
 
 def cpct(p1, p2):
@@ -874,8 +680,9 @@ with st.sidebar:
         fetch_etps.clear()
         fetch_today_prices.clear()
         st.rerun()
-    if st.button("🗄️ Recargar CSV Drive", use_container_width=True):
-        load_master_csv.clear()
+    if st.button("🗄️ Recargar Parquet (repo)", use_container_width=True):
+        load_master_parquet.clear()
+        build_strategy_cached.clear()
         st.rerun()
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1063,73 +870,66 @@ with tab1:
 # ━━━━━━━━━━━━━━━━━ TAB 2: MONITOR OPERATIVO ━━━━━━━━━━━━━━━
 with tab2:
 
-    # ── Cargar datos ──────────────────────────────────────────
-    with st.spinner("📂 Cargando histórico desde Google Drive…"):
-        df_master = load_master_csv()
-
-    today_px = fetch_today_prices()
+    # ── Cargar parquet (del repo, instantáneo) ────────────────
+    df_master = load_master_parquet()
 
     if df_master.empty:
-        st.error("❌ No se pudo cargar el CSV desde Google Drive. Verifica que el archivo sea público.")
+        st.error("❌ No se encontró data/master.parquet en el repositorio.")
+        st.info("Ejecuta el notebook de actualización y haz push: df.to_parquet('data/master.parquet')")
         st.stop()
 
-    # ── Aplicar estrategia (cacheado — no recalcula en cada rerun) ──
-    bt, trades_df, metrics = get_strategy_data(df_master)
+    # ── Aplicar estrategia (cacheado 1h) ──────────────────────
+    bt = build_strategy_cached(df_master)
 
-    # ── Señal de HOY ─────────────────────────────────────────
-    # BB: basado en histórico CSV + precio VXX de hoy (yfinance)
-    last_hist = bt.iloc[-1]
-    last_date = bt.index[-1]
+    # ── Precios de hoy (yfinance) ─────────────────────────────
+    today_px   = fetch_today_prices()
+    last_hist  = bt.iloc[-1]
+    last_date  = bt.index[-1]
 
-    # VXX de hoy desde yfinance
-    vxx_today   = today_px.get('VXX', {}).get('close', last_hist['VXX_Close'])
-    vxx_date    = today_px.get('VXX', {}).get('date', last_date.date())
-    sma20_today = last_hist['BB_SMA20']
-    bb_up_today = last_hist['BB_Upper']
+    vxx_today  = float(today_px.get('VXX',  {}).get('close', last_hist['VXX_Close']))
+    svxy_today = float(today_px.get('SVXY', {}).get('close', 0))
+    svix_today = float(today_px.get('SVIX', {}).get('close', 0))
+    vix_val    = float(today_px.get('VIX',  {}).get('close', last_hist.get('VIX_Close', 0)))
 
-    # BB signal de hoy (sin shift — es la señal que se ejecuta mañana)
-    bb_pos_hist = int(last_hist['sig_bb'])  # posición BB al cierre de ayer
-    if bb_pos_hist == 0 and vxx_today < sma20_today:
-        bb_sig_today = 1
-    elif bb_pos_hist == 1 and vxx_today > bb_up_today:
-        bb_sig_today = 0
-    else:
-        bb_sig_today = bb_pos_hist
+    sma20  = float(last_hist['BB_SMA20'])
+    bb_up  = float(last_hist['BB_Upper'])
 
-    # Contango de hoy: CBOE live (Tab 1) tiene prioridad
-    # m1p y m2p vienen del scope global (scrapeado del CBOE)
+    # BB signal de hoy (posición actual, sin shift)
+    bb_pos = int(last_hist['sig_bb'])
+    if bb_pos == 0 and vxx_today < sma20:   bb_sig_today = 1
+    elif bb_pos == 1 and vxx_today > bb_up: bb_sig_today = 0
+    else:                                    bb_sig_today = bb_pos
+
+    # Contango live del CBOE (del Tab 1 — m1p, m2p en scope global)
     if m1p and m2p and m1p > 0:
-        ct_today     = cpct(m1p, m2p)
-        ct_source    = "CBOE live"
-        m1_sym_today = df_vx['Symbol'].iloc[0] if not df_vx.empty else "M1"
-        m2_sym_today = df_vx['Symbol'].iloc[1] if len(df_vx) > 1 else "M2"
+        ct_today  = cpct(m1p, m2p)
+        ct_source = "CBOE live"
+        m1_sym    = df_vx['Symbol'].iloc[0] if not df_vx.empty else "M1"
+        m2_sym    = df_vx['Symbol'].iloc[1] if len(df_vx) > 1 else "M2"
     else:
-        ct_today     = float(last_hist.get('Contango_pct', 0))
-        ct_source    = "CSV histórico"
-        m1_sym_today = str(last_hist.get('M1_Symbol', 'M1'))
-        m2_sym_today = str(last_hist.get('M2_Symbol', 'M2'))
+        ct_today  = float(last_hist.get('Contango_pct', 0)) if 'Contango_pct' in last_hist else None
+        ct_source = "CSV histórico"
+        m1_sym    = str(last_hist.get('M1_Symbol', 'M1'))
+        m2_sym    = str(last_hist.get('M2_Symbol', 'M2'))
 
-    in_ct_today   = ct_today is not None and ct_today > 0
+    in_ct_today     = ct_today is not None and ct_today > 0
     final_sig_today = int(bb_sig_today == 1 and in_ct_today)
 
-    # Día de ejecución = mañana (siguiente día hábil)
     exec_date = datetime.now().date() + timedelta(days=1)
     while exec_date.weekday() >= 5:
         exec_date += timedelta(days=1)
 
-    pct_to_sma = (vxx_today / sma20_today - 1) * 100 if sma20_today else 0
-    pct_to_bb  = (vxx_today / bb_up_today  - 1) * 100 if bb_up_today else 0
+    pct_to_sma = (vxx_today / sma20 - 1) * 100 if sma20 else 0
+    pct_to_bb  = (vxx_today / bb_up  - 1) * 100 if bb_up  else 0
     ct_str     = f"{ct_today:+.2f}%" if ct_today is not None else "N/A"
-    vix_today  = today_px.get('VIX', {}).get('close', float(last_hist.get('VIX_Close', 0)))
-    svxy_today = today_px.get('SVXY', {}).get('close', 0)
-    svix_today = today_px.get('SVIX', {}).get('close', 0)
-    spy_today  = today_px.get('SPY',  {}).get('close', 0)
 
-    # Régimen VIX
-    if vix_today < 15:   regime, r_clr = "BAJO — óptimo",      "var(--g)"
-    elif vix_today < 20: regime, r_clr = "NORMAL — bueno",     "var(--g)"
-    elif vix_today < 28: regime, r_clr = "ELEVADO — precaución","var(--y)"
-    else:                regime, r_clr = "CRISIS — peligro",   "var(--r)"
+    if vix_val < 15:   regime, r_clr = "BAJO — óptimo",       "var(--g)"
+    elif vix_val < 20: regime, r_clr = "NORMAL — bueno",      "var(--g)"
+    elif vix_val < 28: regime, r_clr = "ELEVADO — precaución","var(--y)"
+    else:              regime, r_clr = "CRISIS — peligro",    "var(--r)"
+
+    def mcard(label, val, clr="nt"):
+        return f'<div class="mpill"><div class="ml">{label}</div><div class="mv {clr}">{val}</div></div>'
 
     # ═══════════════════════════════════════════
     # SECCIÓN 1 — SEÑAL DE HOY
@@ -1137,243 +937,104 @@ with tab2:
     sig_cls = "sig-long" if final_sig_today else "sig-cash"
     sig_txt = "LONG SVXY" if final_sig_today else "CASH"
     sig_clr = "var(--g)" if final_sig_today else "var(--r)"
-    bb_ok   = "ok" if bb_sig_today == 1 else "no"
-    bb_mark = "✓" if bb_sig_today == 1 else "✗"
-    ct_ok   = "ok" if in_ct_today else "no"
-    ct_mark = "✓" if in_ct_today else "✗"
+    bb_ok   = "ok" if bb_sig_today else "no"
+    ct_ok   = "ok" if in_ct_today  else "no"
 
-    col_sig, col_bb, col_ct, col_veh = st.columns([1.3, 1.5, 1.5, 1.3])
+    c1, c2, c3, c4 = st.columns([1.3, 1.5, 1.5, 1.3])
 
-    with col_sig:
-        st.markdown(f"""
-        <div class="sig-box {sig_cls}" style="height:100%">
-            <div class="sl" style="color:{sig_clr};font-size:2.2rem">{sig_txt}</div>
-            <div class="sd" style="margin-top:0.4rem">Ejecución mañana al OPEN</div>
-            <div class="sd">{exec_date.strftime('%Y-%m-%d')} · {vxx_date}</div>
+    with c1:
+        st.markdown(f"""<div class="sig-box {sig_cls}">
+            <div class="sl" style="color:{sig_clr}">{sig_txt}</div>
+            <div class="sd">Ejecutar {exec_date.strftime('%Y-%m-%d')} al OPEN</div>
+            <div class="sd">Señal cierre {last_date.strftime('%Y-%m-%d')}</div>
         </div>""", unsafe_allow_html=True)
 
-    with col_bb:
-        sma_clr = "var(--g)" if vxx_today < sma20_today else "var(--r)"
-        bb_clr2 = "var(--g)" if vxx_today <= bb_up_today else "var(--r)"
-        st.markdown(f"""
-        <div class="icard">
+    with c2:
+        sma_clr = "var(--g)" if vxx_today < sma20 else "var(--r)"
+        bb_clr  = "var(--g)" if vxx_today <= bb_up else "var(--r)"
+        st.markdown(f"""<div class="icard">
             <div class="ic-title">📊 BB Timing — VXX</div>
             <div class="ic-row"><span class="ic-label">Señal BB</span>
-                <span class="ic-val"><span class="{bb_ok}" style="font-size:1rem">{bb_mark}</span>
-                {'LONG' if bb_sig_today else 'CASH'}</span></div>
-            <div class="ic-row"><span class="ic-label">VXX</span>
+                <span class="ic-val"><span class="{bb_ok}">{"✓" if bb_sig_today else "✗"}</span>
+                {"&nbsp;LONG" if bb_sig_today else "&nbsp;CASH"}</span></div>
+            <div class="ic-row"><span class="ic-label">VXX hoy</span>
                 <span class="ic-val" style="font-weight:700">${vxx_today:.2f}</span></div>
             <div class="ic-row"><span class="ic-label">SMA(20)</span>
-                <span class="ic-val" style="color:{sma_clr}">${sma20_today:.2f}
-                ({pct_to_sma:+.1f}%)</span></div>
+                <span class="ic-val" style="color:{sma_clr}">${sma20:.2f} ({pct_to_sma:+.1f}%)</span></div>
             <div class="ic-row"><span class="ic-label">BB 2σ</span>
-                <span class="ic-val" style="color:{bb_clr2}">${bb_up_today:.2f}
-                ({pct_to_bb:+.1f}%)</span></div>
+                <span class="ic-val" style="color:{bb_clr}">${bb_up:.2f} ({pct_to_bb:+.1f}%)</span></div>
         </div>""", unsafe_allow_html=True)
 
-    with col_ct:
-        ct_clr   = "var(--g)" if in_ct_today else "var(--r)"
+    with c3:
+        ct_clr    = "var(--g)" if in_ct_today else "var(--r)"
         ct_estado = "CONTANGO" if in_ct_today else "BACKWARDATION"
-        m1_disp  = f"${m1p:.2f}" if m1p else "—"
-        m2_disp  = f"${m2p:.2f}" if m2p else "—"
-        st.markdown(f"""
-        <div class="icard">
+        m1_disp   = f"${m1p:.2f}" if m1p else "—"
+        m2_disp   = f"${m2p:.2f}" if m2p else "—"
+        st.markdown(f"""<div class="icard">
             <div class="ic-title">📈 Contango ({ct_source})</div>
             <div class="ic-row"><span class="ic-label">Señal CT</span>
-                <span class="ic-val"><span class="{ct_ok}" style="font-size:1rem">{ct_mark}</span>
-                <span style="color:{ct_clr};font-weight:700"> {ct_estado}</span></span></div>
-            <div class="ic-row"><span class="ic-label">{m1_sym_today} (M1)</span>
+                <span class="ic-val"><span class="{ct_ok}">{"✓" if in_ct_today else "✗"}</span>
+                <span style="color:{ct_clr};font-weight:700">&nbsp;{ct_estado}</span></span></div>
+            <div class="ic-row"><span class="ic-label">{m1_sym} (M1)</span>
                 <span class="ic-val">{m1_disp}</span></div>
-            <div class="ic-row"><span class="ic-label">{m2_sym_today} (M2)</span>
+            <div class="ic-row"><span class="ic-label">{m2_sym} (M2)</span>
                 <span class="ic-val">{m2_disp}</span></div>
             <div class="ic-row"><span class="ic-label">Contango %</span>
                 <span class="ic-val" style="color:{ct_clr};font-weight:700">{ct_str}</span></div>
             <div class="ic-row"><span class="ic-label">VIX</span>
-                <span class="ic-val" style="color:{r_clr}">{vix_today:.1f} · {regime}</span></div>
+                <span class="ic-val" style="color:{r_clr}">{vix_val:.1f} · {regime}</span></div>
         </div>""", unsafe_allow_html=True)
 
-    with col_veh:
+    with c4:
         svxy_chg = ""
         if today_px.get('SVXY', {}).get('prev'):
             d = svxy_today - today_px['SVXY']['prev']
             svxy_chg = f" ({d:+.2f})"
-        st.markdown(f"""
-        <div class="icard">
+        st.markdown(f"""<div class="icard">
             <div class="ic-title">💼 Vehículos</div>
             <div class="ic-row"><span class="ic-label">SVXY (-0.5x)</span>
                 <span class="ic-val" style="color:var(--c);font-weight:700">${svxy_today:.2f}{svxy_chg}</span></div>
             <div class="ic-row"><span class="ic-label">SVIX (-1x)</span>
                 <span class="ic-val" style="color:var(--c)">${svix_today:.2f}</span></div>
-            <div class="ic-row"><span class="ic-label">SPY</span>
-                <span class="ic-val">${spy_today:.2f}</span></div>
             <div class="ic-row"><span class="ic-label">VIX Spot</span>
-                <span class="ic-val">{vix_today:.2f}</span></div>
+                <span class="ic-val">{vix_val:.2f}</span></div>
+            <div class="ic-row"><span class="ic-label">CSV al</span>
+                <span class="ic-val" style="color:var(--dim)">{last_date.strftime('%Y-%m-%d')}</span></div>
         </div>""", unsafe_allow_html=True)
 
     # Alertas
-    alerts = []
     if final_sig_today and pct_to_bb > -3:
-        alerts.append(f"⚠️ VXX a {abs(pct_to_bb):.1f}% de la BB Superior — posible salida pronto")
+        st.warning(f"⚠️ VXX a {abs(pct_to_bb):.1f}% de la BB Superior — posible salida pronto")
     if ct_today is not None and 0 < ct_today < 1:
-        alerts.append(f"⚠️ Contango muy bajo ({ct_today:.2f}%) — monitorear de cerca")
+        st.warning(f"⚠️ Contango muy bajo ({ct_today:.2f}%) — monitorear")
     if not final_sig_today and abs(pct_to_sma) < 2 and in_ct_today:
-        alerts.append(f"🔔 Posible entrada pronto — VXX a {abs(pct_to_sma):.1f}% de SMA(20)")
+        st.info(f"🔔 Posible entrada pronto — VXX a {abs(pct_to_sma):.1f}% de SMA(20)")
     if not in_ct_today and bb_sig_today == 1:
-        alerts.append("⚠️ BB dice LONG pero hay backwardation — CASH por Contango Rule")
-    for a in alerts:
-        st.warning(a)
+        st.warning("⚠️ BB dice LONG pero hay backwardation — CASH por Contango Rule")
 
-    st.markdown("<div style='height:0.3rem'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='border-top:1px solid #30363D;margin:0.8rem 0'></div>",
+                unsafe_allow_html=True)
 
     # ═══════════════════════════════════════════
-    # SECCIÓN 2 — MÉTRICAS RESUMEN + EQUITY CURVE
+    # SECCIÓN 2 — GRÁFICA VXX OPERATIVA
     # ═══════════════════════════════════════════
-    st.markdown("<div style='border-top:1px solid #30363D;margin:0.8rem 0 0.6rem'></div>",
-                unsafe_allow_html=True)
+    fig_mon = build_vxx_operational_chart(
+        bt=bt,
+        vxx_today=vxx_today,
+        final_sig_today=final_sig_today,
+        ct_today=ct_today,
+    )
+    st.plotly_chart(fig_mon, use_container_width=True,
+                    config=dict(displayModeBar=True, displaylogo=False,
+                                scrollZoom=False,
+                                modeBarButtonsToRemove=['select2d','lasso2d']))
 
-    # ── helper for metric cards ──
-    def mcard(label, val, clr="nt"):
-        return f'<div class="mpill"><div class="ml">{label}</div><div class="mv {clr}">{val}</div></div>'
-
-    if metrics:
-        m = metrics
-
-        st.markdown(f"""<div class="mrow">
-            {mcard("CAGR", f"{m['cagr']:+.1f}%", "up" if m['cagr']>0 else "dn")}
-            {mcard("Max DD", f"{m['mdd']:.1f}%", "dn")}
-            {mcard("Sharpe", f"{m['sharpe']:.2f}", "up" if m['sharpe']>1 else "nt")}
-            {mcard("Calmar", f"{m['calmar']:.2f}", "up" if m['calmar']>1 else "nt")}
-            {mcard("Win Rate", f"{m['wr']:.1f}%", "nt")}
-            {mcard("Exposición", f"{m['exp']:.1f}%", "nt")}
-        </div>""", unsafe_allow_html=True)
-
-        col_eq, col_yr = st.columns([2, 1])
-        with col_eq:
-            fig_eq = build_equity_chart(m['equity'])
-            st.plotly_chart(fig_eq, width="stretch",
-                            config=dict(displayModeBar=False, displaylogo=False))
-        with col_yr:
-            fig_yr = build_yearly_heatmap(m['yearly'])
-            st.plotly_chart(fig_yr, width="stretch",
-                            config=dict(displayModeBar=False, displaylogo=False))
-
-    # ═══════════════════════════════════════════
-    # SECCIÓN 3 — GRÁFICAS OPERATIVAS
-    # ═══════════════════════════════════════════
-    st.markdown("<div style='border-top:1px solid #30363D;margin:0.8rem 0 0.5rem'></div>",
-                unsafe_allow_html=True)
-    st.markdown("<div style='font-family:Inter;font-weight:700;font-size:0.9rem;"
-                "color:#F0F6FC;margin-bottom:0.6rem'>📊 Gráficas Operativas</div>",
-                unsafe_allow_html=True)
-
-    # ── Gráfica 1: VXX + BB ────────────────────────────────────
-    st.markdown("<div style='font-family:JetBrains Mono;font-size:0.72rem;"
-                "color:#8B949E;margin-bottom:0.2rem'>SEÑAL DE TIMING · VXX vs BB(20, 2σ)</div>",
-                unsafe_allow_html=True)
-    try:
-        fig_vxx = build_bb_chart(bt, window=len(bt))  # todo el histórico
-        st.plotly_chart(fig_vxx, width="stretch",
-                        config=dict(displayModeBar=True, displaylogo=False, scrollZoom=False,
-                                    modeBarButtonsToRemove=['select2d','lasso2d']))
-    except Exception as e:
-        st.error(f"Error en gráfica VXX: {e}")
-
-    # ── Gráfica 2: SVIX operativa ──────────────────────────────
-    if 'SVIX_Close' in bt.columns and bt['SVIX_Close'].notna().sum() > 10:
-        st.markdown("<div style='font-family:JetBrains Mono;font-size:0.72rem;"
-                    "color:#8B949E;margin:0.6rem 0 0.2rem'>VEHÍCULO AGRESIVO · SVIX (-1x)</div>",
-                    unsafe_allow_html=True)
-        try:
-            fig_svix = build_operational_chart(
-                bt, col_price='SVIX_Close', label='SVIX', color='#E91E63',
-                trades_df=trades_df,
-                today_price=None, today_sig=0,  # solo histórico CSV
-            )
-            st.plotly_chart(fig_svix, width="stretch",
-                            config=dict(displayModeBar=True, displaylogo=False, scrollZoom=False,
-                                        modeBarButtonsToRemove=['select2d','lasso2d']))
-        except Exception as e:
-            st.error(f"Error en gráfica SVIX: {e}")
-
-    # ── Gráfica 3: SVXY operativa ──────────────────────────────
-    st.markdown("<div style='font-family:JetBrains Mono;font-size:0.72rem;"
-                "color:#8B949E;margin:0.6rem 0 0.2rem'>VEHÍCULO PRINCIPAL · SVXY (-0.5x)</div>",
-                unsafe_allow_html=True)
-    try:
-        fig_svxy = build_operational_chart(
-            bt, col_price='SVXY_Close', label='SVXY', color='#39D2C0',
-            trades_df=trades_df,
-            today_price=None, today_sig=0,  # solo histórico CSV
-        )
-        st.plotly_chart(fig_svxy, width="stretch",
-                        config=dict(displayModeBar=True, displaylogo=False, scrollZoom=False,
-                                    modeBarButtonsToRemove=['select2d','lasso2d']))
-    except Exception as e:
-        st.error(f"Error en gráfica SVXY: {e}")
-
-    # ═══════════════════════════════════════════
-    # SECCIÓN 4 — HISTORIAL DE OPERACIONES
-    # ═══════════════════════════════════════════
-    st.markdown("<div style='border-top:1px solid #30363D;margin:0.8rem 0 0.5rem'></div>",
-                unsafe_allow_html=True)
-    st.markdown("<div style='font-family:Inter;font-weight:700;font-size:0.9rem;"
-                "color:#F0F6FC;margin-bottom:0.4rem'>📋 Historial de Operaciones</div>",
-                unsafe_allow_html=True)
-
-    if not trades_df.empty:
-        n_total  = len(trades_df)
-        n_closed = len(trades_df[trades_df['Salida'] != '🔴 ABIERTO'])
-        n_win    = (trades_df[trades_df['Salida'] != '🔴 ABIERTO']['Retorno'] > 0).sum()
-        avg_ret  = trades_df[trades_df['Salida'] != '🔴 ABIERTO']['Retorno'].mean()
-        avg_dur  = trades_df[trades_df['Salida'] != '🔴 ABIERTO']['Días'].mean()
-
-        st.markdown(f"""<div class="mrow">
-            {mcard("Trades totales", str(n_total), "nt")}
-            {mcard("Ganadores", f"{n_win}/{n_closed}", "up")}
-            {mcard("Win Rate", f"{n_win/n_closed*100:.1f}%" if n_closed>0 else "—", "nt")}
-            {mcard("Ret. promedio", f"{avg_ret:+.1f}%" if not pd.isna(avg_ret) else "—",
-                   "up" if not pd.isna(avg_ret) and avg_ret>0 else "dn")}
-            {mcard("Duración media", f"{avg_dur:.0f}d" if not pd.isna(avg_dur) else "—", "nt")}
-        </div>""", unsafe_allow_html=True)
-
-        # Tabla HTML scrolleable
-        rows_html = ""
-        for _, t in trades_df.iloc[::-1].iterrows():
-            ret     = t['Retorno']
-            is_open = t['Salida'] == '🔴 ABIERTO'
-            ret_clr = "color:var(--g)" if ret > 0 else "color:var(--r)"
-            sal_clr = "color:var(--y);font-weight:700" if is_open else ""
-            vix_e   = f"{t['VIX entrada']:.1f}" if pd.notna(t.get('VIX entrada')) else "—"
-            ct_e    = f"{t['Contango entr.']:+.2f}%" if pd.notna(t.get('Contango entr.')) else "—"
-            rows_html += f"""<tr>
-                <td style="color:var(--b);font-weight:600">{t['Entrada']}</td>
-                <td style="{sal_clr}">{t['Salida']}</td>
-                <td>{t['Días']}</td>
-                <td style="{ret_clr};font-weight:700">{ret:+.2f}%</td>
-                <td>{t['Razón salida']}</td>
-                <td>{vix_e}</td>
-                <td>{ct_e}</td>
-            </tr>"""
-
-        st.markdown(f"""
-        <div style="max-height:400px;overflow-y:auto;margin-top:0.4rem;
-                    border:1px solid #30363D;border-radius:4px">
-        <table class="dtbl">
-            <thead style="position:sticky;top:0;background:#1C2128;z-index:1"><tr>
-                <th>Entrada</th><th>Salida</th><th>Días</th>
-                <th>Retorno</th><th>Razón salida</th>
-                <th>VIX entrada</th><th>Contango entr.</th>
-            </tr></thead>
-            <tbody>{rows_html}</tbody>
-        </table></div>""", unsafe_allow_html=True)
-
-        st.caption(
-            f"Histórico desde {bt.index[0].strftime('%Y-%m-%d')} · "
-            f"CSV actualizado: {last_date.strftime('%Y-%m-%d')} · "
-            f"Contango live: {ct_source}"
-        )
-    else:
-        st.info("No se encontraron trades en el histórico.")
+    st.caption(
+        f"Histórico: {bt.index[0].strftime('%Y-%m-%d')} → {last_date.strftime('%Y-%m-%d')} "
+        f"({len(bt):,} días) · Parquet del repo · "
+        f"Contango hoy: {ct_source} · "
+        f"▲=Entrada  ▼🟡=Salida BB  ▼🔴=Salida CT"
+    )
 
 
 # ━━━━━━━━━━━━━━━━━ TAB 3: RECOMENDACIONES ━━━━━━━━━━━━━━━━━
