@@ -305,166 +305,170 @@ def fetch_edge_extra():
 # VOL SKEW & IV SURFACE — DATA LAYER
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# _make_yf_session removed: yfinance >=0.2.x requires curl_cffi — do NOT pass requests.Session
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# OPTIONS DATA — curl_cffi directo a Yahoo Finance v8 API
+# Evita el wrapper de yfinance que genera 429 por exceso de
+# requests internos. curl_cffi impersona Chrome a nivel TLS.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _yahoo_options_session():
+    """Sesión curl_cffi con impersonación Chrome (TLS fingerprint real)."""
+    try:
+        from curl_cffi import requests as cffi_req
+        return cffi_req.Session(impersonate="chrome120")
+    except ImportError:
+        return None
 
 
 @st.cache_data(ttl=900)
-def fetch_options_chains(ticker: str = "SPY", n_exp: int = 5) -> tuple:
+def fetch_options_chains(ticker: str = "SPY", n_exp: int = 4) -> tuple:
     """
-    Descarga cadenas de opciones via yfinance con manejo robusto de rate-limiting.
-    - Sesión con headers de browser para reducir bloqueos
-    - Reintentos con backoff exponencial por expiración
-    - TTL 15min para no martillar la API
-    - Prioriza vencimientos mensuales (DTE ≥ 14) para mayor liquidez
-    Retorna (chains_dict, spot_price).
-    chains_dict: {exp_str: {"calls": df, "puts": df, "dte": int}}
+    Descarga cadenas de opciones vía curl_cffi directo a la API v8 de Yahoo Finance.
+    Estrategia: una sola sesión con TLS fingerprint de Chrome real → mucho menos 429.
+    Si curl_cffi no está disponible, hace fallback a yfinance con backoff.
+    TTL 15 min.
     """
     log = logging.getLogger("vix_controller")
 
-    def _fetch_with_retry(ticker_obj, exp_str, max_retries=3):
-        """Reintenta la descarga de una expiración con backoff."""
-        for attempt in range(max_retries):
-            try:
-                chain = ticker_obj.option_chain(exp_str)
-                return chain
-            except Exception as e:
-                err_str = str(e).lower()
-                is_rate_limit = any(
-                    k in err_str
-                    for k in ["rate limit", "too many requests", "429", "throttle"]
-                )
-                if is_rate_limit and attempt < max_retries - 1:
-                    wait = 2 ** (attempt + 1)   # 2s → 4s → 8s
-                    log.warning(f"Rate limit en {ticker} {exp_str} — esperando {wait}s (intento {attempt+1}/{max_retries})")
-                    time.sleep(wait)
-                    continue
-                raise  # re-raise si no es rate-limit o se agotaron intentos
-        return None
+    # ── Helpers ────────────────────────────────────────────────────────────
+    def _clean_chain(df_raw, spot_px):
+        df_c = df_raw.copy()
+        for col in ["impliedVolatility", "openInterest", "volume", "strike"]:
+            df_c[col] = pd.to_numeric(df_c.get(col, 0), errors="coerce").fillna(0)
+        df_c = df_c[df_c["impliedVolatility"].between(0.01, 4.5)]
+        df_c = df_c[df_c["openInterest"] > 0]
+        df_c = df_c.dropna(subset=["strike", "impliedVolatility"])
+        df_c["moneyness"] = df_c["strike"] / spot_px
+        return df_c.sort_values("strike").reset_index(drop=True)
 
-    def _get_with_backoff(fn, label, max_retries=4):
-        """Llama fn() con backoff exponencial ante rate-limit."""
-        for attempt in range(max_retries):
-            try:
-                return fn()
-            except Exception as e:
-                err_str = str(e).lower()
-                is_rl = any(k in err_str for k in
-                            ["rate limit", "too many requests", "429", "throttle"])
-                if is_rl and attempt < max_retries - 1:
-                    wait = 2 ** (attempt + 1)  # 2s, 4s, 8s, 16s
-                    log.warning(f"{label} rate-limit → retry {attempt+1}/{max_retries} en {wait}s")
-                    time.sleep(wait)
-                else:
-                    raise
-        return None
+    # ── Intento 1: curl_cffi con impersonación Chrome ──────────────────────
+    sess = _yahoo_options_session()
+    if sess is not None:
+        try:
+            log.info(f"fetch_options_chains {ticker}: usando curl_cffi Chrome impersonation")
+            base_url = f"https://query1.finance.yahoo.com/v8/finance/options/{ticker}"
+            headers = {
+                "Accept": "application/json",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://finance.yahoo.com/",
+                "Origin": "https://finance.yahoo.com",
+            }
 
+            # Primer call: spot + lista de timestamps de expiración
+            resp = sess.get(base_url, headers=headers, timeout=15)
+            resp.raise_for_status()
+            root = resp.json()["optionChain"]["result"][0]
+
+            spot = float(root["quote"].get("regularMarketPrice", 0))
+            if not spot:
+                raise ValueError("spot=0 en respuesta Yahoo v8")
+
+            exp_timestamps = root.get("expirationDates", [])
+            if not exp_timestamps:
+                raise ValueError("No expirationDates en respuesta")
+
+            today = date.today()
+            chains = {}
+            selected = []
+            for ts in exp_timestamps:
+                exp_date = datetime.fromtimestamp(ts).date()
+                dte = (exp_date - today).days
+                if dte >= 7:
+                    selected.append((ts, exp_date.strftime("%Y-%m-%d"), dte))
+            selected = selected[:n_exp]
+
+            for ts, exp_str, dte in selected:
+                time.sleep(0.6)   # suave throttle entre vencimientos
+                try:
+                    r = sess.get(f"{base_url}?date={ts}", headers=headers, timeout=15)
+                    r.raise_for_status()
+                    opts = r.json()["optionChain"]["result"][0]["options"][0]
+                    calls_df = pd.DataFrame(opts.get("calls", []))
+                    puts_df  = pd.DataFrame(opts.get("puts",  []))
+                    if calls_df.empty or puts_df.empty:
+                        continue
+                    chains[exp_str] = {
+                        "calls": _clean_chain(calls_df, spot),
+                        "puts":  _clean_chain(puts_df,  spot),
+                        "dte":   dte,
+                    }
+                except Exception as e:
+                    log.warning(f"curl_cffi chain {ticker} {exp_str}: {e}")
+
+            log.info(f"curl_cffi OK: {ticker} {len(chains)} chains · spot={spot:.2f}")
+            return chains, spot
+
+        except Exception as e:
+            log.warning(f"curl_cffi falló para {ticker}: {e} — fallback a yfinance")
+
+    # ── Intento 2: yfinance con backoff (fallback) ─────────────────────────
+    log.info(f"fetch_options_chains {ticker}: fallback yfinance")
     try:
-        # Sin session= : yfinance >=0.2.x usa curl_cffi internamente
         t = yf.Ticker(ticker)
 
-        # 1. Lista de vencimientos — con backoff
-        try:
-            expirations = _get_with_backoff(lambda: t.options, f"{ticker}.options")
-        except Exception as e:
-            log.error(f"fetch_options_chains {ticker}: expirations fallida — {e}")
-            return {}, None
+        def _backoff(fn, label, n=4):
+            for i in range(n):
+                try:
+                    return fn()
+                except Exception as exc:
+                    if any(k in str(exc).lower() for k in
+                           ["rate limit", "too many", "429", "throttle"]) and i < n-1:
+                        w = 2 ** (i + 1)
+                        log.warning(f"{label} RL→retry {i+1}/{n} en {w}s")
+                        time.sleep(w)
+                    else:
+                        raise
+            return None
 
+        expirations = _backoff(lambda: t.options, f"{ticker}.options")
         if not expirations:
             return {}, None
 
-        # 2. Spot price — con backoff + delay previo
-        time.sleep(0.5)
-        try:
-            hist = _get_with_backoff(
-                lambda: t.history(period="2d"), f"{ticker}.history"
-            )
-            spot = float(hist["Close"].iloc[-1]) if hist is not None and not hist.empty else None
-        except Exception:
-            spot = None
+        time.sleep(0.8)
+        hist = _backoff(lambda: t.history(period="2d"), f"{ticker}.history")
+        spot = float(hist["Close"].iloc[-1]) if hist is not None and not hist.empty else None
         if not spot:
             return {}, None
 
         today = date.today()
         chains = {}
-        consecutive_rate_limits = 0
+        valid = sorted(
+            [(e, (datetime.strptime(e, "%Y-%m-%d").date() - today).days)
+             for e in expirations
+             if (datetime.strptime(e, "%Y-%m-%d").date() - today).days >= 7],
+            key=lambda x: x[1]
+        )[:n_exp]
 
-        # Filtrar vencimientos futuros con DTE ≥ 7 (descartar weeklys muy cortos)
-        valid_exps = []
-        for exp_str in expirations:
-            try:
-                exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
-                dte = (exp_date - today).days
-                if dte >= 7:
-                    valid_exps.append((exp_str, dte))
-            except Exception:
-                continue
-        valid_exps = sorted(valid_exps, key=lambda x: x[1])[:n_exp]
-
-        # Pequeño delay antes de empezar las cadenas individuales
         time.sleep(1.0)
-
-        for exp_str, dte in valid_exps:
-            if consecutive_rate_limits >= 2:
-                log.warning(f"Múltiples rate limits consecutivos — pausa 10s")
-                time.sleep(10)
-                consecutive_rate_limits = 0
-
+        rl_streak = 0
+        for exp_str, dte in valid:
+            if rl_streak >= 2:
+                time.sleep(12)
+                rl_streak = 0
             try:
-                chain = _fetch_with_retry(t, exp_str)
+                chain = _backoff(lambda e=exp_str: t.option_chain(e), f"{ticker}.chain.{exp_str}")
                 if chain is None:
                     continue
-
-                consecutive_rate_limits = 0  # reset counter si tuvo éxito
-
-                def clean_chain(df_raw, spot_px):
-                    df_c = df_raw.copy()
-                    df_c["impliedVolatility"] = pd.to_numeric(
-                        df_c["impliedVolatility"], errors="coerce"
-                    )
-                    df_c["openInterest"] = pd.to_numeric(
-                        df_c.get("openInterest", 0), errors="coerce"
-                    ).fillna(0)
-                    df_c["volume"] = pd.to_numeric(
-                        df_c.get("volume", 0), errors="coerce"
-                    ).fillna(0)
-                    df_c["strike"] = pd.to_numeric(df_c["strike"], errors="coerce")
-                    df_c = df_c[df_c["impliedVolatility"].between(0.01, 4.5)]
-                    df_c = df_c[df_c["openInterest"] > 0]
-                    df_c = df_c.dropna(subset=["strike", "impliedVolatility"])
-                    df_c["moneyness"] = df_c["strike"] / spot_px
-                    return df_c.sort_values("strike").reset_index(drop=True)
-
-                calls_clean = clean_chain(chain.calls, spot)
-                puts_clean  = clean_chain(chain.puts,  spot)
-
-                if len(calls_clean) < 3 or len(puts_clean) < 3:
-                    continue
-
+                rl_streak = 0
                 chains[exp_str] = {
-                    "calls": calls_clean,
-                    "puts":  puts_clean,
+                    "calls": _clean_chain(chain.calls, spot),
+                    "puts":  _clean_chain(chain.puts,  spot),
                     "dte":   dte,
                 }
-
-                # Pausa entre expiraciones para no saturar la API
-                time.sleep(1.5)  # throttle: ~1.5s entre cada vencimiento
-
-            except Exception as e:
-                err_str = str(e).lower()
-                if any(k in err_str for k in ["rate limit", "too many", "429"]):
-                    consecutive_rate_limits += 1
-                    log.warning(f"Rate limit en {ticker} {exp_str} — skip")
+                time.sleep(1.5)
+            except Exception as ex:
+                if any(k in str(ex).lower() for k in ["rate limit", "too many", "429"]):
+                    rl_streak += 1
+                    log.warning(f"yfinance RL {ticker} {exp_str}")
                 else:
-                    log.warning(f"Options chain {ticker} {exp_str}: {e}")
-                continue
+                    log.warning(f"yfinance chain error {ticker} {exp_str}: {ex}")
 
-        log.info(f"Options chains {ticker}: {len(chains)} expirations · spot={spot:.2f}")
+        log.info(f"yfinance fallback: {ticker} {len(chains)} chains · spot={spot:.2f}")
         return chains, spot
 
     except Exception as e:
         log.error(f"fetch_options_chains {ticker}: {e}")
         return {}, None
-
 
 # ─── Métricas de skew ──────────────────────────────────────────────────────
 def compute_skew_metrics(chains: dict, spot: float) -> dict:
@@ -950,6 +954,289 @@ def build_iv_heatmap(chains: dict, spot: float,
     )
     return fig
 
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# COT — Commitments of Traders (CFTC Public API)
+# Futuros VIX: código CFTC 1170E1 · Disaggregated Report
+# API: https://publicreporting.cftc.gov (Socrata, sin auth)
+# Publicación: martes ~15:30 ET con datos del martes anterior
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+COT_VIX_CODE   = "1170E1"                        # CBOE VIX VOLATILITY INDEX
+COT_API_BASE   = "https://publicreporting.cftc.gov/resource"
+COT_DISAGG_ID  = "72hh-3qpy"                     # Disaggregated Futures & Options Combined
+COT_LEGACY_ID  = "6dca-aqww"                     # Legacy (si disagg falla)
+
+
+@st.cache_data(ttl=3600 * 6)  # 6h — datos semanales, no cambian intraday
+def fetch_cot_vix(n_weeks: int = 104) -> pd.DataFrame:
+    """
+    Descarga el COT disaggregado para VIX futures (código 1170E1) via CFTC Socrata API.
+    Columnas clave:
+      - mm_long / mm_short  : Managed Money (especuladores institucionales)
+      - dealer_long / short : Swap Dealers
+      - prod_long / short   : Producers / Commercial hedgers
+      - oi                  : Open Interest total
+      - net_mm              : MM long - MM short (posicionamiento neto especulador)
+      - net_mm_pct          : net_mm / OI * 100  (% del OI)
+    """
+    log = logging.getLogger("vix_controller")
+    import json
+
+    try:
+        import urllib.request
+        url = (
+            f"{COT_API_BASE}/{COT_DISAGG_ID}.json"
+            f"?cftc_contract_market_code={COT_VIX_CODE}"
+            f"&$limit={n_weeks}"
+            f"&$order=report_date_as_yyyy_mm_dd%20DESC"
+        )
+        log.info(f"COT fetch: {url}")
+        req = urllib.request.Request(
+            url,
+            headers={"Accept": "application/json",
+                     "User-Agent": "Mozilla/5.0 (compatible; VIXController/1.0)"},
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = json.loads(resp.read().decode())
+
+        if not raw:
+            log.warning("COT: respuesta vacía del disaggregated endpoint")
+            return pd.DataFrame()
+
+        df = pd.DataFrame(raw)
+
+        # Mapeo de columnas del disaggregated report
+        col_map = {
+            "report_date_as_yyyy_mm_dd":        "date",
+            "open_interest_all":                 "oi",
+            "m_money_positions_long_all":        "mm_long",
+            "m_money_positions_short_all":       "mm_short",
+            "m_money_positions_spread_all":      "mm_spread",
+            "swap_positions_long_all":           "dealer_long",
+            "swap__positions_short_all":         "dealer_short",
+            "prod_merc_positions_long_all":      "prod_long",
+            "prod_merc_positions_short_all":     "prod_short",
+            "tot_rept_positions_long_all":       "rept_long",
+            "tot_rept_positions_short_all":      "rept_short",
+            "nonrept_positions_long_all":        "nonrept_long",
+            "nonrept_positions_short_all":       "nonrept_short",
+        }
+        # Renombrar sólo las columnas que existen
+        df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+
+        # Parsear tipos
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        for c in ["oi","mm_long","mm_short","mm_spread","dealer_long","dealer_short",
+                  "prod_long","prod_short","rept_long","rept_short",
+                  "nonrept_long","nonrept_short"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+
+        df = df.sort_values("date").reset_index(drop=True)
+
+        # Métricas derivadas
+        if "mm_long" in df.columns and "mm_short" in df.columns:
+            df["net_mm"]      = df["mm_long"] - df["mm_short"]
+            df["net_mm_pct"]  = (df["net_mm"] / df["oi"] * 100).where(df["oi"] > 0)
+
+        if "dealer_long" in df.columns and "dealer_short" in df.columns:
+            df["net_dealer"]  = df["dealer_long"] - df["dealer_short"]
+
+        if "prod_long" in df.columns and "prod_short" in df.columns:
+            df["net_commercial"] = df["prod_long"] - df["prod_short"]
+
+        # Percentiles históricos (2y rolling)
+        if "net_mm_pct" in df.columns:
+            df["net_mm_pct_pctile"] = df["net_mm_pct"].rank(pct=True) * 100
+
+        log.info(f"COT VIX: {len(df)} semanas · última fecha: {df['date'].iloc[-1].date()}")
+        return df
+
+    except Exception as e:
+        log.error(f"fetch_cot_vix: {e}")
+        return pd.DataFrame()
+
+
+def build_cot_positioning_chart(cot: pd.DataFrame, window: int = 104) -> go.Figure:
+    """
+    Gráfico principal COT: posicionamiento neto de Managed Money y Dealers
+    sobre el OI total. Barras Net MM + línea Net Dealer.
+    """
+    fig = go.Figure()
+    if cot.empty or "net_mm" not in cot.columns:
+        return fig
+
+    p = cot.tail(window).dropna(subset=["net_mm"])
+
+    # Colores por signo
+    bar_colors = ["#3FB950" if v >= 0 else "#F85149" for v in p["net_mm"]]
+
+    fig.add_trace(go.Bar(
+        x=p["date"], y=p["net_mm"],
+        name="Net Managed Money",
+        marker_color=bar_colors,
+        opacity=0.75,
+        hovertemplate="%{x|%Y-%m-%d}<br>Net MM: %{y:,.0f} contratos<extra></extra>",
+    ))
+
+    if "net_dealer" in p.columns:
+        fig.add_trace(go.Scatter(
+            x=p["date"], y=p["net_dealer"],
+            name="Net Dealers (Swap)",
+            line=dict(color="#58A6FF", width=2),
+            hovertemplate="%{x|%Y-%m-%d}<br>Net Dealer: %{y:,.0f}<extra></extra>",
+        ))
+
+    if "net_commercial" in p.columns:
+        fig.add_trace(go.Scatter(
+            x=p["date"], y=p["net_commercial"],
+            name="Net Commercial",
+            line=dict(color="#D29922", width=1.5, dash="dot"),
+            hovertemplate="%{x|%Y-%m-%d}<br>Net Comm: %{y:,.0f}<extra></extra>",
+        ))
+
+    fig.add_hline(y=0, line_dash="dash", line_color="#484F58", line_width=1.5)
+
+    fig.update_layout(
+        title=dict(
+            text=(
+                "<b>COT — Posicionamiento Neto en Futuros VIX</b>"
+                "<sup>  Managed Money (especuladores) · verde=net long vol · rojo=net short vol</sup>"
+            ),
+            font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5,
+        ),
+        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+        height=360, margin=dict(l=55, r=30, t=60, b=40),
+        xaxis=dict(gridcolor="#21262D",
+                   tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono"),
+                   rangeselector=dict(
+                       buttons=[
+                           dict(count=6,  label="6M", step="month", stepmode="backward"),
+                           dict(count=1,  label="1A", step="year",  stepmode="backward"),
+                           dict(count=2,  label="2A", step="year",  stepmode="backward"),
+                           dict(step="all", label="Todo"),
+                       ],
+                       bgcolor="#161B22", activecolor="#F7931A",
+                       font=dict(size=9, color="#C9D1D9", family="JetBrains Mono"),
+                   )),
+        yaxis=dict(
+            title=dict(text="Contratos netos", font=dict(size=10, color="#8B949E")),
+            gridcolor="#21262D",
+            tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono"),
+        ),
+        legend=dict(orientation="h", y=1.02, bgcolor="rgba(0,0,0,0)",
+                    font=dict(size=9, color="#C9D1D9", family="JetBrains Mono")),
+        hovermode="x unified", bargap=0.15,
+    )
+    return fig
+
+
+def build_cot_oi_chart(cot: pd.DataFrame, window: int = 104) -> go.Figure:
+    """Open Interest total de futuros VIX + Net MM % del OI (eje secundario)."""
+    fig = go.Figure()
+    if cot.empty or "oi" not in cot.columns:
+        return fig
+
+    p = cot.tail(window).dropna(subset=["oi"])
+
+    fig.add_trace(go.Scatter(
+        x=p["date"], y=p["oi"],
+        name="Open Interest",
+        fill="tozeroy",
+        line=dict(color="#39D2C0", width=2),
+        fillcolor="rgba(57,210,192,0.12)",
+        hovertemplate="%{x|%Y-%m-%d}<br>OI: %{y:,.0f}<extra></extra>",
+    ))
+
+    if "net_mm_pct" in p.columns:
+        fig.add_trace(go.Scatter(
+            x=p["date"], y=p["net_mm_pct"],
+            name="Net MM % del OI",
+            yaxis="y2",
+            line=dict(color="#BC8CFF", width=2),
+            hovertemplate="%{x|%Y-%m-%d}<br>Net MM%%: %{y:.1f}%%<extra></extra>",
+        ))
+        fig.add_hline(y=0, yref="y2", line_dash="dot", line_color="#484F58",
+                      line_width=1)
+
+    fig.update_layout(
+        title=dict(
+            text=(
+                "<b>Open Interest VIX Futures + Net MM %</b>"
+                "<sup>  OI creciente + MM net long = mercado pagando prima de vol</sup>"
+            ),
+            font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5,
+        ),
+        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+        height=300, margin=dict(l=55, r=60, t=60, b=40),
+        xaxis=dict(gridcolor="#21262D",
+                   tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono")),
+        yaxis=dict(title=dict(text="OI (contratos)", font=dict(size=10, color="#39D2C0")),
+                   gridcolor="#21262D",
+                   tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono")),
+        yaxis2=dict(title=dict(text="Net MM % OI", font=dict(size=10, color="#BC8CFF")),
+                    overlaying="y", side="right",
+                    tickfont=dict(size=9, color="#BC8CFF"), showgrid=False,
+                    zeroline=True, zerolinecolor="#30363D"),
+        legend=dict(orientation="h", y=1.02, bgcolor="rgba(0,0,0,0)",
+                    font=dict(size=9, color="#C9D1D9", family="JetBrains Mono")),
+        hovermode="x unified",
+    )
+    return fig
+
+
+def build_cot_breakdown_chart(cot: pd.DataFrame, window: int = 52) -> go.Figure:
+    """
+    Breakdown apilado: longs y shorts de cada categoría en el último año.
+    """
+    fig = go.Figure()
+    if cot.empty:
+        return fig
+
+    p = cot.tail(window)
+
+    CATS = [
+        ("mm_long",   "mm_short",   "Managed Money",  "#3FB950", "#F85149"),
+        ("dealer_long","dealer_short","Swap Dealers",  "#58A6FF", "#F0883E"),
+        ("prod_long", "prod_short",  "Commercial",    "#39D2C0", "#BC8CFF"),
+    ]
+
+    for long_col, short_col, label, c_long, c_short in CATS:
+        if long_col not in p.columns:
+            continue
+        fig.add_trace(go.Scatter(
+            x=p["date"], y=p[long_col],
+            name=f"{label} Long",
+            line=dict(color=c_long, width=1.5),
+            hovertemplate=f"{label} Long: %{{y:,.0f}}<extra></extra>",
+        ))
+        if short_col in p.columns:
+            fig.add_trace(go.Scatter(
+                x=p["date"], y=-p[short_col],
+                name=f"{label} Short",
+                line=dict(color=c_short, width=1.5, dash="dot"),
+                hovertemplate=f"{label} Short: %{{y:,.0f}}<extra></extra>",
+            ))
+
+    fig.add_hline(y=0, line_dash="solid", line_color="#484F58", line_width=1)
+    fig.update_layout(
+        title=dict(
+            text="<b>COT — Breakdown por Categoría</b>"
+                 "<sup>  Longs arriba · Shorts invertidos abajo</sup>",
+            font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5,
+        ),
+        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+        height=320, margin=dict(l=55, r=30, t=60, b=40),
+        xaxis=dict(gridcolor="#21262D",
+                   tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono")),
+        yaxis=dict(gridcolor="#21262D",
+                   tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono")),
+        legend=dict(orientation="h", y=1.02, bgcolor="rgba(0,0,0,0)",
+                    font=dict(size=8, color="#C9D1D9", family="JetBrains Mono")),
+        hovermode="x unified",
+    )
+    return fig
 
 def compute_edge_analytics(df, edge_extra):
     out = {}
@@ -1610,11 +1897,12 @@ def fp(v):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # TABS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-tab1, tab2, tab_edge, tab_skew, tab3, tab4 = st.tabs([
+tab1, tab2, tab_edge, tab_skew, tab_cot, tab3, tab4 = st.tabs([
     "📈  Term Structure",
     "🎯  Monitor Operativo",
     "🔬  Edge Analytics",
     "📐  Vol Skew & Surface",
+    "📋  COT · Futuros VIX",
     "💡  Recomendaciones",
     "ℹ️  Help",
 ])
@@ -2307,6 +2595,172 @@ with tab_skew:
         f"Actualizado: {now_cdmx().strftime('%H:%M:%S')} CDMX · "
         "Precios con delay ~15 min"
     )
+
+
+# ━━━━━━━━━━━━━━━━━ TAB: COT — COMMITMENTS OF TRADERS ━━━━━━━━
+with tab_cot:
+
+    st.markdown("""
+    <div style="font-family:'JetBrains Mono',monospace;font-size:0.72rem;color:#8B949E;
+                padding:0.4rem 0 0.8rem;">
+    Fuente: <b>CFTC Disaggregated COT Report</b> · Código VIX Futures: <b>1170E1</b> ·
+    Publicación: martes ~15:30 ET con datos del martes anterior ·
+    API: publicreporting.cftc.gov (gratuita, sin autenticación)
+    </div>
+    """, unsafe_allow_html=True)
+
+    col_cot1, col_cot2 = st.columns([3, 1])
+    with col_cot1:
+        cot_weeks = st.slider("Semanas de historia", 26, 156, 104,
+                              help="1 año = 52 semanas · 3 años = 156")
+    with col_cot2:
+        if st.button("🔄 Actualizar COT", key="btn_refresh_cot"):
+            fetch_cot_vix.clear()
+            st.rerun()
+
+    with st.spinner("📋 Descargando COT de CFTC…"):
+        cot_df = fetch_cot_vix(n_weeks=max(cot_weeks + 10, 156))
+
+    if cot_df.empty:
+        st.error("❌ No se pudieron obtener datos COT del CFTC. Verifica conexión.")
+        st.info(
+            "La API CFTC (publicreporting.cftc.gov) es pública y gratuita. "
+            "Si falla, intenta de nuevo en unos minutos — el caché es de 6 horas."
+        )
+    else:
+        last_cot = cot_df.iloc[-1]
+        last_date_cot = last_cot["date"].strftime("%Y-%m-%d") if pd.notna(last_cot["date"]) else "?"
+
+        # ── Métricas de resumen ──────────────────────────────────
+        mm_net    = int(last_cot.get("net_mm", 0) or 0)
+        mm_pct    = last_cot.get("net_mm_pct", None)
+        mm_pctile = last_cot.get("net_mm_pct_pctile", None)
+        oi_val    = int(last_cot.get("oi", 0) or 0)
+        dealer_net = int(last_cot.get("net_dealer", 0) or 0)
+        comm_net   = int(last_cot.get("net_commercial", 0) or 0)
+
+        # Señal interpretativa
+        if mm_pctile is not None:
+            if mm_net > 0 and mm_pctile > 70:
+                cot_signal = "⚡ MM NET LONG extremo — alta demanda de vol"
+                cot_sig_clr = "var(--r)"
+                cot_interp = ("Managed Money está net long VIX futures por encima del percentil 70 histórico. "
+                              "El mercado está pagando prima de volatilidad elevada — favorable para estrategias de venta de vol "
+                              "pero indica precaución: el mercado anticipa movimiento.")
+            elif mm_net > 0:
+                cot_signal = "📈 MM NET LONG moderado"
+                cot_sig_clr = "var(--y)"
+                cot_interp = ("Managed Money tiene posición neta long en VIX futures — expectativa moderada de vol. "
+                              "El contango puede estar bajo presión.")
+            elif mm_net < 0 and mm_pctile is not None and mm_pctile < 30:
+                cot_signal = "✅ MM NET SHORT — complacencia elevada"
+                cot_sig_clr = "var(--g)"
+                cot_interp = ("Managed Money está net short VIX futures — los especuladores apuestan a que la vol baja. "
+                              "Históricamente favorable para estrategias de inverse vol como SVXY/SVIX. "
+                              "Señal de complacencia: el mercado no anticipa volatilidad.")
+            else:
+                cot_signal = "➡️ Posicionamiento neutral"
+                cot_sig_clr = "var(--b)"
+                cot_interp = "Managed Money está cerca del equilibrio en futuros VIX."
+        else:
+            cot_signal = "—"
+            cot_sig_clr = "var(--dim)"
+            cot_interp  = ""
+
+        mm_pct_s   = f"{mm_pct:+.1f}% del OI" if mm_pct is not None else "—"
+        mm_pctile_s = f"Pct {mm_pctile:.0f}°" if mm_pctile is not None else "—"
+
+        st.markdown(f"""
+        <div class="mrow">
+            <div class="mpill" style="min-width:180px">
+                <div class="ml">Señal COT</div>
+                <div style="font-family:'Inter',sans-serif;font-weight:700;font-size:0.9rem;
+                            color:{cot_sig_clr}">{cot_signal}</div>
+            </div>
+            <div class="mpill">
+                <div class="ml">Net MM · {last_date_cot}</div>
+                <div class="mv {'up' if mm_net>=0 else 'dn'}">{mm_net:+,}</div>
+            </div>
+            <div class="mpill">
+                <div class="ml">Net MM % OI</div>
+                <div class="mv nt">{mm_pct_s}</div>
+            </div>
+            <div class="mpill">
+                <div class="ml">Percentil histórico</div>
+                <div class="mv nt">{mm_pctile_s}</div>
+            </div>
+            <div class="mpill">
+                <div class="ml">Open Interest</div>
+                <div class="mv nt">{oi_val:,}</div>
+            </div>
+            <div class="mpill">
+                <div class="ml">Net Dealers</div>
+                <div class="mv {'up' if dealer_net>=0 else 'dn'}">{dealer_net:+,}</div>
+            </div>
+            <div class="mpill">
+                <div class="ml">Net Commercial</div>
+                <div class="mv {'up' if comm_net>=0 else 'dn'}">{comm_net:+,}</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        if cot_interp:
+            with st.expander("📊 Interpretación COT", expanded=True):
+                st.markdown(cot_interp)
+                st.markdown("""
+**Guía de lectura rápida:**
+- **Managed Money net LONG VIX** → especuladores apuestan a subida de vol → mercado defensivo
+- **Managed Money net SHORT VIX** → especuladores apuestan a vol baja → contango favorable
+- **OI creciente + MM net short** → el trade de inverse vol tiene viento de cola
+- **OI cayendo** → posiciones se están cerrando, reducir convicción
+- El COT se publica **cada martes** con datos de la semana anterior
+                """)
+
+        st.markdown("<div style='border-top:1px solid #30363D;margin:0.5rem 0'></div>",
+                    unsafe_allow_html=True)
+
+        # ── Charts ──────────────────────────────────────────────
+        try:
+            fig_pos = build_cot_positioning_chart(cot_df, window=cot_weeks)
+            if fig_pos.data:
+                st.plotly_chart(fig_pos, width="stretch", config=dict(displayModeBar=False))
+        except Exception as e:
+            st.error(f"Error chart posicionamiento: {e}")
+
+        col_oi, col_bd = st.columns(2)
+        with col_oi:
+            try:
+                fig_oi = build_cot_oi_chart(cot_df, window=cot_weeks)
+                if fig_oi.data:
+                    st.plotly_chart(fig_oi, width="stretch", config=dict(displayModeBar=False))
+            except Exception as e:
+                st.error(f"Error chart OI: {e}")
+
+        with col_bd:
+            try:
+                fig_bd = build_cot_breakdown_chart(cot_df, window=min(cot_weeks, 104))
+                if fig_bd.data:
+                    st.plotly_chart(fig_bd, width="stretch", config=dict(displayModeBar=False))
+            except Exception as e:
+                st.error(f"Error chart breakdown: {e}")
+
+        # ── Tabla histórica ─────────────────────────────────────
+        with st.expander("📋 Datos semanales COT"):
+            show_cols = [c for c in
+                ["date","oi","mm_long","mm_short","net_mm","net_mm_pct","net_mm_pct_pctile",
+                 "dealer_long","dealer_short","net_dealer","prod_long","prod_short","net_commercial"]
+                if c in cot_df.columns]
+            st.dataframe(
+                cot_df[show_cols].tail(cot_weeks).sort_values("date", ascending=False),
+                use_container_width=True, hide_index=True,
+            )
+
+        st.caption(
+            f"CFTC Disaggregated COT · VIX Futures (1170E1) · "
+            f"Última semana: {last_date_cot} · "
+            f"Cache: 6h · publicreporting.cftc.gov"
+        )
+
 
 
 # ━━━━━━━━━━━━━━━━━ TAB 3: RECOMENDACIONES ━━━━━━━━━━━━━━━━━
