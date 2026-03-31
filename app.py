@@ -305,39 +305,111 @@ def fetch_edge_extra():
 # VOL SKEW & IV SURFACE — DATA LAYER
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-@st.cache_data(ttl=300)
-def fetch_options_chains(ticker: str = "SPY", n_exp: int = 9) -> tuple:
+def _make_yf_session():
+    """Sesión requests con headers de browser para evitar rate-limiting de Yahoo Finance."""
+    import requests
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+    })
+    return s
+
+
+@st.cache_data(ttl=900)
+def fetch_options_chains(ticker: str = "SPY", n_exp: int = 5) -> tuple:
     """
-    Descarga cadenas de opciones via yfinance.
+    Descarga cadenas de opciones via yfinance con manejo robusto de rate-limiting.
+    - Sesión con headers de browser para reducir bloqueos
+    - Reintentos con backoff exponencial por expiración
+    - TTL 15min para no martillar la API
+    - Prioriza vencimientos mensuales (DTE ≥ 14) para mayor liquidez
     Retorna (chains_dict, spot_price).
     chains_dict: {exp_str: {"calls": df, "puts": df, "dte": int}}
-    Filtros aplicados: OI > 0, IV ∈ [0.01, 5.0], spread bid-ask razonable.
     """
     log = logging.getLogger("vix_controller")
+
+    def _fetch_with_retry(ticker_obj, exp_str, max_retries=3):
+        """Reintenta la descarga de una expiración con backoff."""
+        for attempt in range(max_retries):
+            try:
+                chain = ticker_obj.option_chain(exp_str)
+                return chain
+            except Exception as e:
+                err_str = str(e).lower()
+                is_rate_limit = any(
+                    k in err_str
+                    for k in ["rate limit", "too many requests", "429", "throttle"]
+                )
+                if is_rate_limit and attempt < max_retries - 1:
+                    wait = 2 ** (attempt + 1)   # 2s → 4s → 8s
+                    log.warning(f"Rate limit en {ticker} {exp_str} — esperando {wait}s (intento {attempt+1}/{max_retries})")
+                    time.sleep(wait)
+                    continue
+                raise  # re-raise si no es rate-limit o se agotaron intentos
+        return None
+
     try:
-        t = yf.Ticker(ticker)
-        expirations = t.options
+        session = _make_yf_session()
+        t = yf.Ticker(ticker, session=session)
+
+        # Obtener lista de expiraciones (no suele ser bloqueada)
+        try:
+            expirations = t.options
+        except Exception as e:
+            log.error(f"fetch_options_chains {ticker}: no se pudo obtener expirations — {e}")
+            return {}, None
+
         if not expirations:
             return {}, None
 
-        hist = t.history(period="2d")
-        spot = float(hist["Close"].iloc[-1]) if not hist.empty else None
+        # Spot price
+        try:
+            hist = t.history(period="2d")
+            spot = float(hist["Close"].iloc[-1]) if not hist.empty else None
+        except Exception:
+            spot = None
         if not spot:
             return {}, None
 
         today = date.today()
         chains = {}
+        consecutive_rate_limits = 0
 
-        for exp_str in expirations[:n_exp]:
+        # Priorizar vencimientos con DTE ≥ 14 (mensuales, más líquidos y menos ruido)
+        valid_exps = []
+        for exp_str in expirations:
             try:
                 exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
                 dte = (exp_date - today).days
-                if dte < 1:
+                if dte >= 7:
+                    valid_exps.append((exp_str, dte))
+            except Exception:
+                continue
+        # Ordenar por DTE y tomar los n_exp más próximos
+        valid_exps = sorted(valid_exps, key=lambda x: x[1])[:n_exp]
+
+        for exp_str, dte in valid_exps:
+            if consecutive_rate_limits >= 2:
+                log.warning(f"Múltiples rate limits — pausa 8s antes de continuar")
+                time.sleep(8)
+                consecutive_rate_limits = 0
+
+            try:
+                chain = _fetch_with_retry(t, exp_str)
+                if chain is None:
                     continue
 
-                chain = t.option_chain(exp_str)
+                consecutive_rate_limits = 0  # reset counter si tuvo éxito
 
-                def clean_chain(df_raw):
+                def clean_chain(df_raw, spot_px):
                     df_c = df_raw.copy()
                     df_c["impliedVolatility"] = pd.to_numeric(
                         df_c["impliedVolatility"], errors="coerce"
@@ -349,15 +421,14 @@ def fetch_options_chains(ticker: str = "SPY", n_exp: int = 9) -> tuple:
                         df_c.get("volume", 0), errors="coerce"
                     ).fillna(0)
                     df_c["strike"] = pd.to_numeric(df_c["strike"], errors="coerce")
-                    # Filtros de calidad
                     df_c = df_c[df_c["impliedVolatility"].between(0.01, 4.5)]
                     df_c = df_c[df_c["openInterest"] > 0]
                     df_c = df_c.dropna(subset=["strike", "impliedVolatility"])
-                    df_c["moneyness"] = df_c["strike"] / spot
+                    df_c["moneyness"] = df_c["strike"] / spot_px
                     return df_c.sort_values("strike").reset_index(drop=True)
 
-                calls_clean = clean_chain(chain.calls)
-                puts_clean  = clean_chain(chain.puts)
+                calls_clean = clean_chain(chain.calls, spot)
+                puts_clean  = clean_chain(chain.puts,  spot)
 
                 if len(calls_clean) < 3 or len(puts_clean) < 3:
                     continue
@@ -367,8 +438,17 @@ def fetch_options_chains(ticker: str = "SPY", n_exp: int = 9) -> tuple:
                     "puts":  puts_clean,
                     "dte":   dte,
                 }
+
+                # Pausa entre expiraciones para no saturar la API
+                time.sleep(1.2)
+
             except Exception as e:
-                log.warning(f"Options chain {ticker} {exp_str}: {e}")
+                err_str = str(e).lower()
+                if any(k in err_str for k in ["rate limit", "too many", "429"]):
+                    consecutive_rate_limits += 1
+                    log.warning(f"Rate limit en {ticker} {exp_str} — skip")
+                else:
+                    log.warning(f"Options chain {ticker} {exp_str}: {e}")
                 continue
 
         log.info(f"Options chains {ticker}: {len(chains)} expirations · spot={spot:.2f}")
@@ -1466,13 +1546,13 @@ with st.sidebar:
     SHOW_TABLE = st.checkbox("Show data table", True)
     st.markdown("---")
     st.markdown("**🔄 Actualizar datos**")
-    if st.button("📡 Refresh CBOE + yfinance", use_container_width=True):
+    if st.button("📡 Refresh CBOE + yfinance", key="btn_refresh_cboe"):
         scrape_cboe_futures.clear()
         fetch_vix_spot.clear()
         fetch_etps.clear()
         fetch_today_prices.clear()
         st.rerun()
-    if st.button("🗄️ Recargar Parquet (repo)", use_container_width=True):
+    if st.button("🗄️ Recargar Parquet (repo)", key="btn_reload_parquet"):
         load_master_parquet.clear()
         build_strategy_cached.clear()
         st.rerun()
@@ -1823,7 +1903,7 @@ with tab2:
         final_sig_today=final_sig_today,
         ct_today=ct_today,
     )
-    st.plotly_chart(fig_mon, use_container_width=True,
+    st.plotly_chart(fig_mon, width="stretch",
                     config=dict(displayModeBar=True, displaylogo=False,
                                 scrollZoom=False,
                                 modeBarButtonsToRemove=['select2d','lasso2d']))
@@ -1997,7 +2077,7 @@ with tab_skew:
             help="SPY es el proxy más líquido para el mercado amplio",
         )
     with col_ctrl2:
-        n_exps = st.slider("Nº Vencimientos", 3, 9, 6, help="Vencimientos a mostrar en skew y superficie")
+        n_exps = st.slider("Nº Vencimientos", 2, 6, 4, help="Menos vencimientos = más rápido · Cada uno tarda ~1.5s")
     with col_ctrl3:
         mon_lo = st.slider("Moneyness mín (%)", 70, 90, 80,
                            help="Strike mínimo como % del spot") / 100
@@ -2014,8 +2094,14 @@ with tab_skew:
 
     if not opt_chains or not opt_spot:
         st.error(
-            f"❌ No se pudieron obtener opciones para **{skew_ticker}**. "
-            "Verifica tu conexión o prueba durante horario de mercado."
+            f"❌ **Rate limit de Yahoo Finance** — no se pudieron cargar opciones para **{skew_ticker}**."
+        )
+        st.info(
+            "💡 **Pasos para resolver:**\n"
+            "1. Espera **2-3 minutos** y presiona 🔄 Actualizar opciones\n"
+            "2. Reduce el slider de vencimientos a **2 o 3**\n"
+            "3. El caché dura **15 min** — no recarga si ya tienes datos frescos\n"
+            "4. yfinance tiene throttling no documentado; es más estable en horario de mercado (9:30–16:00 ET)"
         )
         st.stop()
 
@@ -2111,7 +2197,7 @@ with tab_skew:
             fig_sk = build_skew_curves(opt_chains, opt_spot,
                                        moneyness_range=(mon_lo, mon_hi))
             if fig_sk.data:
-                st.plotly_chart(fig_sk, use_container_width=True,
+                st.plotly_chart(fig_sk, width="stretch",
                                 config=dict(displayModeBar=True,
                                             modeBarButtonsToRemove=["lasso2d","select2d"]))
             else:
@@ -2123,7 +2209,7 @@ with tab_skew:
         try:
             fig_atm = build_atm_term_structure(opt_chains, opt_spot)
             if fig_atm.data:
-                st.plotly_chart(fig_atm, use_container_width=True,
+                st.plotly_chart(fig_atm, width="stretch",
                                 config=dict(displayModeBar=False))
             else:
                 st.info("No hay datos ATM.")
@@ -2146,7 +2232,7 @@ with tab_skew:
             fig_surf = build_iv_surface(opt_chains, opt_spot,
                                         moneyness_range=(mon_lo, mon_hi))
             if fig_surf.data:
-                st.plotly_chart(fig_surf, use_container_width=True,
+                st.plotly_chart(fig_surf, width="stretch",
                                 config=dict(displayModeBar=True))
             else:
                 st.info("No hay suficientes datos para construir la superficie 3D.")
@@ -2157,7 +2243,7 @@ with tab_skew:
             fig_hm = build_iv_heatmap(opt_chains, opt_spot,
                                       moneyness_range=(mon_lo, mon_hi))
             if fig_hm.data:
-                st.plotly_chart(fig_hm, use_container_width=True,
+                st.plotly_chart(fig_hm, width="stretch",
                                 config=dict(displayModeBar=False))
             else:
                 st.info("No hay suficientes datos para el heatmap.")
