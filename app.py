@@ -814,7 +814,7 @@ def fetch_cot_vix(n_weeks: int = 104) -> pd.DataFrame:
         return pd.DataFrame()
 
     try:
-        current_year = datetime.now().year
+        current_year = now_cdmx().year
         years_needed = max(1, (n_weeks // 52) + 2)
         frames = []
         for yr in range(current_year - years_needed + 1, current_year + 1):
@@ -907,7 +907,92 @@ COT_DISAGG_ID  = "72hh-3qpy"                     # Disaggregated Futures & Optio
 COT_LEGACY_ID  = "6dca-aqww"                     # Legacy (si disagg falla)
 
 
-@st.cache_data(ttl=3600 * 6)  # 6h — datos semanales, no cambian intraday
+def build_cot_positioning_chart(cot_df, window=104):
+    """Net Managed Money positioning + percentile bands."""
+    p = cot_df.tail(window).copy()
+    if 'net_mm' not in p.columns or 'date' not in p.columns:
+        return go.Figure()
+    p = p.dropna(subset=['net_mm', 'date'])
+    if len(p) < 5:
+        return go.Figure()
+    colors = ['#3FB950' if v >= 0 else '#F85149' for v in p['net_mm']]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=p['date'], y=p['net_mm'], marker_color=colors,
+        name='Net MM', opacity=0.7))
+    if 'net_mm_pct' in p.columns:
+        fig.add_trace(go.Scatter(x=p['date'], y=p['net_mm'].rolling(8).mean(),
+            name='SMA(8w)', line=dict(color='#39D2C0', width=2)))
+    fig.add_hline(y=0, line_dash='dash', line_color='#8B949E', line_width=1)
+    fig.update_layout(
+        title=dict(text='<b>Managed Money Net Positioning</b><sup>  VIX Futures · CFTC COT</sup>',
+                   font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
+        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
+        height=350, margin=dict(l=50, r=30, t=55, b=40),
+        xaxis=dict(gridcolor='#21262D', tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
+        yaxis=dict(title='Contratos (net)', gridcolor='#21262D',
+                   tickfont=dict(size=9, color='#8B949E')),
+        legend=dict(orientation='h', y=1.02, bgcolor='rgba(0,0,0,0)',
+                    font=dict(size=9, color='#8B949E', family='JetBrains Mono')),
+        hovermode='x unified')
+    return fig
+
+
+def build_cot_oi_chart(cot_df, window=104):
+    """Open Interest total."""
+    p = cot_df.tail(window).copy()
+    if 'oi' not in p.columns or 'date' not in p.columns:
+        return go.Figure()
+    p = p.dropna(subset=['oi', 'date'])
+    if len(p) < 5:
+        return go.Figure()
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=p['date'], y=p['oi'], name='Open Interest',
+        line=dict(color='#58A6FF', width=2), fill='tozeroy',
+        fillcolor='rgba(88,166,255,0.1)'))
+    fig.update_layout(
+        title=dict(text='<b>Open Interest</b><sup>  VIX Futures</sup>',
+                   font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
+        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
+        height=280, margin=dict(l=50, r=30, t=55, b=40),
+        xaxis=dict(gridcolor='#21262D', tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
+        yaxis=dict(title='Contratos', gridcolor='#21262D',
+                   tickfont=dict(size=9, color='#8B949E')),
+        hovermode='x unified', showlegend=False)
+    return fig
+
+
+def build_cot_breakdown_chart(cot_df, window=104):
+    """Breakdown: MM, Dealers, Asset Managers."""
+    p = cot_df.tail(window).copy()
+    if 'date' not in p.columns:
+        return go.Figure()
+    p = p.dropna(subset=['date'])
+    fig = go.Figure()
+    traces = [
+        ('net_mm', 'Managed Money', '#3FB950'),
+        ('net_dealer', 'Dealers', '#F0883E'),
+        ('net_commercial', 'Asset Managers', '#58A6FF'),
+    ]
+    for col, name, color in traces:
+        if col in p.columns:
+            fig.add_trace(go.Scatter(x=p['date'], y=p[col], name=name,
+                line=dict(color=color, width=2)))
+    fig.add_hline(y=0, line_dash='dash', line_color='#8B949E', line_width=1)
+    fig.update_layout(
+        title=dict(text='<b>Net Positioning by Category</b>',
+                   font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
+        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
+        height=280, margin=dict(l=50, r=30, t=55, b=40),
+        xaxis=dict(gridcolor='#21262D', tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
+        yaxis=dict(title='Contratos (net)', gridcolor='#21262D',
+                   tickfont=dict(size=9, color='#8B949E')),
+        legend=dict(orientation='h', y=1.02, bgcolor='rgba(0,0,0,0)',
+                    font=dict(size=9, color='#8B949E', family='JetBrains Mono')),
+        hovermode='x unified')
+    return fig
+
+
+# Sin cache — recibe DataFrame (unhashable)
 def compute_edge_analytics(df, edge_extra):
     out = {}
     bt = df[df['VIX_Close'].notna() & df['SPY_Close'].notna()].copy()
@@ -2205,7 +2290,7 @@ with tab_skew:
                 "Puts": len(puts_t), "Calls": len(calls_t),
             })
         if rows_tbl:
-            st.dataframe(pd.DataFrame(rows_tbl), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(rows_tbl), width="stretch", hide_index=True)
 
     st.caption(
         f"IV calculada con Black-Scholes (Brent) · r={skew_rfr:.1%} · q={skew_div:.1%} · "
@@ -2368,7 +2453,7 @@ with tab_cot:
                 if c in cot_df.columns]
             st.dataframe(
                 cot_df[show_cols].tail(cot_weeks).sort_values("date", ascending=False),
-                use_container_width=True, hide_index=True,
+                width="stretch", hide_index=True,
             )
 
         st.caption(
