@@ -305,22 +305,7 @@ def fetch_edge_extra():
 # VOL SKEW & IV SURFACE — DATA LAYER
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def _make_yf_session():
-    """Sesión requests con headers de browser para evitar rate-limiting de Yahoo Finance."""
-    import requests
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-    })
-    return s
+# _make_yf_session removed: yfinance >=0.2.x requires curl_cffi — do NOT pass requests.Session
 
 
 @st.cache_data(ttl=900)
@@ -357,8 +342,8 @@ def fetch_options_chains(ticker: str = "SPY", n_exp: int = 5) -> tuple:
         return None
 
     try:
-        session = _make_yf_session()
-        t = yf.Ticker(ticker, session=session)
+        # No session= : yfinance maneja curl_cffi internamente
+        t = yf.Ticker(ticker)
 
         # Obtener lista de expiraciones (no suele ser bloqueada)
         try:
