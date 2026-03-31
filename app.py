@@ -12,6 +12,9 @@ from datetime import datetime, timedelta, date
 from io import StringIO
 import re, time, warnings, logging, os
 from zoneinfo import ZoneInfo
+from scipy.optimize import brentq
+from scipy.stats import norm
+from scipy.interpolate import griddata
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
@@ -302,339 +305,312 @@ def fetch_edge_extra():
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# VOL SKEW & IV SURFACE — DATA LAYER
+# VOL SKEW & IV SURFACE — BLACK-SCHOLES IV ENGINE
+# IV calculada desde cero via Brent's method (igual que functions.py
+# del proyecto Volatility Surface de Georgios Drosogiannis).
+# No dependemos de la IV de yfinance (ruidosa/incorrecta).
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# OPTIONS DATA — curl_cffi directo a Yahoo Finance v8 API
-# Evita el wrapper de yfinance que genera 429 por exceso de
-# requests internos. curl_cffi impersona Chrome a nivel TLS.
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def _bs_call(S, X, r, T, v, q):
+    """Black-Scholes call price con dividendo continuo."""
+    if S <= 0 or X <= 0 or T <= 0: return max(S - X, 0.0)
+    if v <= 0: return max(S*np.exp(-q*T) - X*np.exp(-r*T), 0.0)
+    d1 = (np.log(S/X) + (r - q + 0.5*v**2)*T) / (v*np.sqrt(T))
+    d2 = d1 - v*np.sqrt(T)
+    return S*np.exp(-q*T)*norm.cdf(d1) - X*np.exp(-r*T)*norm.cdf(d2)
+
+def _bs_put(S, X, r, T, v, q):
+    """Black-Scholes put price con dividendo continuo."""
+    if S <= 0 or X <= 0 or T <= 0: return max(X - S, 0.0)
+    if v <= 0: return max(X*np.exp(-r*T) - S*np.exp(-q*T), 0.0)
+    d1 = (np.log(S/X) + (r - q + 0.5*v**2)*T) / (v*np.sqrt(T))
+    d2 = d1 - v*np.sqrt(T)
+    return X*np.exp(-r*T)*norm.cdf(-d2) - S*np.exp(-q*T)*norm.cdf(-d1)
+
+def _bs_iv(S, X, r, T, price, option_type, q, tol=1e-6):
+    """IV via Brent's method. Retorna NaN si no converge o fuera de bounds."""
+    if T <= 0 or S <= 0 or X <= 0 or not np.isfinite(price) or price <= 0:
+        return np.nan
+    fn = _bs_call if option_type == "C" else _bs_put
+    # Bounds de precio
+    lo = max(S*np.exp(-q*T) - X*np.exp(-r*T), 0.0) if option_type == "C" \
+         else max(X*np.exp(-r*T) - S*np.exp(-q*T), 0.0)
+    hi = S*np.exp(-q*T) if option_type == "C" else X*np.exp(-r*T)
+    if not (lo <= price <= hi):
+        return np.nan
+    try:
+        iv = brentq(lambda v: price - fn(S, X, r, T, v, q), 1e-6, 5.0, xtol=tol)
+        return np.nan if iv <= tol else iv
+    except (ValueError, RuntimeError):
+        return np.nan
+
+# ─── Fetch raw options (sin IV de yfinance) ─────────────────────────────────
 
 def _yahoo_options_session():
-    """Sesión curl_cffi con impersonación Chrome (TLS fingerprint real)."""
     try:
         from curl_cffi import requests as cffi_req
         return cffi_req.Session(impersonate="chrome120")
     except ImportError:
         return None
 
-
 @st.cache_data(ttl=900)
 def fetch_options_chains(ticker: str = "SPY", n_exp: int = 4) -> tuple:
     """
-    Descarga cadenas de opciones vía curl_cffi directo a la API v8 de Yahoo Finance.
-    Estrategia: una sola sesión con TLS fingerprint de Chrome real → mucho menos 429.
-    Si curl_cffi no está disponible, hace fallback a yfinance con backoff.
-    TTL 15 min.
+    Descarga opciones y devuelve precios RAW (bid, ask, lastPrice).
+    IV se calcula después con BS dado que yfinance's IV es poco fiable.
+    Estrategia: curl_cffi → Yahoo v8 API directo → fallback yfinance.
     """
     log = logging.getLogger("vix_controller")
 
-    # ── Helpers ────────────────────────────────────────────────────────────
-    def _clean_chain(df_raw, spot_px):
+    def _clean(df_raw, spot_px):
         df_c = df_raw.copy()
-        for col in ["impliedVolatility", "openInterest", "volume", "strike"]:
+        for col in ["bid","ask","lastPrice","openInterest","volume","strike"]:
             df_c[col] = pd.to_numeric(df_c.get(col, 0), errors="coerce").fillna(0)
-        df_c = df_c[df_c["impliedVolatility"].between(0.01, 4.5)]
         df_c = df_c[df_c["openInterest"] > 0]
-        df_c = df_c.dropna(subset=["strike", "impliedVolatility"])
+        df_c = df_c[df_c["strike"] > 0]
+        # midPrice: (bid+ask)/2 si ambos disponibles, else lastPrice
+        df_c["midPrice"] = np.where(
+            (df_c["bid"] > 0) & (df_c["ask"] > 0),
+            0.5*(df_c["bid"] + df_c["ask"]),
+            df_c["lastPrice"]
+        )
+        df_c = df_c[df_c["midPrice"] > 0]
+        df_c = df_c.dropna(subset=["strike","midPrice"])
         df_c["moneyness"] = df_c["strike"] / spot_px
         return df_c.sort_values("strike").reset_index(drop=True)
 
-    # ── Intento 1: curl_cffi con impersonación Chrome ──────────────────────
     sess = _yahoo_options_session()
     if sess is not None:
         try:
-            log.info(f"fetch_options_chains {ticker}: usando curl_cffi Chrome impersonation")
-            base_url = f"https://query1.finance.yahoo.com/v8/finance/options/{ticker}"
-            headers = {
-                "Accept": "application/json",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Referer": "https://finance.yahoo.com/",
-                "Origin": "https://finance.yahoo.com",
-            }
-
-            # Primer call: spot + lista de timestamps de expiración
-            resp = sess.get(base_url, headers=headers, timeout=15)
-            resp.raise_for_status()
-            root = resp.json()["optionChain"]["result"][0]
-
+            log.info(f"Options {ticker}: curl_cffi Chrome impersonation")
+            base = f"https://query1.finance.yahoo.com/v8/finance/options/{ticker}"
+            hdrs = {"Accept":"application/json","Referer":"https://finance.yahoo.com/",
+                    "Accept-Language":"en-US,en;q=0.9"}
+            r0   = sess.get(base, headers=hdrs, timeout=15)
+            r0.raise_for_status()
+            root = r0.json()["optionChain"]["result"][0]
             spot = float(root["quote"].get("regularMarketPrice", 0))
-            if not spot:
-                raise ValueError("spot=0 en respuesta Yahoo v8")
-
-            exp_timestamps = root.get("expirationDates", [])
-            if not exp_timestamps:
-                raise ValueError("No expirationDates en respuesta")
-
-            today = date.today()
+            if not spot: raise ValueError("spot=0")
+            timestamps = root.get("expirationDates", [])
+            today  = date.today()
             chains = {}
-            selected = []
-            for ts in exp_timestamps:
-                exp_date = datetime.fromtimestamp(ts).date()
-                dte = (exp_date - today).days
-                if dte >= 7:
-                    selected.append((ts, exp_date.strftime("%Y-%m-%d"), dte))
-            selected = selected[:n_exp]
-
-            for ts, exp_str, dte in selected:
-                time.sleep(0.6)   # suave throttle entre vencimientos
+            sel = sorted(
+                [(ts, datetime.fromtimestamp(ts).date().strftime("%Y-%m-%d"),
+                  (datetime.fromtimestamp(ts).date() - today).days)
+                 for ts in timestamps
+                 if (datetime.fromtimestamp(ts).date() - today).days >= 7],
+                key=lambda x: x[2])[:n_exp]
+            for ts, exp_str, dte in sel:
+                time.sleep(0.6)
                 try:
-                    r = sess.get(f"{base_url}?date={ts}", headers=headers, timeout=15)
-                    r.raise_for_status()
-                    opts = r.json()["optionChain"]["result"][0]["options"][0]
-                    calls_df = pd.DataFrame(opts.get("calls", []))
-                    puts_df  = pd.DataFrame(opts.get("puts",  []))
-                    if calls_df.empty or puts_df.empty:
-                        continue
-                    chains[exp_str] = {
-                        "calls": _clean_chain(calls_df, spot),
-                        "puts":  _clean_chain(puts_df,  spot),
-                        "dte":   dte,
-                    }
-                except Exception as e:
-                    log.warning(f"curl_cffi chain {ticker} {exp_str}: {e}")
-
-            log.info(f"curl_cffi OK: {ticker} {len(chains)} chains · spot={spot:.2f}")
-            return chains, spot
-
+                    rx = sess.get(f"{base}?date={ts}", headers=hdrs, timeout=15)
+                    rx.raise_for_status()
+                    opts = rx.json()["optionChain"]["result"][0]["options"][0]
+                    c_df = _clean(pd.DataFrame(opts.get("calls",[])), spot)
+                    p_df = _clean(pd.DataFrame(opts.get("puts", [])), spot)
+                    if len(c_df) < 3 or len(p_df) < 3: continue
+                    chains[exp_str] = {"calls":c_df,"puts":p_df,"dte":dte}
+                except Exception as ex:
+                    log.warning(f"curl_cffi chain {ticker} {exp_str}: {ex}")
+            if chains:
+                log.info(f"curl_cffi OK {ticker}: {len(chains)} chains · spot={spot:.2f}")
+                return chains, spot
+            log.warning(f"curl_cffi: no chains for {ticker} — fallback yfinance")
         except Exception as e:
-            log.warning(f"curl_cffi falló para {ticker}: {e} — fallback a yfinance")
+            log.warning(f"curl_cffi failed {ticker}: {e} — fallback yfinance")
 
-    # ── Intento 2: yfinance con backoff (fallback) ─────────────────────────
-    log.info(f"fetch_options_chains {ticker}: fallback yfinance")
+    # ── Fallback: yfinance con backoff ─────────────────────────────────────
+    log.info(f"Options {ticker}: yfinance fallback")
     try:
         t = yf.Ticker(ticker)
-
-        def _backoff(fn, label, n=4):
+        def _bo(fn, label, n=4):
             for i in range(n):
-                try:
-                    return fn()
-                except Exception as exc:
-                    if any(k in str(exc).lower() for k in
-                           ["rate limit", "too many", "429", "throttle"]) and i < n-1:
-                        w = 2 ** (i + 1)
-                        log.warning(f"{label} RL→retry {i+1}/{n} en {w}s")
-                        time.sleep(w)
-                    else:
-                        raise
+                try: return fn()
+                except Exception as ex:
+                    if any(k in str(ex).lower() for k in
+                           ["rate limit","too many","429","throttle"]) and i < n-1:
+                        w = 2**(i+1); log.warning(f"{label} RL→{w}s"); time.sleep(w)
+                    else: raise
             return None
-
-        expirations = _backoff(lambda: t.options, f"{ticker}.options")
-        if not expirations:
-            return {}, None
-
+        exps = _bo(lambda: t.options, f"{ticker}.options")
+        if not exps: return {}, None
         time.sleep(0.8)
-        hist = _backoff(lambda: t.history(period="2d"), f"{ticker}.history")
+        hist = _bo(lambda: t.history(period="2d"), f"{ticker}.hist")
         spot = float(hist["Close"].iloc[-1]) if hist is not None and not hist.empty else None
-        if not spot:
-            return {}, None
-
-        today = date.today()
-        chains = {}
-        valid = sorted(
-            [(e, (datetime.strptime(e, "%Y-%m-%d").date() - today).days)
-             for e in expirations
-             if (datetime.strptime(e, "%Y-%m-%d").date() - today).days >= 7],
-            key=lambda x: x[1]
-        )[:n_exp]
-
+        if not spot: return {}, None
+        today  = date.today()
+        valid  = sorted(
+            [(e,(datetime.strptime(e,"%Y-%m-%d").date()-today).days)
+             for e in exps
+             if (datetime.strptime(e,"%Y-%m-%d").date()-today).days >= 7],
+            key=lambda x: x[1])[:n_exp]
         time.sleep(1.0)
-        rl_streak = 0
+        chains = {}; streak = 0
         for exp_str, dte in valid:
-            if rl_streak >= 2:
-                time.sleep(12)
-                rl_streak = 0
+            if streak >= 2: time.sleep(12); streak = 0
             try:
-                chain = _backoff(lambda e=exp_str: t.option_chain(e), f"{ticker}.chain.{exp_str}")
-                if chain is None:
-                    continue
-                rl_streak = 0
+                ch = _bo(lambda e=exp_str: t.option_chain(e), f"{ticker}.chain.{exp_str}")
+                if ch is None: continue
+                streak = 0
                 chains[exp_str] = {
-                    "calls": _clean_chain(chain.calls, spot),
-                    "puts":  _clean_chain(chain.puts,  spot),
+                    "calls": _clean(ch.calls, spot),
+                    "puts":  _clean(ch.puts,  spot),
                     "dte":   dte,
                 }
                 time.sleep(1.5)
             except Exception as ex:
-                if any(k in str(ex).lower() for k in ["rate limit", "too many", "429"]):
-                    rl_streak += 1
-                    log.warning(f"yfinance RL {ticker} {exp_str}")
+                if any(k in str(ex).lower() for k in ["rate limit","too many","429"]):
+                    streak += 1
                 else:
-                    log.warning(f"yfinance chain error {ticker} {exp_str}: {ex}")
-
-        log.info(f"yfinance fallback: {ticker} {len(chains)} chains · spot={spot:.2f}")
+                    log.warning(f"yfinance chain {ticker} {exp_str}: {ex}")
+        log.info(f"yfinance {ticker}: {len(chains)} chains · spot={spot:.2f}")
         return chains, spot
-
     except Exception as e:
         log.error(f"fetch_options_chains {ticker}: {e}")
         return {}, None
 
-# ─── Métricas de skew ──────────────────────────────────────────────────────
+
+def compute_bs_iv_for_chains(chains: dict, spot: float, r: float, q: float) -> dict:
+    """
+    Aplica BS IV (Brent) a cada opción de cada chain.
+    Agrega columna 'iv' (float, annualizado) y filtra NaN.
+    r = risk-free rate anualizado
+    q = dividend yield continuo
+    """
+    result = {}
+    for exp_str, data in chains.items():
+        dte = data["dte"]
+        T   = dte / 365.0
+        if T <= 0:
+            continue
+        for side, opt_type in [("calls","C"), ("puts","P")]:
+            df = data[side].copy()
+            df["iv"] = df.apply(
+                lambda row: _bs_iv(spot, row["strike"], r, T,
+                                   row["midPrice"], opt_type, q),
+                axis=1
+            )
+            df = df[df["iv"].notna() & (df["iv"] > 0.005) & (df["iv"] < 5.0)]
+            data[side] = df.reset_index(drop=True)
+        if len(data["calls"]) >= 3 and len(data["puts"]) >= 3:
+            result[exp_str] = data
+    return result
+
+# ─── Métricas de skew (usa columna 'iv' BS) ────────────────────────────────
 def compute_skew_metrics(chains: dict, spot: float) -> dict:
     """
-    Calcula métricas clave de skew para el vencimiento más próximo con suficiente data.
-    Retorna dict con: atm_iv, rr25 (25d risk reversal), bf25 (butterfly),
-    skew_slope (pendiente %-pts / 10% move), put_call_ratio_vol.
+    Métricas de skew del primer vencimiento válido usando IV Black-Scholes.
     """
     metrics = {}
-    if not chains or not spot:
-        return metrics
+    if not chains or not spot: return metrics
 
-    # Tomar primer vencimiento con ≥5 puts y ≥5 calls
     for exp_str, data in sorted(chains.items(), key=lambda x: x[1]["dte"]):
         puts  = data["puts"]
         calls = data["calls"]
         dte   = data["dte"]
-        if len(puts) < 5 or len(calls) < 5:
-            continue
+        if "iv" not in puts.columns or "iv" not in calls.columns: continue
+        if len(puts) < 5 or len(calls) < 5: continue
 
-        # ATM IV: interpolación lineal alrededor de spot
-        def get_iv_at_moneyness(df, target_m, tol=0.05):
-            sub = df[df["moneyness"].between(target_m - tol, target_m + tol)]
-            if sub.empty:
-                return np.nan
-            # Weighted average por OI
-            w = sub["openInterest"].values
-            iv = sub["impliedVolatility"].values
-            return float(np.average(iv, weights=w)) if w.sum() > 0 else float(iv.mean())
+        def get_iv_at_m(df, target, tol=0.05):
+            sub = df[df["moneyness"].between(target-tol, target+tol)]
+            if sub.empty: return np.nan
+            w = sub["openInterest"].values + 1
+            return float(np.average(sub["iv"].values, weights=w))
 
-        atm_iv  = get_iv_at_moneyness(puts,  1.00, 0.03)
-        if np.isnan(atm_iv):
-            atm_iv = get_iv_at_moneyness(calls, 1.00, 0.03)
+        atm_iv   = get_iv_at_m(puts, 1.00, 0.03)
+        if np.isnan(atm_iv): atm_iv = get_iv_at_m(calls, 1.00, 0.03)
+        put_25d  = get_iv_at_m(puts,  0.90, 0.04)
+        call_25d = get_iv_at_m(calls, 1.10, 0.04)
 
-        # 25-delta proxy: puts ≈ 0.90 moneyness, calls ≈ 1.10
-        put_25d  = get_iv_at_moneyness(puts,  0.90, 0.04)
-        call_25d = get_iv_at_moneyness(calls, 1.10, 0.04)
+        rr25 = (call_25d - put_25d)*100 if not (np.isnan(put_25d) or np.isnan(call_25d)) else np.nan
+        bf25 = ((call_25d+put_25d)/2 - atm_iv)*100 if not np.isnan(atm_iv) else np.nan
 
-        # Risk reversal = call_25d - put_25d  (negativo = put skew dominante)
-        rr25 = (call_25d - put_25d) * 100 if not (np.isnan(put_25d) or np.isnan(call_25d)) else np.nan
-        # Butterfly = (call_25d + put_25d)/2 - atm
-        bf25 = ((call_25d + put_25d) / 2 - atm_iv) * 100 if not np.isnan(atm_iv) else np.nan
-
-        # Skew slope: regresión lineal IV ~ moneyness en puts [0.80, 1.00]
-        slope_puts = puts[puts["moneyness"].between(0.80, 1.00)]
-        if len(slope_puts) >= 3:
-            m_ = slope_puts["moneyness"].values
-            iv_ = slope_puts["impliedVolatility"].values
-            coef = np.polyfit(m_, iv_, 1)[0]
-            skew_slope = coef * 0.10 * 100  # %-pts IV change per 10% move
+        sp = puts[puts["moneyness"].between(0.80, 1.00)]
+        if len(sp) >= 3:
+            coef = np.polyfit(sp["moneyness"].values, sp["iv"].values, 1)[0]
+            skew_slope = coef * 0.10 * 100
         else:
             skew_slope = np.nan
 
-        # P/C ratio (volume)
-        total_put_vol  = puts["volume"].sum()
-        total_call_vol = calls["volume"].sum()
-        pc_ratio = (total_put_vol / total_call_vol) if total_call_vol > 0 else np.nan
+        pc_ratio = (puts["volume"].sum() / calls["volume"].sum()
+                    if calls["volume"].sum() > 0 else np.nan)
 
         metrics = {
-            "exp":        exp_str,
-            "dte":        dte,
-            "atm_iv":     round(atm_iv * 100, 2) if not np.isnan(atm_iv) else None,
-            "put_25d_iv": round(put_25d * 100, 2) if not np.isnan(put_25d) else None,
-            "call_25d_iv":round(call_25d * 100, 2) if not np.isnan(call_25d) else None,
-            "rr25":       round(rr25, 2) if not np.isnan(rr25) else None,
-            "bf25":       round(bf25, 2) if not np.isnan(bf25) else None,
-            "skew_slope": round(skew_slope, 2) if not np.isnan(skew_slope) else None,
-            "pc_ratio":   round(pc_ratio, 3) if not np.isnan(pc_ratio) else None,
+            "exp": exp_str, "dte": dte,
+            "atm_iv":     round(atm_iv*100, 2)  if not np.isnan(atm_iv)    else None,
+            "put_25d_iv": round(put_25d*100, 2)  if not np.isnan(put_25d)   else None,
+            "call_25d_iv":round(call_25d*100,2)  if not np.isnan(call_25d)  else None,
+            "rr25":       round(rr25, 2)          if not np.isnan(rr25)      else None,
+            "bf25":       round(bf25, 2)          if not np.isnan(bf25)      else None,
+            "skew_slope": round(skew_slope, 2)    if not np.isnan(skew_slope)else None,
+            "pc_ratio":   round(pc_ratio, 3)      if not np.isnan(pc_ratio)  else None,
         }
-        break  # usar sólo el primer vencimiento válido
-
+        break
     return metrics
-
 
 # ─── Chart: Skew Curves ────────────────────────────────────────────────────
 SKEW_PALETTE = [
-    "#58A6FF", "#F0883E", "#3FB950", "#BC8CFF",
-    "#39D2C0", "#D29922", "#F85149", "#79C0FF",
+    "#58A6FF","#F0883E","#3FB950","#BC8CFF",
+    "#39D2C0","#D29922","#F85149","#79C0FF",
 ]
 
-def build_skew_curves(chains: dict, spot: float, moneyness_range=(0.75, 1.25)) -> go.Figure:
+def build_skew_curves(chains: dict, spot: float,
+                      moneyness_range=(0.75, 1.25),
+                      y_mode: str = "moneyness") -> go.Figure:
     """
-    Curvas de IV vs Moneyness (K/S) por vencimiento.
-    Combina puts (lado izquierdo) + calls (lado derecho) en una sola curva continua.
+    Curvas IV (BS) vs Moneyness o log-moneyness por vencimiento.
+    y_mode: 'moneyness' → % vs spot | 'log' → ln(K/F)
+    Usa columna 'iv' (BS calculado), no yfinance.
     """
     fig = go.Figure()
-    if not chains or not spot:
-        return fig
-
+    if not chains or not spot: return fig
     lo, hi = moneyness_range
 
-    for idx, (exp_str, data) in enumerate(
-        sorted(chains.items(), key=lambda x: x[1]["dte"])
-    ):
+    for idx, (exp_str, data) in enumerate(sorted(chains.items(), key=lambda x: x[1]["dte"])):
         clr   = SKEW_PALETTE[idx % len(SKEW_PALETTE)]
-        dte   = data["dte"]
-        puts  = data["puts"]
-        calls = data["calls"]
+        dte   = data["dte"]; T = dte / 365.0
+        puts  = data["puts"][data["puts"]["moneyness"].between(lo, 1.02)].copy()
+        calls = data["calls"][data["calls"]["moneyness"].between(0.98, hi)].copy()
+        combined = pd.concat([puts, calls]).drop_duplicates("strike").sort_values("moneyness")
+        if len(combined) < 3: continue
 
-        # Puts: zona izquierda (moneyness < 1.02), calls: zona derecha (≥ 0.98)
-        puts_f  = puts[puts["moneyness"].between(lo, 1.02)].copy()
-        calls_f = calls[calls["moneyness"].between(0.98, hi)].copy()
+        iv_smooth = combined["iv"].rolling(3, min_periods=1, center=True).mean()
 
-        # Merge: preferir puts a la izquierda, calls a la derecha del spot
-        combined = pd.concat([puts_f, calls_f]).drop_duplicates("strike")
-        combined = combined.sort_values("moneyness")
-
-        if len(combined) < 3:
-            continue
-
-        # Suavizado con media rodante si hay ruido
-        iv_smooth = combined["impliedVolatility"].rolling(3, min_periods=1, center=True).mean()
+        if y_mode == "log":
+            F = spot * np.exp(0 * T)   # r, q are baked into iv already
+            x_vals = np.log(combined["strike"].values / spot)  # approx log-moneyness
+            x_label = "Log-moneyness  ln(K/S)"
+            x_suffix = ""
+        else:
+            x_vals  = combined["moneyness"].values * 100 - 100
+            x_label = "% vs Spot  (neg=OTM puts | pos=OTM calls)"
+            x_suffix = "%"
 
         fig.add_trace(go.Scatter(
-            x=combined["moneyness"] * 100 - 100,   # → % OTM/ITM
-            y=iv_smooth * 100,
-            mode="lines+markers",
-            name=f"{exp_str} ({dte}d)",
+            x=x_vals, y=iv_smooth * 100,
+            mode="lines+markers", name=f"{exp_str} ({dte}d)",
             line=dict(color=clr, width=2.5, shape="spline"),
             marker=dict(size=5, color=clr, opacity=0.7),
-            hovertemplate=(
-                f"<b>{exp_str}</b><br>"
-                "Δ Spot: %{x:.1f}%<br>"
-                "IV: %{y:.1f}%<extra></extra>"
-            ),
+            hovertemplate=f"<b>{exp_str}</b><br>x: %{{x:.2f}}{x_suffix}<br>IV(BS): %{{y:.1f}}%<extra></extra>",
         ))
 
-    # Línea ATM
-    fig.add_vline(
-        x=0, line_dash="dash", line_color="#8B949E", line_width=1.5,
-        annotation_text="ATM", annotation_font=dict(size=10, color="#8B949E"),
-    )
-
+    fig.add_vline(x=0, line_dash="dash", line_color="#8B949E", line_width=1.5,
+                  annotation_text="ATM", annotation_font=dict(size=10, color="#8B949E"))
     fig.update_layout(
-        title=dict(
-            text=(
-                "<b>Volatility Skew</b>"
-                "<sup>  IV vs Distancia al Spot · Puts izquierda · Calls derecha</sup>"
-            ),
-            font=dict(size=13, color="#C9D1D9", family="Inter"),
-            x=0.5,
-        ),
-        template="plotly_dark",
-        paper_bgcolor="#0D1117",
-        plot_bgcolor="#161B22",
-        height=420,
-        margin=dict(l=55, r=30, t=60, b=50),
-        xaxis=dict(
-            title=dict(text="% vs Spot  (neg = OTM puts | pos = OTM calls)",
-                       font=dict(size=10, color="#8B949E")),
-            gridcolor="#21262D",
-            zeroline=True, zerolinecolor="#30363D",
-            tickfont=dict(size=10, color="#8B949E", family="JetBrains Mono"),
-            ticksuffix="%",
-        ),
-        yaxis=dict(
-            title=dict(text="Implied Volatility (%)", font=dict(size=10, color="#8B949E")),
-            gridcolor="#21262D",
-            tickfont=dict(size=10, color="#8B949E", family="JetBrains Mono"),
-            ticksuffix="%",
-        ),
-        legend=dict(
-            orientation="v", yanchor="top", y=0.99, xanchor="right", x=0.99,
-            bgcolor="rgba(22,27,34,0.9)", bordercolor="#30363D", borderwidth=1,
-            font=dict(size=9, color="#C9D1D9", family="JetBrains Mono"),
-        ),
+        title=dict(text="<b>Volatility Skew</b><sup>  IV Black-Scholes por vencimiento</sup>",
+                   font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5),
+        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+        height=420, margin=dict(l=55, r=30, t=60, b=50),
+        xaxis=dict(title=dict(text=x_label, font=dict(size=10, color="#8B949E")),
+                   gridcolor="#21262D", zeroline=True, zerolinecolor="#30363D",
+                   tickfont=dict(size=10, color="#8B949E", family="JetBrains Mono")),
+        yaxis=dict(title=dict(text="Implied Volatility BS (%)", font=dict(size=10, color="#8B949E")),
+                   gridcolor="#21262D",
+                   tickfont=dict(size=10, color="#8B949E", family="JetBrains Mono"),
+                   ticksuffix="%"),
+        legend=dict(orientation="v", yanchor="top", y=0.99, xanchor="right", x=0.99,
+                    bgcolor="rgba(22,27,34,0.9)", bordercolor="#30363D", borderwidth=1,
+                    font=dict(size=9, color="#C9D1D9", family="JetBrains Mono")),
         hovermode="x unified",
     )
     return fig
@@ -642,45 +618,24 @@ def build_skew_curves(chains: dict, spot: float, moneyness_range=(0.75, 1.25)) -
 
 # ─── Chart: ATM Term Structure ─────────────────────────────────────────────
 def build_atm_term_structure(chains: dict, spot: float) -> go.Figure:
-    """
-    ATM IV en función del vencimiento (term structure de volatilidad implícita).
-    Complementa la term structure de futuros VIX.
-    """
     fig = go.Figure()
-    if not chains or not spot:
-        return fig
-
+    if not chains or not spot: return fig
     rows = []
     for exp_str, data in sorted(chains.items(), key=lambda x: x[1]["dte"]):
-        puts  = data["puts"]
-        calls = data["calls"]
-        dte   = data["dte"]
-
-        atm_puts  = puts[puts["moneyness"].between(0.97, 1.03)]
-        atm_calls = calls[calls["moneyness"].between(0.97, 1.03)]
-        atm_all   = pd.concat([atm_puts, atm_calls])
-
-        if atm_all.empty:
-            continue
-
-        atm_iv = float(
-            np.average(
-                atm_all["impliedVolatility"].values,
-                weights=atm_all["openInterest"].values + 1,
-            )
-        )
-        rows.append({"dte": dte, "atm_iv": atm_iv * 100, "exp": exp_str})
-
-    if not rows:
-        return fig
-
+        dte = data["dte"]
+        atm = pd.concat([
+            data["puts"][data["puts"]["moneyness"].between(0.97, 1.03)],
+            data["calls"][data["calls"]["moneyness"].between(0.97, 1.03)],
+        ])
+        if atm.empty or "iv" not in atm.columns: continue
+        atm_iv = float(np.average(atm["iv"].values,
+                                  weights=atm["openInterest"].values + 1)) * 100
+        rows.append({"dte":dte,"atm_iv":atm_iv,"exp":exp_str})
+    if not rows: return fig
     df_atm = pd.DataFrame(rows).sort_values("dte")
-
     fig.add_trace(go.Scatter(
-        x=df_atm["dte"],
-        y=df_atm["atm_iv"],
-        mode="lines+markers+text",
-        name="ATM IV",
+        x=df_atm["dte"], y=df_atm["atm_iv"],
+        mode="lines+markers+text", name="ATM IV (BS)",
         line=dict(color="#39D2C0", width=3, shape="spline"),
         marker=dict(size=10, color="#39D2C0", line=dict(width=2, color="#0D1117")),
         text=[f"{v:.1f}%" for v in df_atm["atm_iv"]],
@@ -688,272 +643,256 @@ def build_atm_term_structure(chains: dict, spot: float) -> go.Figure:
         textfont=dict(size=9, color="#C9D1D9", family="JetBrains Mono"),
         hovertemplate="DTE: %{x}d<br>ATM IV: %{y:.2f}%<extra></extra>",
     ))
-
-    # Línea de referencia VIX (~30d IV del mercado)
     fig.update_layout(
-        title=dict(
-            text=(
-                "<b>ATM IV Term Structure</b>"
-                "<sup>  Volatilidad implícita en el dinero por vencimiento</sup>"
-            ),
-            font=dict(size=13, color="#C9D1D9", family="Inter"),
-            x=0.5,
-        ),
-        template="plotly_dark",
-        paper_bgcolor="#0D1117",
-        plot_bgcolor="#161B22",
-        height=300,
-        margin=dict(l=55, r=30, t=60, b=50),
-        xaxis=dict(
-            title=dict(text="Días al Vencimiento (DTE)", font=dict(size=10, color="#8B949E")),
-            gridcolor="#21262D",
-            tickfont=dict(size=10, color="#8B949E", family="JetBrains Mono"),
-        ),
-        yaxis=dict(
-            title=dict(text="ATM IV (%)", font=dict(size=10, color="#8B949E")),
-            gridcolor="#21262D",
-            tickfont=dict(size=10, color="#8B949E", family="JetBrains Mono"),
-            ticksuffix="%",
-        ),
-        hovermode="x unified",
-        showlegend=False,
+        title=dict(text="<b>ATM IV Term Structure</b><sup>  IV en el dinero por vencimiento</sup>",
+                   font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5),
+        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+        height=300, margin=dict(l=55, r=30, t=60, b=50),
+        xaxis=dict(title=dict(text="Días al Vencimiento (DTE)", font=dict(size=10, color="#8B949E")),
+                   gridcolor="#21262D",
+                   tickfont=dict(size=10, color="#8B949E", family="JetBrains Mono")),
+        yaxis=dict(title=dict(text="ATM IV (%)", font=dict(size=10, color="#8B949E")),
+                   gridcolor="#21262D",
+                   tickfont=dict(size=10, color="#8B949E", family="JetBrains Mono"),
+                   ticksuffix="%"),
+        hovermode="x unified", showlegend=False,
     )
     return fig
 
 
-# ─── Chart: IV Surface (3D) ────────────────────────────────────────────────
+# ─── Chart: IV Surface 3D (griddata — método del otro proyecto) ────────────
 def build_iv_surface(chains: dict, spot: float,
-                     moneyness_range=(0.80, 1.20), n_strike_bins=40) -> go.Figure:
+                     moneyness_range=(0.80, 1.20), n_grid=40,
+                     y_mode="moneyness") -> go.Figure:
     """
-    Superficie de volatilidad implícita en 3D:
-    X = Moneyness (K/S en %), Y = DTE, Z = IV (%)
-    Construye una grilla regular por interpolación lineal sobre los datos reales.
+    Superficie 3D con scipy.griddata (lineal + nearest fallback).
+    X = DTE, Y = moneyness o log-moneyness, Z = IV% BS.
+    Mismo método que Volatility Surface de Drosogiannis.
     """
     fig = go.Figure()
-    if not chains or not spot:
-        return fig
-
+    if not chains or not spot: return fig
     lo, hi = moneyness_range
-    all_points = []
 
+    all_X, all_Y, all_Z = [], [], []
     for exp_str, data in chains.items():
-        dte   = data["dte"]
-        puts  = data["puts"]
-        calls = data["calls"]
+        dte = data["dte"]
+        pts = pd.concat([
+            data["puts"][data["puts"]["moneyness"].between(lo, 1.02)],
+            data["calls"][data["calls"]["moneyness"].between(0.98, hi)],
+        ]).drop_duplicates("strike")
+        if len(pts) < 4 or "iv" not in pts.columns: continue
+        if y_mode == "log":
+            y_vals = np.log(pts["strike"].values / spot)
+        else:
+            y_vals = pts["moneyness"].values * 100 - 100   # % vs spot
+        all_X.extend([dte] * len(pts))
+        all_Y.extend(y_vals.tolist())
+        all_Z.extend((pts["iv"].values * 100).tolist())
 
-        # Puts para moneyness < 1, calls para moneyness ≥ 1
-        p_f = puts[puts["moneyness"].between(lo, 1.02)][["moneyness", "impliedVolatility"]].copy()
-        c_f = calls[calls["moneyness"].between(0.98, hi)][["moneyness", "impliedVolatility"]].copy()
+    if len(all_X) < 8: return fig
+    X = np.array(all_X); Y = np.array(all_Y); Z = np.array(all_Z)
 
-        combo = pd.concat([p_f, c_f]).drop_duplicates("moneyness").sort_values("moneyness")
-        if len(combo) < 4:
-            continue
+    # Grid regular
+    xi = np.linspace(X.min(), X.max(), n_grid)
+    yi = np.linspace(Y.min(), Y.max(), n_grid)
+    xi_g, yi_g = np.meshgrid(xi, yi)
 
-        combo["dte"] = dte
-        all_points.append(combo)
+    zi = griddata((X, Y), Z, (xi_g, yi_g), method="linear")
+    zi2 = griddata((X, Y), Z, (xi_g, yi_g), method="nearest")
+    zi  = np.where(np.isnan(zi), zi2, zi)   # fill NaN con nearest
 
-    if not all_points:
-        return fig
-
-    pts = pd.concat(all_points, ignore_index=True)
-    pts["iv_pct"] = pts["impliedVolatility"] * 100
-
-    # Crear grilla regular
-    mon_grid = np.linspace(lo, hi, n_strike_bins)
-    dte_vals  = sorted(pts["dte"].unique())
-
-    grid_rows = []
-    for dte_val in dte_vals:
-        slice_df = pts[pts["dte"] == dte_val].sort_values("moneyness")
-        if len(slice_df) < 3:
-            continue
-        # Interpolación lineal al grid de moneyness
-        iv_interp = np.interp(
-            mon_grid,
-            slice_df["moneyness"].values,
-            slice_df["iv_pct"].values,
-            left=np.nan, right=np.nan,
-        )
-        grid_rows.append(iv_interp)
-
-    if not grid_rows:
-        return fig
-
-    Z = np.array(grid_rows)       # shape: (n_dte, n_strikes)
-    X = mon_grid * 100 - 100      # % vs spot
-    Y = np.array(dte_vals)
-
-    # Suavizar filas con media rodante
-    from numpy.lib.stride_tricks import sliding_window_view
-    for i in range(Z.shape[0]):
-        row = Z[i]
-        valid = ~np.isnan(row)
-        if valid.sum() > 5:
-            kernel = np.ones(5) / 5
-            row[valid] = np.convolve(row[valid], kernel, mode="same")
-        Z[i] = row
+    y_label = "Log-moneyness ln(K/S)" if y_mode == "log" else "% vs Spot"
 
     fig.add_trace(go.Surface(
-        x=X,
-        y=Y,
-        z=Z,
+        x=xi, y=yi, z=zi,
         colorscale=[
-            [0.0,  "#1a237e"],
-            [0.15, "#1565C0"],
-            [0.30, "#0288D1"],
-            [0.45, "#00ACC1"],
-            [0.55, "#3FB950"],
-            [0.65, "#D29922"],
-            [0.80, "#F0883E"],
-            [1.0,  "#F85149"],
+            [0.0,"#1a237e"],[0.15,"#1565C0"],[0.30,"#0288D1"],
+            [0.45,"#00ACC1"],[0.55,"#3FB950"],[0.65,"#D29922"],
+            [0.80,"#F0883E"],[1.0,"#F85149"],
         ],
-        colorbar=dict(
-            title=dict(text="IV %", font=dict(color="#8B949E", size=10)),
-            tickfont=dict(color="#8B949E", size=9),
-            len=0.6, thickness=12,
-        ),
-        contours=dict(
-            z=dict(show=True, usecolormap=True, highlightcolor="#F0F6FC", project_z=False),
-        ),
-        hovertemplate=(
-            "Δ Spot: %{x:.1f}%<br>"
-            "DTE: %{y}d<br>"
-            "IV: %{z:.1f}%<extra></extra>"
-        ),
+        colorbar=dict(title=dict(text="IV %", font=dict(color="#8B949E",size=10)),
+                      tickfont=dict(color="#8B949E",size=9), len=0.6, thickness=12),
+        hovertemplate="DTE: %{x:.0f}d<br>Y: %{y:.2f}<br>IV: %{z:.1f}%<extra></extra>",
         opacity=0.92,
     ))
-
     fig.update_layout(
-        title=dict(
-            text="<b>Implied Volatility Surface</b>",
-            font=dict(size=14, color="#C9D1D9", family="Inter"),
-            x=0.5,
-        ),
+        title=dict(text="<b>Implied Volatility Surface</b><sup>  IV Black-Scholes · griddata interpolation</sup>",
+                   font=dict(size=14, color="#C9D1D9", family="Inter"), x=0.5),
         scene=dict(
-            xaxis=dict(
-                title="% vs Spot",
-                gridcolor="#30363D", backgroundcolor="#0D1117",
-                tickfont=dict(size=9, color="#8B949E"),
-            ),
-            yaxis=dict(
-                title="DTE (días)",
-                gridcolor="#30363D", backgroundcolor="#0D1117",
-                tickfont=dict(size=9, color="#8B949E"),
-            ),
-            zaxis=dict(
-                title="IV (%)",
-                gridcolor="#30363D", backgroundcolor="#0D1117",
-                tickfont=dict(size=9, color="#8B949E"),
-            ),
+            xaxis=dict(title="DTE (días)", gridcolor="#30363D", backgroundcolor="#0D1117",
+                       tickfont=dict(size=9, color="#8B949E")),
+            yaxis=dict(title=y_label, gridcolor="#30363D", backgroundcolor="#0D1117",
+                       tickfont=dict(size=9, color="#8B949E")),
+            zaxis=dict(title="IV (%)", gridcolor="#30363D", backgroundcolor="#0D1117",
+                       tickfont=dict(size=9, color="#8B949E")),
             bgcolor="#0D1117",
-            camera=dict(
-                eye=dict(x=-1.6, y=-1.6, z=0.9),
-                up=dict(x=0, y=0, z=1),
-            ),
+            camera=dict(eye=dict(x=-1.6, y=-1.6, z=0.9), up=dict(x=0,y=0,z=1)),
         ),
-        paper_bgcolor="#0D1117",
-        height=520,
-        margin=dict(l=0, r=0, t=50, b=0),
+        paper_bgcolor="#0D1117", height=520, margin=dict(l=0,r=0,t=50,b=0),
     )
     return fig
 
 
-# ─── Chart: IV Heatmap (2D) ────────────────────────────────────────────────
+# ─── Chart: IV Heatmap 2D ──────────────────────────────────────────────────
 def build_iv_heatmap(chains: dict, spot: float,
                      moneyness_range=(0.82, 1.18), n_bins=35) -> go.Figure:
-    """
-    Heatmap 2D: filas = DTE, columnas = Moneyness, color = IV%.
-    Más legible que la superficie 3D para análisis cuantitativo.
-    """
     fig = go.Figure()
-    if not chains or not spot:
-        return fig
-
+    if not chains or not spot: return fig
     lo, hi = moneyness_range
     mon_grid = np.linspace(lo, hi, n_bins)
-    dte_vals, iv_rows, labels_x = [], [], []
+    dte_vals, iv_rows = [], []
 
     for exp_str, data in sorted(chains.items(), key=lambda x: x[1]["dte"]):
-        dte   = data["dte"]
-        pts_p = data["puts"][data["puts"]["moneyness"].between(lo, 1.02)]
-        pts_c = data["calls"][data["calls"]["moneyness"].between(0.98, hi)]
-        combo = pd.concat([pts_p, pts_c]).drop_duplicates("moneyness").sort_values("moneyness")
-        if len(combo) < 3:
-            continue
+        dte = data["dte"]
+        pts = pd.concat([
+            data["puts"][data["puts"]["moneyness"].between(lo, 1.02)],
+            data["calls"][data["calls"]["moneyness"].between(0.98, hi)],
+        ]).drop_duplicates("moneyness").sort_values("moneyness")
+        if len(pts) < 3 or "iv" not in pts.columns: continue
+        iv_interp = np.interp(mon_grid, pts["moneyness"].values,
+                              pts["iv"].values * 100, left=np.nan, right=np.nan)
+        dte_vals.append(dte); iv_rows.append(iv_interp)
 
-        iv_interp = np.interp(
-            mon_grid,
-            combo["moneyness"].values,
-            (combo["impliedVolatility"] * 100).values,
-            left=np.nan, right=np.nan,
-        )
-        dte_vals.append(dte)
-        iv_rows.append(iv_interp)
-
-    if not iv_rows:
-        return fig
-
+    if not iv_rows: return fig
     Z = np.array(iv_rows)
     labels_x = [f"{(m*100-100):+.0f}%" for m in mon_grid]
     labels_y = [f"{d}d" for d in dte_vals]
 
+    atm_idx = int(np.argmin(np.abs(mon_grid - 1.0)))
     fig.add_trace(go.Heatmap(
-        z=Z,
-        x=labels_x,
-        y=labels_y,
-        colorscale=[
-            [0.0,  "#1565C0"],
-            [0.25, "#0288D1"],
-            [0.50, "#3FB950"],
-            [0.70, "#D29922"],
-            [0.85, "#F0883E"],
-            [1.0,  "#F85149"],
-        ],
-        colorbar=dict(
-            title=dict(text="IV %", font=dict(color="#8B949E", size=10)),
-            tickfont=dict(color="#8B949E", size=9),
-            len=0.8, thickness=14,
-        ),
+        z=Z, x=labels_x, y=labels_y,
+        colorscale=[[0.0,"#1565C0"],[0.25,"#0288D1"],[0.50,"#3FB950"],
+                    [0.70,"#D29922"],[0.85,"#F0883E"],[1.0,"#F85149"]],
+        colorbar=dict(title=dict(text="IV %",font=dict(color="#8B949E",size=10)),
+                      tickfont=dict(color="#8B949E",size=9), len=0.8, thickness=14),
         hoverongaps=False,
-        hovertemplate="Δ Spot: %{x}<br>DTE: %{y}<br>IV: %{z:.1f}%<extra></extra>",
+        hovertemplate="Δ Spot: %{x}<br>DTE: %{y}<br>IV(BS): %{z:.1f}%<extra></extra>",
         xgap=1, ygap=1,
     ))
-
-    # Marcar columna ATM (moneyness = 1 → +0%)
-    atm_idx = int(np.argmin(np.abs(mon_grid - 1.0)))
-    fig.add_vline(
-        x=labels_x[atm_idx],
-        line_dash="dash", line_color="#8B949E", line_width=1.5,
-        annotation_text="ATM", annotation_font=dict(size=9, color="#8B949E"),
-    )
-
+    fig.add_vline(x=labels_x[atm_idx], line_dash="dash", line_color="#8B949E",
+                  line_width=1.5,
+                  annotation_text="ATM", annotation_font=dict(size=9, color="#8B949E"))
     fig.update_layout(
-        title=dict(
-            text=(
-                "<b>IV Surface — Heatmap</b>"
-                "<sup>  Filas = DTE · Columnas = % vs Spot · Color = IV%</sup>"
-            ),
-            font=dict(size=13, color="#C9D1D9", family="Inter"),
-            x=0.5,
-        ),
-        template="plotly_dark",
-        paper_bgcolor="#0D1117",
-        plot_bgcolor="#161B22",
-        height=380,
-        margin=dict(l=55, r=20, t=60, b=60),
-        xaxis=dict(
-            tickfont=dict(size=8, color="#8B949E", family="JetBrains Mono"),
-            title=dict(text="Distancia al Spot", font=dict(size=10, color="#8B949E")),
-            tickangle=-45,
-        ),
-        yaxis=dict(
-            tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono"),
-            title=dict(text="DTE", font=dict(size=10, color="#8B949E")),
-            autorange="reversed",
-        ),
+        title=dict(text="<b>IV Surface — Heatmap</b><sup>  Filas=DTE · Columnas=%Spot · Color=IV(BS)%</sup>",
+                   font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5),
+        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+        height=380, margin=dict(l=55, r=20, t=60, b=60),
+        xaxis=dict(tickfont=dict(size=8,color="#8B949E",family="JetBrains Mono"),
+                   title=dict(text="Distancia al Spot",font=dict(size=10,color="#8B949E")),
+                   tickangle=-45),
+        yaxis=dict(tickfont=dict(size=9,color="#8B949E",family="JetBrains Mono"),
+                   title=dict(text="DTE",font=dict(size=10,color="#8B949E")),
+                   autorange="reversed"),
     )
     return fig
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# COT — Commitments of Traders via cot_reports library
+# Fuente: CFTC "Traders in Financial Futures" report
+# VIX Futures: buscamos "VIX" en Market and Exchange Names
+# Leveraged Funds ≈ Managed Money (hedge funds / CTAs)
+# Asset Manager ≈ Institucionales pasivos
+# Publicación: cada martes ~15:30 ET con datos del martes anterior
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@st.cache_data(ttl=3600 * 6)
+def fetch_cot_vix(n_weeks: int = 104) -> pd.DataFrame:
+    """
+    Descarga el COT de Traders in Financial Futures para VIX via cot_reports.
+    Columnas clave:
+      - mm_long / mm_short   : Leveraged Funds (hedge funds/CTAs)
+      - asset_long / short   : Asset Managers (institucionales)
+      - dealer_long / short  : Dealer Intermediaries
+      - net_mm               : Leveraged Funds net
+      - net_mm_pct           : % del Open Interest
+    """
+    log = logging.getLogger("vix_controller")
+    try:
+        import cot_reports
+    except ImportError:
+        log.error("cot_reports no instalado. Agrega 'cot_reports' a requirements.txt")
+        return pd.DataFrame()
+
+    try:
+        current_year = datetime.now().year
+        years_needed = max(1, (n_weeks // 52) + 2)
+        frames = []
+        for yr in range(current_year - years_needed + 1, current_year + 1):
+            try:
+                df_yr = cot_reports.cot_year(
+                    year=yr,
+                    cot_report_type="traders_in_financial_futures_fut"
+                )
+                frames.append(df_yr)
+                log.info(f"COT: año {yr} OK ({len(df_yr)} filas)")
+            except Exception as e:
+                log.warning(f"COT año {yr}: {e}")
+                continue
+
+        if not frames:
+            log.error("COT: no se pudo descargar ningún año")
+            return pd.DataFrame()
+
+        df = pd.concat(frames, ignore_index=True)
+
+        # Filtrar VIX futures
+        mask = df["Market and Exchange Names"].str.contains("VIX", case=False, na=False)
+        df   = df[mask].copy()
+        if df.empty:
+            log.error("COT: no se encontraron filas de VIX futures")
+            return pd.DataFrame()
+
+        # Parsear fecha
+        date_col = "As of Date in Form YYYY-MM-DD"
+        if date_col in df.columns:
+            df["date"] = pd.to_datetime(df[date_col], errors="coerce")
+        else:
+            # Alternativa: buscar columna con fecha
+            date_cols = [c for c in df.columns if "date" in c.lower() or "yyyy" in c.lower()]
+            df["date"] = pd.to_datetime(df[date_cols[0]], errors="coerce") if date_cols else pd.NaT
+
+        df = df.sort_values("date").reset_index(drop=True)
+
+        # Renombrar columnas (TFF report)
+        col_map = {
+            "Open Interest (All)":                        "oi",
+            "Leveraged Funds-Long (All)":                 "mm_long",
+            "Leveraged Funds-Short (All)":                "mm_short",
+            "Leveraged Funds-Spreading (All)":            "mm_spread",
+            "Asset Manager/Institutional-Long (All)":     "asset_long",
+            "Asset Manager/Institutional-Short (All)":    "asset_short",
+            "Dealer Intermediary-Long (All)":             "dealer_long",
+            "Dealer Intermediary-Short (All)":            "dealer_short",
+            "Other Reportables-Long (All)":               "other_long",
+            "Other Reportables-Short (All)":              "other_short",
+        }
+        df = df.rename(columns={k:v for k,v in col_map.items() if k in df.columns})
+
+        # Convertir a numérico
+        for c in ["oi","mm_long","mm_short","mm_spread","asset_long","asset_short",
+                  "dealer_long","dealer_short","other_long","other_short"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+
+        # Métricas derivadas
+        if "mm_long" in df.columns and "mm_short" in df.columns:
+            df["net_mm"]     = df["mm_long"] - df["mm_short"]
+            df["net_mm_pct"] = (df["net_mm"] / df["oi"] * 100).where(df["oi"] > 0)
+            df["net_mm_pct_pctile"] = df["net_mm_pct"].rank(pct=True) * 100
+
+        if "dealer_long" in df.columns and "dealer_short" in df.columns:
+            df["net_dealer"] = df["dealer_long"] - df["dealer_short"]
+
+        if "asset_long" in df.columns and "asset_short" in df.columns:
+            df["net_commercial"] = df["asset_long"] - df["asset_short"]
+
+        last_ok = df["date"].dropna().iloc[-1].strftime("%Y-%m-%d") if not df["date"].dropna().empty else "?"
+        log.info(f"COT VIX (TFF): {len(df)} semanas · última: {last_ok}")
+        return df.tail(n_weeks).reset_index(drop=True)
+
+    except Exception as e:
+        log.error(f"fetch_cot_vix: {e}")
+        return pd.DataFrame()
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # COT — Commitments of Traders (CFTC Public API)
@@ -969,275 +908,6 @@ COT_LEGACY_ID  = "6dca-aqww"                     # Legacy (si disagg falla)
 
 
 @st.cache_data(ttl=3600 * 6)  # 6h — datos semanales, no cambian intraday
-def fetch_cot_vix(n_weeks: int = 104) -> pd.DataFrame:
-    """
-    Descarga el COT disaggregado para VIX futures (código 1170E1) via CFTC Socrata API.
-    Columnas clave:
-      - mm_long / mm_short  : Managed Money (especuladores institucionales)
-      - dealer_long / short : Swap Dealers
-      - prod_long / short   : Producers / Commercial hedgers
-      - oi                  : Open Interest total
-      - net_mm              : MM long - MM short (posicionamiento neto especulador)
-      - net_mm_pct          : net_mm / OI * 100  (% del OI)
-    """
-    log = logging.getLogger("vix_controller")
-    import json
-
-    try:
-        import urllib.request
-        url = (
-            f"{COT_API_BASE}/{COT_DISAGG_ID}.json"
-            f"?cftc_contract_market_code={COT_VIX_CODE}"
-            f"&$limit={n_weeks}"
-            f"&$order=report_date_as_yyyy_mm_dd%20DESC"
-        )
-        log.info(f"COT fetch: {url}")
-        req = urllib.request.Request(
-            url,
-            headers={"Accept": "application/json",
-                     "User-Agent": "Mozilla/5.0 (compatible; VIXController/1.0)"},
-        )
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            raw = json.loads(resp.read().decode())
-
-        if not raw:
-            log.warning("COT: respuesta vacía del disaggregated endpoint")
-            return pd.DataFrame()
-
-        df = pd.DataFrame(raw)
-
-        # Mapeo de columnas del disaggregated report
-        col_map = {
-            "report_date_as_yyyy_mm_dd":        "date",
-            "open_interest_all":                 "oi",
-            "m_money_positions_long_all":        "mm_long",
-            "m_money_positions_short_all":       "mm_short",
-            "m_money_positions_spread_all":      "mm_spread",
-            "swap_positions_long_all":           "dealer_long",
-            "swap__positions_short_all":         "dealer_short",
-            "prod_merc_positions_long_all":      "prod_long",
-            "prod_merc_positions_short_all":     "prod_short",
-            "tot_rept_positions_long_all":       "rept_long",
-            "tot_rept_positions_short_all":      "rept_short",
-            "nonrept_positions_long_all":        "nonrept_long",
-            "nonrept_positions_short_all":       "nonrept_short",
-        }
-        # Renombrar sólo las columnas que existen
-        df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
-
-        # Parsear tipos
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        for c in ["oi","mm_long","mm_short","mm_spread","dealer_long","dealer_short",
-                  "prod_long","prod_short","rept_long","rept_short",
-                  "nonrept_long","nonrept_short"]:
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-
-        df = df.sort_values("date").reset_index(drop=True)
-
-        # Métricas derivadas
-        if "mm_long" in df.columns and "mm_short" in df.columns:
-            df["net_mm"]      = df["mm_long"] - df["mm_short"]
-            df["net_mm_pct"]  = (df["net_mm"] / df["oi"] * 100).where(df["oi"] > 0)
-
-        if "dealer_long" in df.columns and "dealer_short" in df.columns:
-            df["net_dealer"]  = df["dealer_long"] - df["dealer_short"]
-
-        if "prod_long" in df.columns and "prod_short" in df.columns:
-            df["net_commercial"] = df["prod_long"] - df["prod_short"]
-
-        # Percentiles históricos (2y rolling)
-        if "net_mm_pct" in df.columns:
-            df["net_mm_pct_pctile"] = df["net_mm_pct"].rank(pct=True) * 100
-
-        log.info(f"COT VIX: {len(df)} semanas · última fecha: {df['date'].iloc[-1].date()}")
-        return df
-
-    except Exception as e:
-        log.error(f"fetch_cot_vix: {e}")
-        return pd.DataFrame()
-
-
-def build_cot_positioning_chart(cot: pd.DataFrame, window: int = 104) -> go.Figure:
-    """
-    Gráfico principal COT: posicionamiento neto de Managed Money y Dealers
-    sobre el OI total. Barras Net MM + línea Net Dealer.
-    """
-    fig = go.Figure()
-    if cot.empty or "net_mm" not in cot.columns:
-        return fig
-
-    p = cot.tail(window).dropna(subset=["net_mm"])
-
-    # Colores por signo
-    bar_colors = ["#3FB950" if v >= 0 else "#F85149" for v in p["net_mm"]]
-
-    fig.add_trace(go.Bar(
-        x=p["date"], y=p["net_mm"],
-        name="Net Managed Money",
-        marker_color=bar_colors,
-        opacity=0.75,
-        hovertemplate="%{x|%Y-%m-%d}<br>Net MM: %{y:,.0f} contratos<extra></extra>",
-    ))
-
-    if "net_dealer" in p.columns:
-        fig.add_trace(go.Scatter(
-            x=p["date"], y=p["net_dealer"],
-            name="Net Dealers (Swap)",
-            line=dict(color="#58A6FF", width=2),
-            hovertemplate="%{x|%Y-%m-%d}<br>Net Dealer: %{y:,.0f}<extra></extra>",
-        ))
-
-    if "net_commercial" in p.columns:
-        fig.add_trace(go.Scatter(
-            x=p["date"], y=p["net_commercial"],
-            name="Net Commercial",
-            line=dict(color="#D29922", width=1.5, dash="dot"),
-            hovertemplate="%{x|%Y-%m-%d}<br>Net Comm: %{y:,.0f}<extra></extra>",
-        ))
-
-    fig.add_hline(y=0, line_dash="dash", line_color="#484F58", line_width=1.5)
-
-    fig.update_layout(
-        title=dict(
-            text=(
-                "<b>COT — Posicionamiento Neto en Futuros VIX</b>"
-                "<sup>  Managed Money (especuladores) · verde=net long vol · rojo=net short vol</sup>"
-            ),
-            font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5,
-        ),
-        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
-        height=360, margin=dict(l=55, r=30, t=60, b=40),
-        xaxis=dict(gridcolor="#21262D",
-                   tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono"),
-                   rangeselector=dict(
-                       buttons=[
-                           dict(count=6,  label="6M", step="month", stepmode="backward"),
-                           dict(count=1,  label="1A", step="year",  stepmode="backward"),
-                           dict(count=2,  label="2A", step="year",  stepmode="backward"),
-                           dict(step="all", label="Todo"),
-                       ],
-                       bgcolor="#161B22", activecolor="#F7931A",
-                       font=dict(size=9, color="#C9D1D9", family="JetBrains Mono"),
-                   )),
-        yaxis=dict(
-            title=dict(text="Contratos netos", font=dict(size=10, color="#8B949E")),
-            gridcolor="#21262D",
-            tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono"),
-        ),
-        legend=dict(orientation="h", y=1.02, bgcolor="rgba(0,0,0,0)",
-                    font=dict(size=9, color="#C9D1D9", family="JetBrains Mono")),
-        hovermode="x unified", bargap=0.15,
-    )
-    return fig
-
-
-def build_cot_oi_chart(cot: pd.DataFrame, window: int = 104) -> go.Figure:
-    """Open Interest total de futuros VIX + Net MM % del OI (eje secundario)."""
-    fig = go.Figure()
-    if cot.empty or "oi" not in cot.columns:
-        return fig
-
-    p = cot.tail(window).dropna(subset=["oi"])
-
-    fig.add_trace(go.Scatter(
-        x=p["date"], y=p["oi"],
-        name="Open Interest",
-        fill="tozeroy",
-        line=dict(color="#39D2C0", width=2),
-        fillcolor="rgba(57,210,192,0.12)",
-        hovertemplate="%{x|%Y-%m-%d}<br>OI: %{y:,.0f}<extra></extra>",
-    ))
-
-    if "net_mm_pct" in p.columns:
-        fig.add_trace(go.Scatter(
-            x=p["date"], y=p["net_mm_pct"],
-            name="Net MM % del OI",
-            yaxis="y2",
-            line=dict(color="#BC8CFF", width=2),
-            hovertemplate="%{x|%Y-%m-%d}<br>Net MM%%: %{y:.1f}%%<extra></extra>",
-        ))
-        fig.add_hline(y=0, yref="y2", line_dash="dot", line_color="#484F58",
-                      line_width=1)
-
-    fig.update_layout(
-        title=dict(
-            text=(
-                "<b>Open Interest VIX Futures + Net MM %</b>"
-                "<sup>  OI creciente + MM net long = mercado pagando prima de vol</sup>"
-            ),
-            font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5,
-        ),
-        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
-        height=300, margin=dict(l=55, r=60, t=60, b=40),
-        xaxis=dict(gridcolor="#21262D",
-                   tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono")),
-        yaxis=dict(title=dict(text="OI (contratos)", font=dict(size=10, color="#39D2C0")),
-                   gridcolor="#21262D",
-                   tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono")),
-        yaxis2=dict(title=dict(text="Net MM % OI", font=dict(size=10, color="#BC8CFF")),
-                    overlaying="y", side="right",
-                    tickfont=dict(size=9, color="#BC8CFF"), showgrid=False,
-                    zeroline=True, zerolinecolor="#30363D"),
-        legend=dict(orientation="h", y=1.02, bgcolor="rgba(0,0,0,0)",
-                    font=dict(size=9, color="#C9D1D9", family="JetBrains Mono")),
-        hovermode="x unified",
-    )
-    return fig
-
-
-def build_cot_breakdown_chart(cot: pd.DataFrame, window: int = 52) -> go.Figure:
-    """
-    Breakdown apilado: longs y shorts de cada categoría en el último año.
-    """
-    fig = go.Figure()
-    if cot.empty:
-        return fig
-
-    p = cot.tail(window)
-
-    CATS = [
-        ("mm_long",   "mm_short",   "Managed Money",  "#3FB950", "#F85149"),
-        ("dealer_long","dealer_short","Swap Dealers",  "#58A6FF", "#F0883E"),
-        ("prod_long", "prod_short",  "Commercial",    "#39D2C0", "#BC8CFF"),
-    ]
-
-    for long_col, short_col, label, c_long, c_short in CATS:
-        if long_col not in p.columns:
-            continue
-        fig.add_trace(go.Scatter(
-            x=p["date"], y=p[long_col],
-            name=f"{label} Long",
-            line=dict(color=c_long, width=1.5),
-            hovertemplate=f"{label} Long: %{{y:,.0f}}<extra></extra>",
-        ))
-        if short_col in p.columns:
-            fig.add_trace(go.Scatter(
-                x=p["date"], y=-p[short_col],
-                name=f"{label} Short",
-                line=dict(color=c_short, width=1.5, dash="dot"),
-                hovertemplate=f"{label} Short: %{{y:,.0f}}<extra></extra>",
-            ))
-
-    fig.add_hline(y=0, line_dash="solid", line_color="#484F58", line_width=1)
-    fig.update_layout(
-        title=dict(
-            text="<b>COT — Breakdown por Categoría</b>"
-                 "<sup>  Longs arriba · Shorts invertidos abajo</sup>",
-            font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5,
-        ),
-        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
-        height=320, margin=dict(l=55, r=30, t=60, b=40),
-        xaxis=dict(gridcolor="#21262D",
-                   tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono")),
-        yaxis=dict(gridcolor="#21262D",
-                   tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono")),
-        legend=dict(orientation="h", y=1.02, bgcolor="rgba(0,0,0,0)",
-                    font=dict(size=8, color="#C9D1D9", family="JetBrains Mono")),
-        hovermode="x unified",
-    )
-    return fig
-
 def compute_edge_analytics(df, edge_extra):
     out = {}
     bt = df[df['VIX_Close'].notna() & df['SPY_Close'].notna()].copy()
@@ -2362,238 +2032,184 @@ with tab_edge:
 # ━━━━━━━━━━━━━━━━━ TAB: VOL SKEW & SURFACE ━━━━━━━━━━━━━━━━━
 with tab_skew:
 
-    # ── Controls ──────────────────────────────────────────────
-    col_ctrl1, col_ctrl2, col_ctrl3, col_ctrl4 = st.columns([1, 1, 1, 1])
-    with col_ctrl1:
+    # ── Controles ─────────────────────────────────────────────
+    col_c1, col_c2, col_c3, col_c4 = st.columns([1,1,1,1])
+    with col_c1:
         skew_ticker = st.selectbox(
-            "Subyacente",
-            ["SPY", "QQQ", "IWM", "GLD", "TLT"],
-            index=0,
-            help="SPY es el proxy más líquido para el mercado amplio",
+            "Subyacente", ["SPY","QQQ","IWM","GLD","TLT"], index=0,
+            help="SPY = mayor liquidez de opciones",
         )
-    with col_ctrl2:
-        n_exps = st.slider("Nº Vencimientos", 2, 6, 4, help="Menos vencimientos = más rápido · Cada uno tarda ~1.5s")
-    with col_ctrl3:
-        mon_lo = st.slider("Moneyness mín (%)", 70, 90, 80,
-                           help="Strike mínimo como % del spot") / 100
-    with col_ctrl4:
-        mon_hi = st.slider("Moneyness máx (%)", 110, 135, 120,
-                           help="Strike máximo como % del spot") / 100
+    with col_c2:
+        n_exps = st.slider("Nº Vencimientos", 2, 6, 4,
+                           help="Cada vencimiento tarda ~0.6-1.5s")
+    with col_c3:
+        skew_rfr = st.number_input("Risk-Free Rate (r)", 0.0, 0.15,
+                                   value=0.043, step=0.001, format="%.3f",
+                                   help="Tasa libre de riesgo anualizada (ej: 4.3%=0.043)")
+    with col_c4:
+        skew_div = st.number_input("Dividend Yield (q)", 0.0, 0.10,
+                                   value=0.013, step=0.001, format="%.3f",
+                                   help="Yield de dividendo continuo (SPY≈1.3%)")
+
+    col_c5, col_c6, col_c7, col_c8 = st.columns([1,1,1,1])
+    with col_c5:
+        mon_lo = st.slider("Strike mín (%spot)", 70, 90, 80) / 100
+    with col_c6:
+        mon_hi = st.slider("Strike máx (%spot)", 110, 140, 125) / 100
+    with col_c7:
+        y_axis_mode = st.selectbox("Eje Y", ["% vs Spot", "Log-moneyness ln(K/S)"],
+                                   help="Log-moneyness es la convención académica de BS")
+        y_mode = "moneyness" if y_axis_mode.startswith("%") else "log"
+    with col_c8:
+        view_mode = st.selectbox("Vista superficie", ["🌐 3D Surface", "🗺️ Heatmap 2D"])
 
     if st.button("🔄 Actualizar opciones", key="refresh_options"):
         fetch_options_chains.clear()
+        st.rerun()
 
-    # ── Load data ─────────────────────────────────────────────
-    est_secs = n_exps * 1.5 + 2
-    with st.spinner(
-        f"📡 Descargando {n_exps} vencimientos de {skew_ticker} "
-        f"(~{est_secs:.0f}s · throttle anti-rate-limit)…"
-    ):
-        opt_chains, opt_spot = fetch_options_chains(skew_ticker, n_exp=n_exps)
+    # ── Fetch raw data ────────────────────────────────────────
+    est_secs = n_exps * 1.2 + 2
+    with st.spinner(f"📡 Descargando {n_exps} vencimientos de {skew_ticker} (~{est_secs:.0f}s)…"):
+        opt_chains_raw, opt_spot = fetch_options_chains(skew_ticker, n_exp=n_exps)
 
-    if not opt_chains or not opt_spot:
-        st.error(
-            f"❌ **Yahoo Finance rate limit** — no se pudieron cargar opciones para **{skew_ticker}**."
-        )
-        st.info(
-            "💡 **Pasos para resolver:**\n"
-            "1. Espera **3-5 minutos** y presiona 🔄 Actualizar opciones\n"
-            "2. Baja el slider **Nº Vencimientos** a **2**\n"
-            "3. El caché dura 15 min — si ya cargó antes, no volverá a pedir hasta que expire\n"
-            "4. yfinance/Yahoo tiene cuotas no documentadas; funciona mejor en horario de mercado (9:30–16:00 ET)"
-        )
+    if not opt_chains_raw or not opt_spot:
+        st.error(f"❌ Yahoo Finance rate limit — no se cargaron opciones para **{skew_ticker}**.")
+        st.info("💡 Espera 3-5 min · baja a 2 vencimientos · o intenta en horario de mercado (9:30-16:00 ET).")
         st.stop()
 
-    n_valid_chains = len(opt_chains)
+    # ── Calcular IV con Black-Scholes (Brent's method) ───────
+    with st.spinner("⚙️ Calculando IV Black-Scholes…"):
+        opt_chains = compute_bs_iv_for_chains(opt_chains_raw, opt_spot,
+                                              r=skew_rfr, q=skew_div)
+
+    if not opt_chains:
+        st.warning("⚠️ No se pudo calcular IV BS para ningún vencimiento. "
+                   "Ajusta r/q o amplía el rango de strikes.")
+        st.stop()
+
     spot_disp = f"${opt_spot:.2f}"
-    exp_list  = sorted(opt_chains.keys())
+    n_valid   = len(opt_chains)
 
     # ── Métricas de skew ─────────────────────────────────────
-    sk_metrics = compute_skew_metrics(opt_chains, opt_spot)
+    sk = compute_skew_metrics(opt_chains, opt_spot)
 
-    def _m(v, suffix="", sign=False, color_fn=None):
-        if v is None:
-            return "—"
-        s = f"{'+' if sign and v >= 0 else ''}{v:.2f}{suffix}"
-        return s
+    def _fmt(v, sfx="", sign=False):
+        return f"{'+' if sign and v>=0 else ''}{v:.2f}{sfx}" if v is not None else "—"
 
-    atm_v  = _m(sk_metrics.get("atm_iv"),  "%")
-    rr_v   = _m(sk_metrics.get("rr25"),    " pts", sign=True)
-    bf_v   = _m(sk_metrics.get("bf25"),    " pts", sign=True)
-    slp_v  = _m(sk_metrics.get("skew_slope"), " pts/10%")
-    pc_v   = _m(sk_metrics.get("pc_ratio"))
-    sk_exp = sk_metrics.get("exp", exp_list[0] if exp_list else "—")
-    sk_dte = sk_metrics.get("dte", "?")
-
-    # Colores semafóricos
-    rr_raw  = sk_metrics.get("rr25")
-    pc_raw  = sk_metrics.get("pc_ratio")
-    rr_clr  = "var(--r)" if (rr_raw is not None and rr_raw < -3) else "var(--y)" if (rr_raw is not None and rr_raw < 0) else "var(--g)"
-    pc_clr  = "var(--r)" if (pc_raw is not None and pc_raw > 1.5) else "var(--y)" if (pc_raw is not None and pc_raw > 1.0) else "var(--g)"
+    rr_raw = sk.get("rr25"); pc_raw = sk.get("pc_ratio")
+    rr_clr = "var(--r)" if (rr_raw and rr_raw < -3) else "var(--y)" if (rr_raw and rr_raw < 0) else "var(--g)"
+    pc_clr = "var(--r)" if (pc_raw and pc_raw > 1.5) else "var(--y)" if (pc_raw and pc_raw > 1.0) else "var(--g)"
 
     st.markdown(f"""
     <div class="mrow">
-        <div class="mpill">
-            <div class="ml">{skew_ticker} Spot</div>
-            <div class="mv nt">{spot_disp}</div>
-        </div>
-        <div class="mpill">
-            <div class="ml">ATM IV · {sk_exp} ({sk_dte}d)</div>
-            <div class="mv nt">{atm_v}</div>
-        </div>
-        <div class="mpill">
-            <div class="ml">25Δ Risk Reversal</div>
-            <div class="mv" style="color:{rr_clr}">{rr_v}</div>
-        </div>
-        <div class="mpill">
-            <div class="ml">25Δ Butterfly</div>
-            <div class="mv nt">{bf_v}</div>
-        </div>
-        <div class="mpill">
-            <div class="ml">Put Skew Slope</div>
-            <div class="mv nt">{slp_v}</div>
-        </div>
-        <div class="mpill">
-            <div class="ml">P/C Vol Ratio</div>
-            <div class="mv" style="color:{pc_clr}">{pc_v}</div>
-        </div>
-        <div class="mpill">
-            <div class="ml">Vencimientos</div>
-            <div class="mv nt">{n_valid_chains}</div>
-        </div>
+        <div class="mpill"><div class="ml">{skew_ticker} Spot</div><div class="mv nt">{spot_disp}</div></div>
+        <div class="mpill"><div class="ml">ATM IV BS · {sk.get('exp','—')} ({sk.get('dte','?')}d)</div>
+            <div class="mv nt">{_fmt(sk.get('atm_iv'),'%')}</div></div>
+        <div class="mpill"><div class="ml">25Δ Risk Reversal</div>
+            <div class="mv" style="color:{rr_clr}">{_fmt(sk.get('rr25'),' pts',True)}</div></div>
+        <div class="mpill"><div class="ml">25Δ Butterfly</div>
+            <div class="mv nt">{_fmt(sk.get('bf25'),' pts',True)}</div></div>
+        <div class="mpill"><div class="ml">Skew Slope /10%</div>
+            <div class="mv nt">{_fmt(sk.get('skew_slope'),' pts')}</div></div>
+        <div class="mpill"><div class="ml">P/C Vol Ratio</div>
+            <div class="mv" style="color:{pc_clr}">{_fmt(sk.get('pc_ratio'))}</div></div>
+        <div class="mpill"><div class="ml">Vencimientos BS</div>
+            <div class="mv nt">{n_valid}</div></div>
+        <div class="mpill"><div class="ml">r / q</div>
+            <div class="mv nt">{skew_rfr:.1%} / {skew_div:.1%}</div></div>
     </div>
     """, unsafe_allow_html=True)
 
-    # ── Interpretación rápida ─────────────────────────────────
     interp_parts = []
     if rr_raw is not None:
-        if rr_raw < -4:
-            interp_parts.append("🔴 **Risk Reversal muy negativo** — el mercado paga prima fuerte por protección put; régimen de fear elevado")
-        elif rr_raw < -2:
-            interp_parts.append("🟡 **Risk Reversal negativo moderado** — skew put normal, demanda de cobertura activa")
-        else:
-            interp_parts.append("🟢 **Risk Reversal cerca de cero** — skew equilibrado, apetito por riesgo presente")
+        if rr_raw < -4: interp_parts.append("🔴 **Risk Reversal muy negativo** — put skew extremo, fear elevado")
+        elif rr_raw < -2: interp_parts.append("🟡 **Risk Reversal negativo moderado** — demanda de cobertura activa")
+        else: interp_parts.append("🟢 **Risk Reversal neutro** — apetito por riesgo presente")
     if pc_raw is not None:
-        if pc_raw > 1.5:
-            interp_parts.append("🔴 **P/C Ratio > 1.5** — flujo dominantemente en puts, posible hedging institucional o miedo")
-        elif pc_raw > 1.0:
-            interp_parts.append("🟡 **P/C Ratio > 1.0** — ligero sesgo a puts, mercado defensivo")
-        else:
-            interp_parts.append("🟢 **P/C Ratio < 1.0** — flujo en calls domina, risk-on")
+        if pc_raw > 1.5: interp_parts.append("🔴 **P/C Ratio > 1.5** — flujo dominante en puts, hedging institucional")
+        elif pc_raw > 1.0: interp_parts.append("🟡 **P/C Ratio > 1.0** — ligero sesgo defensivo")
+        else: interp_parts.append("🟢 **P/C Ratio < 1.0** — flujo en calls, risk-on")
     if interp_parts:
         with st.expander("📊 Lectura del Skew", expanded=True):
-            for line in interp_parts:
-                st.markdown(line)
+            for l in interp_parts: st.markdown(l)
 
     st.markdown("<div style='border-top:1px solid #30363D;margin:0.5rem 0'></div>",
                 unsafe_allow_html=True)
 
-    # ── Charts: Skew + ATM Term Structure ────────────────────
-    col_skew, col_atm = st.columns([1.6, 1])
-
-    with col_skew:
+    # ── Skew Curves + ATM Term Structure ─────────────────────
+    col_sk, col_atm = st.columns([1.6, 1])
+    with col_sk:
         try:
             fig_sk = build_skew_curves(opt_chains, opt_spot,
-                                       moneyness_range=(mon_lo, mon_hi))
+                                       moneyness_range=(mon_lo, mon_hi),
+                                       y_mode=y_mode)
             if fig_sk.data:
                 st.plotly_chart(fig_sk, width="stretch",
                                 config=dict(displayModeBar=True,
                                             modeBarButtonsToRemove=["lasso2d","select2d"]))
-            else:
-                st.info("No hay suficientes datos para graficar el skew.")
-        except Exception as e:
-            st.error(f"Error skew curves: {e}")
+            else: st.info("No hay suficientes datos para graficar el skew.")
+        except Exception as e: st.error(f"Error skew: {e}")
 
     with col_atm:
         try:
             fig_atm = build_atm_term_structure(opt_chains, opt_spot)
             if fig_atm.data:
-                st.plotly_chart(fig_atm, width="stretch",
-                                config=dict(displayModeBar=False))
-            else:
-                st.info("No hay datos ATM.")
-        except Exception as e:
-            st.error(f"Error ATM TS: {e}")
+                st.plotly_chart(fig_atm, width="stretch", config=dict(displayModeBar=False))
+            else: st.info("No hay datos ATM.")
+        except Exception as e: st.error(f"Error ATM TS: {e}")
 
     st.markdown("<div style='border-top:1px solid #30363D;margin:0.5rem 0'></div>",
                 unsafe_allow_html=True)
 
-    # ── IV Surface selector ───────────────────────────────────
-    view_mode = st.radio(
-        "Vista de superficie",
-        ["🌐 3D Surface", "🗺️ Heatmap 2D"],
-        horizontal=True,
-        help="El heatmap es más preciso para leer valores; la superficie 3D muestra la geometría de la vol.",
-    )
-
+    # ── IV Surface ────────────────────────────────────────────
     if view_mode == "🌐 3D Surface":
         try:
             fig_surf = build_iv_surface(opt_chains, opt_spot,
-                                        moneyness_range=(mon_lo, mon_hi))
+                                        moneyness_range=(mon_lo, mon_hi),
+                                        y_mode=y_mode)
             if fig_surf.data:
-                st.plotly_chart(fig_surf, width="stretch",
-                                config=dict(displayModeBar=True))
-            else:
-                st.info("No hay suficientes datos para construir la superficie 3D.")
-        except Exception as e:
-            st.error(f"Error IV Surface: {e}")
+                st.plotly_chart(fig_surf, width="stretch", config=dict(displayModeBar=True))
+            else: st.info("No hay suficientes datos para la superficie 3D.")
+        except Exception as e: st.error(f"Error IV Surface: {e}")
     else:
         try:
             fig_hm = build_iv_heatmap(opt_chains, opt_spot,
                                       moneyness_range=(mon_lo, mon_hi))
             if fig_hm.data:
-                st.plotly_chart(fig_hm, width="stretch",
-                                config=dict(displayModeBar=False))
-            else:
-                st.info("No hay suficientes datos para el heatmap.")
-        except Exception as e:
-            st.error(f"Error IV Heatmap: {e}")
+                st.plotly_chart(fig_hm, width="stretch", config=dict(displayModeBar=False))
+            else: st.info("No hay suficientes datos para el heatmap.")
+        except Exception as e: st.error(f"Error IV Heatmap: {e}")
 
-    # ── Data table de vencimientos ─────────────────────────────
+    # ── Tabla por vencimiento ─────────────────────────────────
     with st.expander("📋 Tabla resumen por vencimiento"):
         rows_tbl = []
         for exp_str, data in sorted(opt_chains.items(), key=lambda x: x[1]["dte"]):
-            dte_t   = data["dte"]
-            puts_t  = data["puts"]
-            calls_t = data["calls"]
-
-            atm_p = puts_t[puts_t["moneyness"].between(0.97, 1.03)]
-            atm_c = calls_t[calls_t["moneyness"].between(0.97, 1.03)]
-            atm_all_t = pd.concat([atm_p, atm_c])
-
-            atm_iv_t = (
-                float(np.average(atm_all_t["impliedVolatility"].values,
-                                 weights=atm_all_t["openInterest"].values + 1)) * 100
-                if not atm_all_t.empty else np.nan
-            )
-
-            p90 = puts_t[puts_t["moneyness"].between(0.88, 0.92)]["impliedVolatility"].mean()
-            c110 = calls_t[calls_t["moneyness"].between(1.08, 1.12)]["impliedVolatility"].mean()
-            rr_t = (c110 - p90) * 100 if not (np.isnan(p90) if isinstance(p90, float) else False) else np.nan
-
+            dte_t = data["dte"]
+            puts_t  = data["puts"];  calls_t = data["calls"]
+            atm_all = pd.concat([
+                puts_t[puts_t["moneyness"].between(0.97,1.03)],
+                calls_t[calls_t["moneyness"].between(0.97,1.03)],
+            ])
+            atm_iv_t = (float(np.average(atm_all["iv"].values,
+                                          weights=atm_all["openInterest"].values+1))*100
+                        if not atm_all.empty and "iv" in atm_all.columns else np.nan)
+            p90  = puts_t[puts_t["moneyness"].between(0.88,0.92)]["iv"].mean()
+            c110 = calls_t[calls_t["moneyness"].between(1.08,1.12)]["iv"].mean()
+            rr_t = (c110-p90)*100 if pd.notna(p90) and pd.notna(c110) else np.nan
             rows_tbl.append({
-                "Vencimiento": exp_str,
-                "DTE": dte_t,
-                "ATM IV": f"{atm_iv_t:.1f}%" if not np.isnan(atm_iv_t) else "—",
-                "IV 90% (puts)": f"{p90*100:.1f}%" if pd.notna(p90) else "—",
-                "IV 110% (calls)": f"{c110*100:.1f}%" if pd.notna(c110) else "—",
-                "RR ~25Δ": f"{rr_t:+.1f} pts" if not np.isnan(rr_t) else "—",
-                "Puts (OI>0)": len(puts_t),
-                "Calls (OI>0)": len(calls_t),
+                "Vencimiento": exp_str, "DTE": dte_t,
+                "ATM IV (BS)": f"{atm_iv_t:.1f}%" if not np.isnan(atm_iv_t) else "—",
+                "IV 90% put":  f"{p90*100:.1f}%"  if pd.notna(p90)  else "—",
+                "IV 110% call":f"{c110*100:.1f}%" if pd.notna(c110) else "—",
+                "RR ~25Δ":     f"{rr_t:+.1f} pts" if not np.isnan(rr_t) else "—",
+                "Puts": len(puts_t), "Calls": len(calls_t),
             })
-
         if rows_tbl:
-            st.dataframe(
-                pd.DataFrame(rows_tbl),
-                use_container_width=True,
-                hide_index=True,
-            )
+            st.dataframe(pd.DataFrame(rows_tbl), use_container_width=True, hide_index=True)
 
     st.caption(
-        f"Fuente: Yahoo Finance (opciones con OI > 0) · "
-        f"Spot {skew_ticker}: {spot_disp} · "
-        f"Actualizado: {now_cdmx().strftime('%H:%M:%S')} CDMX · "
-        "Precios con delay ~15 min"
+        f"IV calculada con Black-Scholes (Brent) · r={skew_rfr:.1%} · q={skew_div:.1%} · "
+        f"Spot {skew_ticker}: {spot_disp} · {now_cdmx().strftime('%H:%M:%S')} CDMX"
     )
 
 
