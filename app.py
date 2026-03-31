@@ -705,11 +705,7 @@ def build_iv_surface(chains: dict, spot: float,
 
     fig.add_trace(go.Surface(
         x=xi, y=yi, z=zi,
-        colorscale=[
-            [0.0,"#1a237e"],[0.15,"#1565C0"],[0.30,"#0288D1"],
-            [0.45,"#00ACC1"],[0.55,"#3FB950"],[0.65,"#D29922"],
-            [0.80,"#F0883E"],[1.0,"#F85149"],
-        ],
+        colorscale="Viridis",
         colorbar=dict(title=dict(text="IV %", font=dict(color="#8B949E",size=10)),
                       tickfont=dict(color="#8B949E",size=9), len=0.6, thickness=12),
         hovertemplate="DTE: %{x:.0f}d<br>Y: %{y:.2f}<br>IV: %{z:.1f}%<extra></extra>",
@@ -742,15 +738,19 @@ def build_iv_heatmap(chains: dict, spot: float,
     mon_grid = np.linspace(lo, hi, n_bins)
     dte_vals, iv_rows = [], []
 
-    for exp_str, data in sorted(chains.items(), key=lambda x: x[1]["dte"]):
-        dte = data["dte"]
+    for exp_str, data in sorted(chains.items(), key=lambda x: int(x[1]["dte"])):
+        dte = int(data["dte"])
         pts = pd.concat([
             data["puts"][data["puts"]["moneyness"].between(lo, 1.02)],
             data["calls"][data["calls"]["moneyness"].between(0.98, hi)],
         ]).drop_duplicates("moneyness").sort_values("moneyness")
         if len(pts) < 3 or "iv" not in pts.columns: continue
-        iv_interp = np.interp(mon_grid, pts["moneyness"].values,
-                              pts["iv"].values * 100, left=np.nan, right=np.nan)
+        iv_vals = pd.to_numeric(pts["iv"], errors="coerce").values * 100
+        mon_vals = pd.to_numeric(pts["moneyness"], errors="coerce").values
+        mask = np.isfinite(iv_vals) & np.isfinite(mon_vals)
+        if mask.sum() < 3: continue
+        iv_interp = np.interp(mon_grid, mon_vals[mask], iv_vals[mask],
+                              left=np.nan, right=np.nan)
         dte_vals.append(dte); iv_rows.append(iv_interp)
 
     if not iv_rows: return fig
@@ -787,96 +787,73 @@ def build_iv_heatmap(chains: dict, spot: float,
     return fig
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# COT — Commitments of Traders via cot_reports library
-# Fuente: CFTC "Traders in Financial Futures" report
-# VIX Futures: buscamos "VIX" en Market and Exchange Names
-# Leveraged Funds ≈ Managed Money (hedge funds / CTAs)
-# Asset Manager ≈ Institucionales pasivos
-# Publicación: cada martes ~15:30 ET con datos del martes anterior
+# COT — Commitments of Traders via CFTC Socrata API (sin cot_reports)
+# Fuente: publicreporting.cftc.gov — Disaggregated Futures report
+# VIX Futures: CFTC_Market_Code = "1170E1"
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @st.cache_data(ttl=3600 * 6)
 def fetch_cot_vix(n_weeks: int = 104) -> pd.DataFrame:
     """
-    Descarga el COT de Traders in Financial Futures para VIX via cot_reports.
-    Columnas clave:
-      - mm_long / mm_short   : Leveraged Funds (hedge funds/CTAs)
-      - asset_long / short   : Asset Managers (institucionales)
-      - dealer_long / short  : Dealer Intermediaries
-      - net_mm               : Leveraged Funds net
-      - net_mm_pct           : % del Open Interest
+    Descarga COT directo de la API Socrata del CFTC.
+    Dataset: Disaggregated Futures — 72hh-3qpy
+    Filtro: cftc_market_code = '1170E1' (VIX)
     """
     log = logging.getLogger("vix_controller")
-    try:
-        import cot_reports
-    except ImportError:
-        log.error("cot_reports no instalado. Agrega 'cot_reports' a requirements.txt")
-        return pd.DataFrame()
+    import urllib.request, json
+
+    # Socrata API — Disaggregated Futures
+    api_id = "72hh-3qpy"
+    limit = min(n_weeks + 20, 2000)
+    url = (f"https://publicreporting.cftc.gov/resource/{api_id}.json"
+           f"?$where=cftc_market_code='1170E1'"
+           f"&$order=report_date_as_yyyy_mm_dd DESC"
+           f"&$limit={limit}")
 
     try:
-        current_year = now_cdmx().year
-        years_needed = max(1, (n_weeks // 52) + 2)
-        frames = []
-        for yr in range(current_year - years_needed + 1, current_year + 1):
-            try:
-                df_yr = cot_reports.cot_year(
-                    year=yr,
-                    cot_report_type="traders_in_financial_futures_fut"
-                )
-                frames.append(df_yr)
-                log.info(f"COT: año {yr} OK ({len(df_yr)} filas)")
-            except Exception as e:
-                log.warning(f"COT año {yr}: {e}")
-                continue
+        req = urllib.request.Request(url, headers={"Accept": "application/json",
+                                                    "User-Agent": "VIXController/1.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode())
 
-        if not frames:
-            log.error("COT: no se pudo descargar ningún año")
+        if not data:
+            log.error("COT API: respuesta vacía")
             return pd.DataFrame()
 
-        df = pd.concat(frames, ignore_index=True)
-
-        # Filtrar VIX futures
-        mask = df["Market and Exchange Names"].str.contains("VIX", case=False, na=False)
-        df   = df[mask].copy()
-        if df.empty:
-            log.error("COT: no se encontraron filas de VIX futures")
-            return pd.DataFrame()
+        df = pd.DataFrame(data)
+        log.info(f"COT API: {len(df)} filas descargadas")
 
         # Parsear fecha
-        date_col = "As of Date in Form YYYY-MM-DD"
-        if date_col in df.columns:
-            df["date"] = pd.to_datetime(df[date_col], errors="coerce")
-        else:
-            # Alternativa: buscar columna con fecha
-            date_cols = [c for c in df.columns if "date" in c.lower() or "yyyy" in c.lower()]
-            df["date"] = pd.to_datetime(df[date_cols[0]], errors="coerce") if date_cols else pd.NaT
+        if "report_date_as_yyyy_mm_dd" in df.columns:
+            df["date"] = pd.to_datetime(df["report_date_as_yyyy_mm_dd"], errors="coerce")
+        elif "as_of_date_in_form_yymmdd" in df.columns:
+            df["date"] = pd.to_datetime(df["as_of_date_in_form_yymmdd"], errors="coerce")
 
-        df = df.sort_values("date").reset_index(drop=True)
-
-        # Renombrar columnas (TFF report)
-        col_map = {
-            "Open Interest (All)":                        "oi",
-            "Leveraged Funds-Long (All)":                 "mm_long",
-            "Leveraged Funds-Short (All)":                "mm_short",
-            "Leveraged Funds-Spreading (All)":            "mm_spread",
-            "Asset Manager/Institutional-Long (All)":     "asset_long",
-            "Asset Manager/Institutional-Short (All)":    "asset_short",
-            "Dealer Intermediary-Long (All)":             "dealer_long",
-            "Dealer Intermediary-Short (All)":            "dealer_short",
-            "Other Reportables-Long (All)":               "other_long",
-            "Other Reportables-Short (All)":              "other_short",
+        # Mapear columnas Socrata → nuestro esquema
+        socrata_map = {
+            "open_interest_all":                       "oi",
+            "lev_money_positions_long_all":             "mm_long",
+            "lev_money_positions_short_all":            "mm_short",
+            "lev_money_positions_spread_all":           "mm_spread",
+            "asset_mgr_positions_long_all":             "asset_long",
+            "asset_mgr_positions_short_all":            "asset_short",
+            "dealer_positions_long_all":                "dealer_long",
+            "dealer_positions_short_all":               "dealer_short",
+            "other_rept_positions_long_all":            "other_long",
+            "other_rept_positions_short_all":           "other_short",
         }
-        df = df.rename(columns={k:v for k,v in col_map.items() if k in df.columns})
+        df = df.rename(columns={k: v for k, v in socrata_map.items() if k in df.columns})
 
         # Convertir a numérico
-        for c in ["oi","mm_long","mm_short","mm_spread","asset_long","asset_short",
-                  "dealer_long","dealer_short","other_long","other_short"]:
+        num_cols = ["oi", "mm_long", "mm_short", "mm_spread", "asset_long",
+                    "asset_short", "dealer_long", "dealer_short", "other_long", "other_short"]
+        for c in num_cols:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
 
         # Métricas derivadas
         if "mm_long" in df.columns and "mm_short" in df.columns:
-            df["net_mm"]     = df["mm_long"] - df["mm_short"]
+            df["net_mm"] = df["mm_long"] - df["mm_short"]
             df["net_mm_pct"] = (df["net_mm"] / df["oi"] * 100).where(df["oi"] > 0)
             df["net_mm_pct_pctile"] = df["net_mm_pct"].rank(pct=True) * 100
 
@@ -886,8 +863,9 @@ def fetch_cot_vix(n_weeks: int = 104) -> pd.DataFrame:
         if "asset_long" in df.columns and "asset_short" in df.columns:
             df["net_commercial"] = df["asset_long"] - df["asset_short"]
 
+        df = df.sort_values("date").reset_index(drop=True)
         last_ok = df["date"].dropna().iloc[-1].strftime("%Y-%m-%d") if not df["date"].dropna().empty else "?"
-        log.info(f"COT VIX (TFF): {len(df)} semanas · última: {last_ok}")
+        log.info(f"COT VIX: {len(df)} semanas · última: {last_ok}")
         return df.tail(n_weeks).reset_index(drop=True)
 
     except Exception as e:
@@ -2120,13 +2098,13 @@ with tab_skew:
     # ── Controles ─────────────────────────────────────────────
     col_c1, col_c2, col_c3, col_c4 = st.columns([1,1,1,1])
     with col_c1:
-        skew_ticker = st.selectbox(
-            "Subyacente", ["SPY","QQQ","IWM","GLD","TLT"], index=0,
-            help="SPY = mayor liquidez de opciones",
-        )
+        skew_ticker = st.text_input(
+            "Subyacente (ticker)", value="SPY",
+            help="Cualquier ticker de opciones: SPY, QQQ, AAPL, TSLA, IWM, GLD, TLT…",
+        ).strip().upper()
     with col_c2:
-        n_exps = st.slider("Nº Vencimientos", 2, 6, 4,
-                           help="Cada vencimiento tarda ~0.6-1.5s")
+        n_exps = st.slider("Nº Vencimientos", 2, 12, 6,
+                           help="Más vencimientos = superficie más completa pero más lento (~1s c/u)")
     with col_c3:
         skew_rfr = st.number_input("Risk-Free Rate (r)", 0.0, 0.15,
                                    value=0.043, step=0.001, format="%.3f",
@@ -2291,6 +2269,60 @@ with tab_skew:
             })
         if rows_tbl:
             st.dataframe(pd.DataFrame(rows_tbl), width="stretch", hide_index=True)
+
+    # ── High-IV Scanner: mejores strikes para vender primas ──
+    with st.expander("🎯 Scanner: Strikes con Mayor IV (para venta de primas)", expanded=False):
+        st.markdown("""<div style="font-family:'JetBrains Mono';font-size:0.72rem;color:#8B949E;margin-bottom:0.5rem">
+        Opciones con IV más alta por vencimiento — candidatas para vender primas (put spreads, iron condors).
+        Ordenadas por IV descendente. OI alto = más liquidez para ejecutar.
+        </div>""", unsafe_allow_html=True)
+
+        scanner_exp = st.selectbox("Vencimiento", sorted(opt_chains.keys(),
+            key=lambda x: opt_chains[x]["dte"]),
+            format_func=lambda x: f"{x} ({opt_chains[x]['dte']}d)",
+            key="scanner_exp")
+
+        if scanner_exp and scanner_exp in opt_chains:
+            s_data = opt_chains[scanner_exp]
+            s_dte = s_data["dte"]
+
+            # Combinar puts y calls
+            s_puts = s_data["puts"].copy()
+            s_puts["type"] = "PUT"
+            s_calls = s_data["calls"].copy()
+            s_calls["type"] = "CALL"
+            s_all = pd.concat([s_puts, s_calls], ignore_index=True)
+
+            if "iv" in s_all.columns and len(s_all) > 0:
+                s_all["iv_pct"] = s_all["iv"] * 100
+                s_all["dist_spot"] = ((s_all["strike"] / opt_spot) - 1) * 100
+                s_all = s_all.sort_values("iv_pct", ascending=False)
+
+                # Top 20
+                top_iv = s_all.head(20)[["type", "strike", "iv_pct", "dist_spot",
+                                          "midPrice", "bid", "ask", "openInterest", "volume"]].copy()
+                top_iv.columns = ["Tipo", "Strike", "IV (BS) %", "Dist Spot %",
+                                  "Mid $", "Bid", "Ask", "OI", "Vol"]
+                for c in ["IV (BS) %", "Dist Spot %"]:
+                    top_iv[c] = top_iv[c].round(2)
+                for c in ["Mid $", "Bid", "Ask"]:
+                    top_iv[c] = top_iv[c].round(2)
+                top_iv["OI"] = top_iv["OI"].astype(int)
+                top_iv["Vol"] = top_iv["Vol"].astype(int)
+
+                st.dataframe(top_iv, width="stretch", hide_index=True)
+
+                # Resumen
+                avg_put_iv = s_puts["iv"].mean() * 100 if len(s_puts) > 0 else 0
+                avg_call_iv = s_calls["iv"].mean() * 100 if len(s_calls) > 0 else 0
+                max_iv_row = s_all.iloc[0]
+                st.markdown(f"""<div style="font-family:'JetBrains Mono';font-size:0.75rem;color:#C9D1D9;margin-top:0.4rem">
+                    IV promedio puts: <b style="color:#F85149">{avg_put_iv:.1f}%</b> ·
+                    IV promedio calls: <b style="color:#3FB950">{avg_call_iv:.1f}%</b> ·
+                    Mayor IV: <b style="color:#D29922">{max_iv_row['type']} K={max_iv_row['strike']:.0f} → {max_iv_row['iv_pct']:.1f}%</b>
+                </div>""", unsafe_allow_html=True)
+            else:
+                st.info("No hay datos de IV para este vencimiento.")
 
     st.caption(
         f"IV calculada con Black-Scholes (Brent) · r={skew_rfr:.1%} · q={skew_div:.1%} · "
