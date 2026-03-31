@@ -11,9 +11,14 @@ import yfinance as yf
 from datetime import datetime, timedelta, date
 from io import StringIO
 import re, time, warnings, logging, os
+from zoneinfo import ZoneInfo
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
+
+CDMX_TZ = ZoneInfo("America/Mexico_City")
+def now_cdmx():
+    return datetime.now(CDMX_TZ)
 
 st.set_page_config(page_title="VIX Controller", page_icon="🔴", layout="wide",
                    initial_sidebar_state="collapsed")
@@ -176,7 +181,7 @@ def scrape_cboe_futures() -> pd.DataFrame:
         log.info(f"CBOE_SCRAPE: HTML {len(html):,} chars · VX/ hits: {vx_n}")
         st.session_state["scrape_debug"] = (
             f"HTML: {len(html):,} chars · 'VX/' en HTML: {vx_n} · "
-            f"{datetime.now().strftime('%H:%M:%S')}"
+            f"{now_cdmx().strftime('%H:%M:%S')}"
         )
 
     except Exception as e:
@@ -236,7 +241,7 @@ def scrape_cboe_futures() -> pd.DataFrame:
                 errors='coerce'
             )
 
-    today = pd.Timestamp('today').normalize()
+    today = pd.Timestamp(now_cdmx().date()).normalize()
     if 'Expiration' in df_vx.columns:
         df_vx['DTE'] = (df_vx['Expiration'] - today).dt.days
 
@@ -244,7 +249,7 @@ def scrape_cboe_futures() -> pd.DataFrame:
         lambda r: r['Last'] if pd.notna(r.get('Last')) and r.get('Last', 0) > 0
                   else r.get('Settlement', 0), axis=1
     )
-    df_vx['Scraped_At'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    df_vx['Scraped_At'] = now_cdmx().strftime('%Y-%m-%d %H:%M:%S')
     log.info(f"CBOE_SCRAPE: {len(df_vx)} contratos mensuales ✅")
     return df_vx
 
@@ -277,15 +282,12 @@ def fetch_etps():
     return out
 
 
-
-
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # EDGE ANALYTICS — DATA LAYER
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @st.cache_data(ttl=300)
 def fetch_edge_extra():
-    """Descarga SKEW, HYG, IEF para edge analytics."""
     out = {}
     for name, sym in [("SKEW", "^SKEW"), ("HYG", "HYG"), ("IEF", "IEF")]:
         try:
@@ -299,15 +301,12 @@ def fetch_edge_extra():
     return out
 
 
-def compute_edge_analytics(df: pd.DataFrame, edge_extra: dict) -> dict:
-    """Calcula todos los indicadores de edge sobre el Master CSV."""
+def compute_edge_analytics(df, edge_extra):
     out = {}
     bt = df[df['VIX_Close'].notna() & df['SPY_Close'].notna()].copy()
-
     if len(bt) < 60:
         return out
 
-    # ── 1. VRP: VIX - Realized Vol 20d ──
     log_ret = np.log(bt['SPY_Close'] / bt['SPY_Close'].shift(1))
     bt['RV5']  = log_ret.rolling(5).std()  * np.sqrt(252) * 100
     bt['RV10'] = log_ret.rolling(10).std() * np.sqrt(252) * 100
@@ -315,94 +314,68 @@ def compute_edge_analytics(df: pd.DataFrame, edge_extra: dict) -> dict:
     bt['RV60'] = log_ret.rolling(60).std() * np.sqrt(252) * 100
     bt['VRP']  = bt['VIX_Close'] - bt['RV20']
 
-    # VRP percentile (últimos 2 años)
     vrp_2y = bt['VRP'].tail(504).dropna()
     if len(vrp_2y) > 20:
-        current_vrp = vrp_2y.iloc[-1]
-        out['vrp_percentile'] = round((vrp_2y < current_vrp).mean() * 100, 0)
+        out['vrp_percentile'] = round((vrp_2y < vrp_2y.iloc[-1]).mean() * 100, 0)
 
-    # ── 2. Roll Yield ──
     if 'M1_Price' in bt.columns and 'M1_DTE' in bt.columns:
         m1 = bt['M1_Price']; dte = bt['M1_DTE']; spot = bt['VIX_Close']
         valid = (m1 > 0) & (dte > 0) & m1.notna() & dte.notna() & spot.notna()
-        bt['Roll_Yield'] = np.where(valid,
-            (m1 - spot) / m1 * (365 / dte) * 100, np.nan)
+        bt['Roll_Yield'] = np.where(valid, (m1 - spot) / m1 * (365 / dte) * 100, np.nan)
 
-    # ── 3. VVIX/VIX Ratio ──
     if 'VVIX_Close' in bt.columns:
-        bt['VVIX_VIX'] = np.where(
-            bt['VIX_Close'] > 0,
-            bt['VVIX_Close'] / bt['VIX_Close'], np.nan)
+        bt['VVIX_VIX'] = np.where(bt['VIX_Close'] > 0, bt['VVIX_Close'] / bt['VIX_Close'], np.nan)
 
-    # ── 4. SKEW ──
     if 'SKEW' in edge_extra and not edge_extra['SKEW'].empty:
         skew_df = edge_extra['SKEW'][['Close']].rename(columns={'Close': 'SKEW'})
         bt = bt.join(skew_df, how='left')
 
-    # ── 5. Credit Spread Proxy: HYG vs IEF ──
     if 'HYG' in edge_extra and 'IEF' in edge_extra:
         hyg = edge_extra['HYG'][['Close']].rename(columns={'Close': 'HYG'})
         ief = edge_extra['IEF'][['Close']].rename(columns={'Close': 'IEF'})
         bt = bt.join(hyg, how='left').join(ief, how='left')
         if 'HYG' in bt.columns and 'IEF' in bt.columns:
-            hyg_ret = bt['HYG'].pct_change().rolling(20).sum()
-            ief_ret = bt['IEF'].pct_change().rolling(20).sum()
-            bt['Credit_Spread'] = -(hyg_ret - ief_ret) * 100
+            bt['Credit_Spread'] = -(bt['HYG'].pct_change().rolling(20).sum() -
+                                    bt['IEF'].pct_change().rolling(20).sum()) * 100
 
-    # ── 6. Calendario de Eventos ──
-    fomc_dates_2026 = [
-        '2026-01-28', '2026-03-18', '2026-05-06', '2026-06-17',
-        '2026-07-29', '2026-09-16', '2026-10-28', '2026-12-16',
-    ]
-    cpi_dates_2026 = [
-        '2026-01-14', '2026-02-12', '2026-03-11', '2026-04-14',
-        '2026-05-13', '2026-06-10', '2026-07-15', '2026-08-12',
-        '2026-09-10', '2026-10-13', '2026-11-12', '2026-12-10',
-    ]
-    nfp_dates_2026 = [
-        '2026-01-09', '2026-02-06', '2026-03-06', '2026-04-03',
-        '2026-05-08', '2026-06-05', '2026-07-02', '2026-08-07',
-        '2026-09-04', '2026-10-02', '2026-11-06', '2026-12-04',
-    ]
-    today = pd.Timestamp.now().normalize()
+    # Calendario de eventos 2026
+    today = pd.Timestamp(now_cdmx().date())
     upcoming = []
-    for d in fomc_dates_2026:
-        dt = pd.Timestamp(d)
-        diff = (dt - today).days
-        if 0 <= diff <= 14:
-            upcoming.append(('FOMC', dt, diff))
-    for d in cpi_dates_2026:
-        dt = pd.Timestamp(d)
-        diff = (dt - today).days
-        if 0 <= diff <= 14:
-            upcoming.append(('CPI', dt, diff))
-    for d in nfp_dates_2026:
-        dt = pd.Timestamp(d)
-        diff = (dt - today).days
-        if 0 <= diff <= 14:
-            upcoming.append(('NFP', dt, diff))
+    events = {
+        'FOMC': ['2026-01-28','2026-03-18','2026-05-06','2026-06-17',
+                  '2026-07-29','2026-09-16','2026-10-28','2026-12-16'],
+        'CPI':  ['2026-01-14','2026-02-12','2026-03-11','2026-04-14','2026-05-13',
+                  '2026-06-10','2026-07-15','2026-08-12','2026-09-10','2026-10-13',
+                  '2026-11-12','2026-12-10'],
+        'NFP':  ['2026-01-09','2026-02-06','2026-03-06','2026-04-03','2026-05-08',
+                  '2026-06-05','2026-07-02','2026-08-07','2026-09-04','2026-10-02',
+                  '2026-11-06','2026-12-04'],
+    }
+    for ev_name, dates in events.items():
+        for d in dates:
+            dt = pd.Timestamp(d)
+            diff = (dt - today).days
+            if 0 <= diff <= 14:
+                upcoming.append((ev_name, dt, diff))
     upcoming.sort(key=lambda x: x[2])
     out['upcoming_events'] = upcoming
-
     out['bt'] = bt
     return out
 
 
-def build_vrp_chart(bt: pd.DataFrame, window: int = 252) -> go.Figure:
-    """VIX vs RV20 + VRP."""
+def build_vrp_chart(bt, window=252):
     p = bt.tail(window).dropna(subset=['VRP'])
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=p.index, y=p['VIX_Close'], name='VIX (Implied)',
         line=dict(color='#F85149', width=2)))
     fig.add_trace(go.Scatter(x=p.index, y=p['RV20'], name='RV20 (Realized)',
         line=dict(color='#58A6FF', width=2)))
-    # VRP as filled area
     fig.add_trace(go.Scatter(x=p.index, y=p['VRP'], name='VRP (IV - RV)',
         fill='tozeroy', line=dict(color='#3FB950', width=1),
         fillcolor='rgba(63,185,80,0.15)'))
     fig.add_hline(y=0, line_dash='dash', line_color='#8B949E', line_width=1)
     fig.update_layout(
-        title=dict(text='<b>Volatility Risk Premium</b><sup>  VIX − RV20 · Tu edge en puntos</sup>',
+        title=dict(text='<b>Volatility Risk Premium</b><sup>  VIX - RV20 · Tu edge en puntos</sup>',
                    font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
         template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
         height=350, margin=dict(l=50, r=30, t=55, b=40),
@@ -414,8 +387,7 @@ def build_vrp_chart(bt: pd.DataFrame, window: int = 252) -> go.Figure:
     return fig
 
 
-def build_rv_chart(bt: pd.DataFrame, window: int = 252) -> go.Figure:
-    """Multi-timeframe RV vs VIX."""
+def build_rv_chart(bt, window=252):
     p = bt.tail(window).dropna(subset=['RV20'])
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=p.index, y=p['VIX_Close'], name='VIX',
@@ -423,10 +395,9 @@ def build_rv_chart(bt: pd.DataFrame, window: int = 252) -> go.Figure:
     for col, lbl, clr in [('RV5','RV5 (1w)','#D29922'), ('RV10','RV10 (2w)','#F0883E'),
                            ('RV20','RV20 (1m)','#58A6FF'), ('RV60','RV60 (3m)','#BC8CFF')]:
         if col in p.columns:
-            fig.add_trace(go.Scatter(x=p.index, y=p[col], name=lbl,
-                line=dict(color=clr, width=1.2)))
+            fig.add_trace(go.Scatter(x=p.index, y=p[col], name=lbl, line=dict(color=clr, width=1.2)))
     fig.update_layout(
-        title=dict(text='<b>Implied vs Realized Vol</b><sup>  VIX encima = VRP positivo (cobras prima)</sup>',
+        title=dict(text='<b>Implied vs Realized Vol</b><sup>  VIX encima = VRP positivo</sup>',
                    font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
         template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
         height=350, margin=dict(l=50, r=30, t=55, b=40),
@@ -438,22 +409,19 @@ def build_rv_chart(bt: pd.DataFrame, window: int = 252) -> go.Figure:
     return fig
 
 
-def build_roll_yield_chart(bt: pd.DataFrame, window: int = 252) -> go.Figure:
-    """Roll Yield annualized."""
-    p = bt.tail(window)
-    if 'Roll_Yield' not in p.columns:
+def build_roll_yield_chart(bt, window=252):
+    if 'Roll_Yield' not in bt.columns:
         return go.Figure()
-    p = p.dropna(subset=['Roll_Yield'])
+    p = bt.tail(window).dropna(subset=['Roll_Yield'])
     colors = ['#3FB950' if v > 0 else '#F85149' for v in p['Roll_Yield']]
     fig = go.Figure()
     fig.add_trace(go.Bar(x=p.index, y=p['Roll_Yield'], marker_color=colors,
         name='Roll Yield %', opacity=0.7))
-    ry_sma = p['Roll_Yield'].rolling(20).mean()
-    fig.add_trace(go.Scatter(x=p.index, y=ry_sma, name='SMA(20)',
-        line=dict(color='#39D2C0', width=2)))
+    fig.add_trace(go.Scatter(x=p.index, y=p['Roll_Yield'].rolling(20).mean(),
+        name='SMA(20)', line=dict(color='#39D2C0', width=2)))
     fig.add_hline(y=0, line_dash='dash', line_color='#8B949E', line_width=1)
     fig.update_layout(
-        title=dict(text='<b>Roll Yield</b><sup>  Carry diario anualizado · Verde=cobras, Rojo=pagas</sup>',
+        title=dict(text='<b>Roll Yield</b><sup>  Carry anualizado · Verde=cobras</sup>',
                    font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
         template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
         height=300, margin=dict(l=50, r=30, t=55, b=40),
@@ -461,37 +429,33 @@ def build_roll_yield_chart(bt: pd.DataFrame, window: int = 252) -> go.Figure:
         yaxis=dict(title='Ann. %', gridcolor='#21262D', tickfont=dict(size=9, color='#8B949E')),
         legend=dict(orientation='h', y=1.02, bgcolor='rgba(0,0,0,0)',
                     font=dict(size=9, color='#8B949E', family='JetBrains Mono')),
-        hovermode='x unified', showlegend=True)
+        hovermode='x unified')
     return fig
 
 
-def build_vvix_ratio_chart(bt: pd.DataFrame, window: int = 252) -> go.Figure:
-    """VVIX/VIX Ratio — early warning."""
+def build_vvix_ratio_chart(bt, window=252):
     if 'VVIX_VIX' not in bt.columns:
         return go.Figure()
     p = bt.tail(window).dropna(subset=['VVIX_VIX'])
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=p.index, y=p['VVIX_VIX'], name='VVIX/VIX Ratio',
+    fig.add_trace(go.Scatter(x=p.index, y=p['VVIX_VIX'], name='VVIX/VIX',
         line=dict(color='#BC8CFF', width=2)))
     fig.add_hline(y=6, line_dash='dash', line_color='#F85149', line_width=1.5,
         annotation_text='  Danger > 6', annotation_font=dict(color='#F85149', size=10))
     fig.add_hline(y=5, line_dash='dot', line_color='#D29922', line_width=1,
         annotation_text='  Warning > 5', annotation_font=dict(color='#D29922', size=9))
     fig.update_layout(
-        title=dict(text='<b>VVIX / VIX Ratio</b><sup>  > 6 = dealers anticipan spike de VIX</sup>',
+        title=dict(text='<b>VVIX / VIX Ratio</b><sup>  > 6 = dealers anticipan spike</sup>',
                    font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
         template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
         height=300, margin=dict(l=50, r=30, t=55, b=40),
         xaxis=dict(gridcolor='#21262D', tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
         yaxis=dict(title='Ratio', gridcolor='#21262D', tickfont=dict(size=9, color='#8B949E')),
-        legend=dict(orientation='h', y=1.02, bgcolor='rgba(0,0,0,0)',
-                    font=dict(size=9, color='#8B949E', family='JetBrains Mono')),
         hovermode='x unified')
     return fig
 
 
-def build_skew_chart(bt: pd.DataFrame, window: int = 252) -> go.Figure:
-    """CBOE SKEW Index."""
+def build_skew_chart(bt, window=252):
     if 'SKEW' not in bt.columns:
         return go.Figure()
     p = bt.tail(window).dropna(subset=['SKEW'])
@@ -500,13 +464,13 @@ def build_skew_chart(bt: pd.DataFrame, window: int = 252) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=p.index, y=p['SKEW'], name='CBOE SKEW',
         line=dict(color='#F0883E', width=2)))
-    skew_mean = p['SKEW'].mean()
-    fig.add_hline(y=skew_mean, line_dash='dot', line_color='#8B949E', line_width=1,
-        annotation_text=f'  Media: {skew_mean:.0f}', annotation_font=dict(color='#8B949E', size=9))
+    fig.add_hline(y=p['SKEW'].mean(), line_dash='dot', line_color='#8B949E', line_width=1,
+        annotation_text=f'  Media: {p["SKEW"].mean():.0f}',
+        annotation_font=dict(color='#8B949E', size=9))
     fig.add_hline(y=150, line_dash='dash', line_color='#F85149', line_width=1,
         annotation_text='  Extremo > 150', annotation_font=dict(color='#F85149', size=9))
     fig.update_layout(
-        title=dict(text='<b>CBOE SKEW Index</b><sup>  Demanda de protección · > 150 = extremo</sup>',
+        title=dict(text='<b>CBOE SKEW</b><sup>  Demanda de proteccion · > 150 = extremo</sup>',
                    font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
         template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
         height=280, margin=dict(l=50, r=30, t=55, b=40),
@@ -516,8 +480,7 @@ def build_skew_chart(bt: pd.DataFrame, window: int = 252) -> go.Figure:
     return fig
 
 
-def build_credit_chart(bt: pd.DataFrame, window: int = 252) -> go.Figure:
-    """Credit spread proxy + VIX overlay."""
+def build_credit_chart(bt, window=252):
     if 'Credit_Spread' not in bt.columns:
         return go.Figure()
     p = bt.tail(window).dropna(subset=['Credit_Spread'])
@@ -529,7 +492,7 @@ def build_credit_chart(bt: pd.DataFrame, window: int = 252) -> go.Figure:
     fig.add_trace(go.Scatter(x=p.index, y=p['VIX_Close'], name='VIX', yaxis='y2',
         line=dict(color='#F85149', width=1.5, dash='dot')))
     fig.update_layout(
-        title=dict(text='<b>Credit Spread vs VIX</b><sup>  Divergencia = warning de stress</sup>',
+        title=dict(text='<b>Credit Spread vs VIX</b><sup>  Divergencia = warning</sup>',
                    font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
         template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
         height=280, margin=dict(l=50, r=60, t=55, b=40),
@@ -544,30 +507,33 @@ def build_credit_chart(bt: pd.DataFrame, window: int = 252) -> go.Figure:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# MONITOR OPERATIVO — DATA LAYER
+# MONITOR OPERATIVO — DATA LAYER (parquet local del repo)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-DRIVE_FILE_ID = "12fzSq4BgkppRjoupeMjM67jCB8Qwo8Yz"
-DRIVE_URL     = f"https://drive.google.com/uc?id={DRIVE_FILE_ID}"
+PARQUET_PATH = "data/master.parquet"
 
-@st.cache_data(ttl=300)  # Refrescar cada 5 min (el CSV no cambia tan rápido)
-def load_master_csv() -> pd.DataFrame:
-    """Descarga el CSV maestro desde Google Drive vía gdown."""
+@st.cache_data(ttl=3600)
+def load_master_parquet() -> pd.DataFrame:
+    """
+    Lee el histórico desde data/master.parquet (repo de GitHub).
+    Instantáneo — sin red, sin Drive, sin gdown.
+    El notebook exporta: df.to_parquet('data/master.parquet') y hace push.
+    Columnas clave: VXX_Close, M1_Price, In_Contango, Contango_pct, VIX_Close
+    """
     log = logging.getLogger("vix_controller")
-    tmp = "/tmp/master_historico.csv"
     try:
-        import gdown
-        gdown.download(DRIVE_URL, tmp, quiet=True, fuzzy=True)
-        df = pd.read_csv(tmp, index_col=0, parse_dates=True).sort_index()
-        log.info(f"CSV cargado: {len(df):,} filas · {df.index[-1].strftime('%Y-%m-%d')}")
+        df = pd.read_parquet(PARQUET_PATH)
+        df.index = pd.to_datetime(df.index)
+        df = df.sort_index()
+        log.info(f"Parquet: {len(df):,} filas · {df.index[-1].strftime('%Y-%m-%d')}")
         return df
     except Exception as e:
-        log.error(f"Error cargando CSV: {e}")
+        log.error(f"Error parquet: {e}")
         return pd.DataFrame()
 
 
 @st.cache_data(ttl=55)
 def fetch_today_prices():
-    """Precios del día de yfinance: VXX, SVXY, SVIX, VIX, SPY."""
+    """Precios del día: VXX, SVXY, SVIX, VIX, SPY."""
     out = {}
     for name, sym in [("VXX","VXX"),("SVXY","SVXY"),("SVIX","SVIX"),
                        ("VIX","^VIX"),("SPY","SPY")]:
@@ -584,24 +550,26 @@ def fetch_today_prices():
     return out
 
 
-def build_strategy(df: pd.DataFrame) -> pd.DataFrame:
+@st.cache_data(ttl=3600)
+def build_strategy_cached(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Aplica la estrategia BB(20, 2σ) + Contango Rule sobre el DataFrame histórico.
-    Retorna el DataFrame con columnas de señal, indicadores y trades.
+    Aplica BB(20, 2σ) + Contango Rule sobre el histórico completo.
+    Cacheado 1h — mismo TTL que el parquet.
+
     Lógica exacta del notebook:
-      Entrada: VXX < SMA(20) → pos=1
-      Salida:  VXX > BB_Upper(2σ) → pos=0
-      Filtro:  In_Contango == 1
-      Ejecución: shift(1) — señal de hoy se ejecuta mañana
+      Entrada : VXX < SMA(20)       → pos=1 (BB timing)
+      Salida  : VXX > BB_Upper(2σ)  → pos=0 (salida por BB)
+               O In_Contango == 0   → pos=0 (salida por CT)
+      Filtro  : contango_filter = In_Contango (sin shift — es dato del cierre)
+      sig_final = sig_bb × ct_filter  (shift ya aplicado en sig_bb)
     """
-    bt = df[df['VXX_Close'].notna() & df['SVXY_Close'].notna() &
-            df['M1_Price'].notna()].copy()
+    bt = df[df['VXX_Close'].notna() & df['M1_Price'].notna()].copy()
 
     vxx = bt['VXX_Close']
-    bt['BB_SMA20']   = vxx.rolling(20).mean()
-    bt['BB_STD20']   = vxx.rolling(20).std()
-    bt['BB_Upper']   = bt['BB_SMA20'] + 2.0 * bt['BB_STD20']
-    bt['BB_Lower']   = bt['BB_SMA20'] - 2.0 * bt['BB_STD20']
+    bt['BB_SMA20'] = vxx.rolling(20).mean()
+    bt['BB_STD20'] = vxx.rolling(20).std()
+    bt['BB_Upper'] = bt['BB_SMA20'] + 2.0 * bt['BB_STD20']
+    bt['BB_Lower'] = bt['BB_SMA20'] - 2.0 * bt['BB_STD20']
 
     # Señal BB pura
     sig = pd.Series(0, index=bt.index)
@@ -612,342 +580,159 @@ def build_strategy(df: pd.DataFrame) -> pd.DataFrame:
         u = bt['BB_Upper'].iloc[i]
         if pd.isna(s) or pd.isna(u) or pd.isna(p):
             sig.iloc[i] = pos; continue
-        if pos == 0 and p < s: pos = 1
+        if pos == 0 and p < s:   pos = 1
         elif pos == 1 and p > u: pos = 0
         sig.iloc[i] = pos
 
-    bt['sig_bb']      = sig.shift(1).fillna(0)
-    bt['ct_filter']   = bt['In_Contango'].fillna(0).astype(int)
-    bt['sig_final']   = (bt['sig_bb'] * bt['ct_filter']).astype(int)
-
-    # Retorno estrategia
-    bt['strat_ret'] = bt['SVXY_ret'] * bt['sig_final']
-    bt['equity']    = (1 + bt['strat_ret'].fillna(0)).cumprod()
-
+    bt['sig_bb']    = sig.shift(1).fillna(0).astype(int)
+    bt['ct_filter'] = bt['In_Contango'].fillna(0).astype(int)
+    bt['sig_final'] = (bt['sig_bb'] * bt['ct_filter']).astype(int)
     return bt
 
 
-def extract_trades(bt: pd.DataFrame) -> pd.DataFrame:
-    """Extrae todos los trades (entrada/salida) del histórico."""
-    sig = bt['sig_final']
-    trades = []
-    entry_date = None
-
-    for i in range(1, len(sig)):
-        # Entrada: 0 → 1
-        if sig.iloc[i] == 1 and sig.iloc[i-1] == 0:
-            entry_date = sig.index[i]
-        # Salida: 1 → 0
-        elif sig.iloc[i] == 0 and sig.iloc[i-1] == 1 and entry_date is not None:
-            exit_date = sig.index[i]
-            rets = bt['SVXY_ret'].loc[entry_date:exit_date].dropna()
-            if len(rets) == 0:
-                entry_date = None; continue
-
-            trade_ret = (1 + rets).prod() - 1
-            duration  = len(rets)
-
-            # Razón de salida
-            prev = sig.index[i-1]
-            bb_exit = bt.loc[prev, 'VXX_Close'] > bt.loc[prev, 'BB_Upper'] if prev in bt.index else False
-            ct_exit = bt.loc[prev, 'In_Contango'] == 0 if prev in bt.index else False
-            if ct_exit and bb_exit: reason = 'Ambas'
-            elif ct_exit:           reason = 'Contango Rule'
-            else:                   reason = 'BB Superior'
-
-            trades.append({
-                'Entrada'        : entry_date.strftime('%Y-%m-%d'),
-                'Salida'         : exit_date.strftime('%Y-%m-%d'),
-                'Días'           : duration,
-                'Retorno'        : round(trade_ret * 100, 2),
-                'Razón salida'   : reason,
-                'VIX entrada'    : round(bt.loc[entry_date, 'VIX_Close'], 1) if entry_date in bt.index else None,
-                'Contango entr.' : round(bt.loc[entry_date, 'Contango_pct'], 2) if entry_date in bt.index else None,
-            })
-            entry_date = None
-
-    # Trade abierto actualmente
-    if entry_date is not None:
-        rets = bt['SVXY_ret'].loc[entry_date:].dropna()
-        trade_ret = (1 + rets).prod() - 1 if len(rets) > 0 else 0
-        trades.append({
-            'Entrada'        : entry_date.strftime('%Y-%m-%d'),
-            'Salida'         : '🔴 ABIERTO',
-            'Días'           : len(rets),
-            'Retorno'        : round(trade_ret * 100, 2),
-            'Razón salida'   : '—',
-            'VIX entrada'    : round(bt.loc[entry_date, 'VIX_Close'], 1) if entry_date in bt.index else None,
-            'Contango entr.' : round(bt.loc[entry_date, 'Contango_pct'], 2) if entry_date in bt.index else None,
-        })
-
-    return pd.DataFrame(trades)
-
-
-def calc_metrics(bt: pd.DataFrame) -> dict:
-    """Calcula métricas clave del backtest."""
-    sr = bt['strat_ret'].dropna()
-    if len(sr) < 50: return {}
-    eq     = (1 + sr).cumprod()
-    years  = len(eq) / 252
-    cagr   = (eq.iloc[-1] ** (1/years) - 1) * 100
-    peak   = eq.cummax()
-    mdd    = ((eq - peak) / peak).min() * 100
-    sharpe = sr.mean() / sr.std() * np.sqrt(252) if sr.std() > 0 else 0
-    calmar = abs(cagr / mdd) if mdd != 0 else 0
-    trades_in = (sr != 0)
-    wr     = (sr[trades_in] > 0).mean() * 100 if trades_in.sum() > 0 else 0
-    exp    = bt['sig_final'].mean() * 100
-    # Retornos anuales
-    yearly = {}
-    for yr in sorted(set(eq.index.year)):
-        yr_r = sr[sr.index.year == yr]
-        if len(yr_r) > 20:
-            yearly[yr] = round(((1 + yr_r).cumprod().iloc[-1] - 1) * 100, 1)
-    return dict(cagr=round(cagr,1), mdd=round(mdd,1), sharpe=round(sharpe,2),
-                calmar=round(calmar,2), wr=round(wr,1), exp=round(exp,1),
-                yearly=yearly, equity=eq)
-
-
-def build_bb_chart(bt: pd.DataFrame, window: int = 250) -> go.Figure:
-    """Gráfico VXX + Bollinger Bands con zonas y flechas ENTRY/EXIT."""
-    p = bt.tail(window).copy()
-
-    # Normalizar nombres de columna — compatibilidad con ambos esquemas
-    if 'SMA20' in p.columns and 'BB_SMA20' not in p.columns:
-        p['BB_SMA20'] = p['SMA20']
-    if 'BB_Upper' not in p.columns and 'BB_Upper_20' in p.columns:
-        p['BB_Upper'] = p['BB_Upper_20']
-    if 'BB_Lower' not in p.columns and 'BB_Lower_20' in p.columns:
-        p['BB_Lower'] = p['BB_Lower_20']
-    if 'sig_final' not in p.columns and 'bb_sig' in p.columns:
-        p['sig_final'] = p['bb_sig']
-    if 'VXX_Close' not in p.columns and 'VXX' in p.columns:
-        p['VXX_Close'] = p['VXX']
-
-    sig = p['sig_final']
-    fig = go.Figure()
-
-    # Zonas colored — agregar como trace con fill (mucho más eficiente que vrect)
-    # Crear columna de precio que solo existe cuando LONG para fill
-    p['long_zone'] = np.where(sig == 1, p['VXX_Close'].max() * 1.15, np.nan)
-    p['cash_zone'] = np.where(sig == 0, p['VXX_Close'].max() * 1.15, np.nan)
-    fig.add_trace(go.Scatter(x=p.index, y=p['long_zone'], mode='none',
-        fill='tozeroy', fillcolor='rgba(63,185,80,0.06)', showlegend=False,
-        hoverinfo='skip'))
-    fig.add_trace(go.Scatter(x=p.index, y=p['cash_zone'], mode='none',
-        fill='tozeroy', fillcolor='rgba(248,81,73,0.03)', showlegend=False,
-        hoverinfo='skip'))
-
-    # BB band fill
-    fig.add_trace(go.Scatter(x=p.index, y=p['BB_Upper'], mode='lines',
-        name='BB 2σ', line=dict(color='#F85149', width=1.2)))
-    fig.add_trace(go.Scatter(x=p.index, y=p['BB_Lower'], mode='lines',
-        name='BB Lower', line=dict(color='#F85149', width=0.5),
-        fill='tonexty', fillcolor='rgba(88,166,255,0.03)', showlegend=False))
-    fig.add_trace(go.Scatter(x=p.index, y=p['BB_SMA20'], mode='lines',
-        name='SMA(20)', line=dict(color='#58A6FF', width=1.5, dash='dash')))
-    fig.add_trace(go.Scatter(x=p.index, y=p['VXX_Close'], mode='lines',
-        name='VXX', line=dict(color='#F0F6FC', width=2)))
-
-    # ENTRY / EXIT arrows
-    for i in range(1, len(p)):
-        if sig.iloc[i] == 1 and sig.iloc[i-1] == 0:
-            fig.add_annotation(x=p.index[i], y=p['VXX_Close'].iloc[i],
-                text="▲ ENTRY", showarrow=True, arrowhead=2, arrowcolor="#3FB950",
-                font=dict(size=9, color="#3FB950", family="JetBrains Mono"), ax=0, ay=25)
-        elif sig.iloc[i] == 0 and sig.iloc[i-1] == 1:
-            fig.add_annotation(x=p.index[i], y=p['VXX_Close'].iloc[i],
-                text="▼ EXIT", showarrow=True, arrowhead=2, arrowcolor="#F85149",
-                font=dict(size=9, color="#F85149", family="JetBrains Mono"), ax=0, ay=-25)
-
-    # Today marker
-    fig.add_trace(go.Scatter(x=[p.index[-1]], y=[p['VXX_Close'].iloc[-1]],
-        mode='markers', name='Hoy',
-        marker=dict(size=12, color='#D29922', line=dict(width=2, color='white')),
-        showlegend=False))
-
-    fig.update_layout(
-        title=dict(text="<b>VXX + Bollinger Bands</b><sup>  BB(20, 2σ) · Verde=LONG SVXY · Rojo=CASH</sup>",
-                   font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
-        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
-        height=380, margin=dict(l=50, r=30, t=55, b=40),
-        xaxis=dict(gridcolor='#21262D',
-                   tickfont=dict(size=10, color='#8B949E', family='JetBrains Mono')),
-        yaxis=dict(title=dict(text="VXX", font=dict(size=11, color='#8B949E')),
-                   gridcolor='#21262D',
-                   tickfont=dict(size=10, color='#8B949E', family='JetBrains Mono')),
-        legend=dict(orientation='h', yanchor='bottom', y=1.02,
-                    bgcolor='rgba(0,0,0,0)',
-                    font=dict(size=9, color='#8B949E', family='JetBrains Mono')),
-        hovermode='x unified')
-    return fig
-
-
-def build_equity_chart(equity: pd.Series) -> go.Figure:
-    """Equity curve con drawdown."""
-    peak = equity.cummax()
-    dd   = (equity - peak) / peak * 100
-
-    fig = go.Figure()
-    # Drawdown fill
-    fig.add_trace(go.Scatter(x=equity.index, y=dd, mode='lines',
-        name='Drawdown %', line=dict(color='#F85149', width=1),
-        fill='tozeroy', fillcolor='rgba(248,81,73,0.12)',
-        yaxis='y2'))
-    # Equity
-    fig.add_trace(go.Scatter(x=equity.index, y=equity, mode='lines',
-        name='Equity ($1)', line=dict(color='#3FB950', width=2.5)))
-
-    fig.update_layout(
-        title=dict(text="<b>Equity Curve — SVXY BB(2σ) + Contango</b><sup>  Base $1 · 2018–hoy</sup>",
-                   font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
-        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
-        height=340, margin=dict(l=50, r=60, t=55, b=40),
-        xaxis=dict(gridcolor='#21262D',
-                   tickfont=dict(size=10, color='#8B949E', family='JetBrains Mono')),
-        yaxis=dict(title='Equity ($)', gridcolor='#21262D',
-                   tickfont=dict(size=10, color='#8B949E', family='JetBrains Mono')),
-        yaxis2=dict(title='Drawdown %', overlaying='y', side='right',
-                    tickfont=dict(size=9, color='#F85149', family='JetBrains Mono'),
-                    showgrid=False),
-        legend=dict(orientation='h', yanchor='bottom', y=1.02,
-                    bgcolor='rgba(0,0,0,0)',
-                    font=dict(size=9, color='#8B949E', family='JetBrains Mono')),
-        hovermode='x unified')
-    return fig
-
-
-def build_yearly_heatmap(yearly: dict) -> go.Figure:
-    """Heatmap simple de retornos anuales."""
-    years = sorted(yearly.keys())
-    vals  = [yearly[y] for y in years]
-    colors = ['#3FB950' if v >= 0 else '#F85149' for v in vals]
-
-    fig = go.Figure(go.Bar(
-        x=[str(y) for y in years], y=vals,
-        marker_color=colors,
-        text=[f"{v:+.1f}%" for v in vals],
-        textposition='outside',
-        textfont=dict(size=10, family='JetBrains Mono', color='#C9D1D9'),
-    ))
-    fig.update_layout(
-        title=dict(text="<b>Retorno Anual</b>",
-                   font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
-        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
-        height=280, margin=dict(l=40, r=20, t=50, b=30),
-        xaxis=dict(tickfont=dict(size=10, color='#8B949E', family='JetBrains Mono')),
-        yaxis=dict(tickfont=dict(size=10, color='#8B949E', family='JetBrains Mono'),
-                   gridcolor='#21262D', zeroline=True, zerolinecolor='#30363D'),
-        showlegend=False)
-    return fig
-
-
-def build_operational_chart(bt: pd.DataFrame, col_price: str,
-                            label: str, color: str,
-                            trades_df: pd.DataFrame,
-                            today_price: float = None,
-                            today_sig: int = 0) -> go.Figure:
+def build_vxx_operational_chart(bt: pd.DataFrame,
+                                 vxx_today: float,
+                                 final_sig_today: int,
+                                 ct_today: float | None) -> go.Figure:
     """
-    Gráfica operativa genérica para VXX, SVXY o SVIX.
-    Muestra precio histórico + zonas LONG/CASH + flechas entrada/salida
-    + punto de hoy si hay precio live.
-    col_price : columna del DataFrame (e.g. 'VXX_Close', 'SVXY_Close')
+    Gráfica operativa VXX con dos subpaneles:
+
+    Panel 1 — VXX + SMA(20) + BB 2σ:
+      · Zona verde      : LONG activo (sig_final==1)
+      · Zona roja tenue : Backwardation (sig_bb==1 pero ct==0)
+      · ▲ verde         : Entrada (sig_final 0→1)
+      · ▼ naranja       : Salida por BB (VXX cruzó BB_Upper)
+      · ▼ rojo          : Salida por Contango Rule (CT se apagó)
+      · 💎 hoy          : precio actual (verde=LONG, rojo=CASH)
+
+    Panel 2 — Contango % histórico (barras verdes/rojas del CSV)
+              + punto de hoy en CBOE live
     """
-    # Usar solo filas donde existe el precio
-    p = bt[bt[col_price].notna()].copy()
-    sig = p['sig_final']
-    price_s = p[col_price]
+    from plotly.subplots import make_subplots
 
-    fig = go.Figure()
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        row_heights=[0.68, 0.32],
+        vertical_spacing=0.03,
+    )
 
-    # ── Zonas LONG / CASH (eficiente, sin vrect loop) ────────
-    p_plot = p.copy()
-    p_plot['long_zone'] = np.where(sig == 1, price_s.max() * 1.15, np.nan)
-    fig.add_trace(go.Scatter(x=p_plot.index, y=p_plot['long_zone'], mode='none',
-        fill='tozeroy', fillcolor='rgba(63,185,80,0.06)', showlegend=False,
-        hoverinfo='skip'))
+    sig    = bt['sig_final']
+    sig_bb = bt['sig_bb']
+    ct     = bt['ct_filter']
+    vxx    = bt['VXX_Close']
+    y_top  = vxx.max() * 1.25
 
-    # ── Precio ─────────────────────────────────────────────────
+    # ── Zona LONG (verde) ─────────────────────────────────────
+    long_y = np.where(sig == 1, y_top, np.nan)
     fig.add_trace(go.Scatter(
-        x=price_s.index, y=price_s.values,
-        mode='lines', name=label,
-        line=dict(color=color, width=2),
-        hovertemplate='%{x|%Y-%m-%d}<br>' + label + ': $%{y:.2f}<extra></extra>',
-    ))
+        x=bt.index, y=long_y, mode='none',
+        fill='tozeroy', fillcolor='rgba(63,185,80,0.09)',
+        showlegend=True, name='LONG activo', hoverinfo='skip',
+    ), row=1, col=1)
 
-    # ── Flechas ENTRY / EXIT desde trades_df ──────────────────
-    closed = trades_df[trades_df['Salida'] != '🔴 ABIERTO']
-    open_t = trades_df[trades_df['Salida'] == '🔴 ABIERTO']
+    # ── Zona Backwardation (rojo tenue) ───────────────────────
+    bkwd_y = np.where((sig_bb == 1) & (ct == 0), y_top, np.nan)
+    fig.add_trace(go.Scatter(
+        x=bt.index, y=bkwd_y, mode='none',
+        fill='tozeroy', fillcolor='rgba(248,81,73,0.07)',
+        showlegend=True, name='Backwardation', hoverinfo='skip',
+    ), row=1, col=1)
 
-    for _, t in closed.iterrows():
-        entry_d = pd.Timestamp(t['Entrada'])
-        exit_d  = pd.Timestamp(t['Salida'])
-        # Buscar precio más cercano a esa fecha
-        if entry_d in price_s.index:
-            ep = price_s.loc[entry_d]
-        elif len(price_s.loc[price_s.index >= entry_d]) > 0:
-            ep = price_s.loc[price_s.index >= entry_d].iloc[0]
-        else:
-            continue
-        if exit_d in price_s.index:
-            xp = price_s.loc[exit_d]
-        elif len(price_s.loc[price_s.index >= exit_d]) > 0:
-            xp = price_s.loc[price_s.index >= exit_d].iloc[0]
-        else:
-            continue
+    # ── BB + SMA + VXX ────────────────────────────────────────
+    fig.add_trace(go.Scatter(x=bt.index, y=bt['BB_Upper'],
+        mode='lines', name='BB 2σ',
+        line=dict(color='#F85149', width=1, dash='dot')), row=1, col=1)
+    fig.add_trace(go.Scatter(x=bt.index, y=bt['BB_Lower'],
+        mode='lines', showlegend=False,
+        line=dict(color='#F85149', width=0.5, dash='dot'),
+        fill='tonexty', fillcolor='rgba(248,81,73,0.03)'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=bt.index, y=bt['BB_SMA20'],
+        mode='lines', name='SMA(20)',
+        line=dict(color='#58A6FF', width=1.5, dash='dash')), row=1, col=1)
+    fig.add_trace(go.Scatter(x=bt.index, y=vxx,
+        mode='lines', name='VXX',
+        line=dict(color='#F0F6FC', width=2),
+        hovertemplate='%{x|%Y-%m-%d}  VXX: $%{y:.2f}<extra></extra>'), row=1, col=1)
 
-        fig.add_annotation(x=entry_d, y=ep,
-            text="▲", showarrow=False,
-            font=dict(size=13, color="#3FB950", family="JetBrains Mono"),
-            yshift=-16)
-        fig.add_annotation(x=exit_d, y=xp,
-            text="▼", showarrow=False,
-            font=dict(size=13, color="#F85149", family="JetBrains Mono"),
-            yshift=16)
+    # ── Flechas ───────────────────────────────────────────────
+    for i in range(1, len(sig)):
+        date     = sig.index[i]
+        y_val    = vxx.iloc[i]
+        prev_sig = sig.iloc[i-1];   cur_sig  = sig.iloc[i]
+        prev_bb  = sig_bb.iloc[i-1]; cur_bb  = sig_bb.iloc[i]
+        prev_ct  = ct.iloc[i-1];    cur_ct   = ct.iloc[i]
 
-    # Trade abierto actualmente
-    for _, t in open_t.iterrows():
-        entry_d = pd.Timestamp(t['Entrada'])
-        if entry_d in price_s.index:
-            ep = price_s.loc[entry_d]
-        elif len(price_s.loc[price_s.index >= entry_d]) > 0:
-            ep = price_s.loc[price_s.index >= entry_d].iloc[0]
-        else:
-            continue
-        fig.add_annotation(x=entry_d, y=ep,
-            text="▲ OPEN", showarrow=True,
-            arrowhead=2, arrowcolor="#3FB950",
-            font=dict(size=9, color="#3FB950", family="JetBrains Mono"),
-            ax=0, ay=30)
+        if cur_sig == 1 and prev_sig == 0:
+            # Entrada
+            fig.add_annotation(x=date, y=y_val, yshift=-22,
+                text="▲", showarrow=False,
+                font=dict(size=16, color='#3FB950', family='JetBrains Mono'),
+                row=1, col=1)
+        elif cur_sig == 0 and prev_sig == 1:
+            if cur_bb == 0 and prev_bb == 1:
+                # Salida por BB (naranja)
+                fig.add_annotation(x=date, y=y_val, yshift=22,
+                    text="▼", showarrow=False,
+                    font=dict(size=16, color='#D29922', family='JetBrains Mono'),
+                    row=1, col=1)
+            elif cur_ct == 0 and prev_ct == 1:
+                # Salida por Contango Rule (rojo)
+                fig.add_annotation(x=date, y=y_val, yshift=22,
+                    text="▼", showarrow=False,
+                    font=dict(size=16, color='#F85149', family='JetBrains Mono'),
+                    row=1, col=1)
+            else:
+                # Ambas (naranja — BB dominó)
+                fig.add_annotation(x=date, y=y_val, yshift=22,
+                    text="▼", showarrow=False,
+                    font=dict(size=16, color='#D29922', family='JetBrains Mono'),
+                    row=1, col=1)
 
-    # ── Punto de hoy ───────────────────────────────────────────
-    if today_price and today_price > 0:
-        today_clr = '#3FB950' if today_sig == 1 else '#F85149'
-        today_lbl = '🟢 HOY — LONG' if today_sig == 1 else '🔴 HOY — CASH'
-        fig.add_trace(go.Scatter(
-            x=[pd.Timestamp.now().normalize()],
-            y=[today_price],
-            mode='markers+text',
-            name=today_lbl,
-            text=[f"${today_price:.2f}"],
-            textposition='top center',
-            textfont=dict(size=10, color=today_clr, family='JetBrains Mono'),
-            marker=dict(size=14, color=today_clr,
-                        line=dict(width=2, color='white'), symbol='diamond'),
-        ))
+    # Punto de hoy
+    today_clr = '#3FB950' if final_sig_today else '#F85149'
+    fig.add_trace(go.Scatter(
+        x=[bt.index[-1]], y=[vxx_today],
+        mode='markers', name='HOY — LONG' if final_sig_today else 'HOY — CASH',
+        marker=dict(size=14, color=today_clr,
+                    line=dict(width=2, color='white'), symbol='diamond'),
+        hovertemplate=f'HOY: ${vxx_today:.2f}<extra></extra>',
+    ), row=1, col=1)
 
+    # ── Panel 2: Contango histórico ───────────────────────────
+    if 'Contango_pct' in bt.columns:
+        ct_hist  = bt['Contango_pct'].fillna(0)
+        bar_clrs = ['#3FB950' if v > 0 else '#F85149' for v in ct_hist]
+        fig.add_trace(go.Bar(
+            x=bt.index, y=ct_hist,
+            name='Contango %', marker_color=bar_clrs, opacity=0.7,
+            hovertemplate='%{x|%Y-%m-%d}  CT: %{y:+.2f}%<extra></extra>',
+        ), row=2, col=1)
+        if ct_today is not None:
+            ct_clr = '#3FB950' if ct_today > 0 else '#F85149'
+            fig.add_trace(go.Scatter(
+                x=[bt.index[-1]], y=[ct_today],
+                mode='markers', name=f'CT hoy: {ct_today:+.2f}%',
+                marker=dict(size=10, color=ct_clr, symbol='diamond',
+                            line=dict(width=2, color='white')),
+            ), row=2, col=1)
+        fig.add_hline(y=0, line_color='#484F58', line_width=1, row=2, col=1)
+
+    # ── Layout ────────────────────────────────────────────────
     fig.update_layout(
         title=dict(
-            text=f"<b>{label} — Operativa</b>"
-                 f"<sup>  Verde=LONG SVXY · Rojo=CASH · ▲Entrada · ▼Salida</sup>",
-            font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
+            text="<b>VXX — Monitor Operativo BB(20, 2σ) + Contango Rule</b>"
+                 "<sup>  ▲=Entrada  ▼🟡=Salida BB  ▼🔴=Salida CT  💎=Hoy</sup>",
+            font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5,
+        ),
         template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
-        height=400, margin=dict(l=55, r=30, t=55, b=40),
+        height=560, margin=dict(l=55, r=30, t=65, b=40),
         xaxis=dict(
-            gridcolor='#21262D', rangeslider=dict(visible=False),
+            gridcolor='#21262D',
             tickfont=dict(size=10, color='#8B949E', family='JetBrains Mono'),
             rangeselector=dict(
                 buttons=[
+                    dict(count=1,  label="1M",  step="month", stepmode="backward"),
                     dict(count=3,  label="3M",  step="month", stepmode="backward"),
                     dict(count=6,  label="6M",  step="month", stepmode="backward"),
                     dict(count=1,  label="1A",  step="year",  stepmode="backward"),
@@ -958,15 +743,19 @@ def build_operational_chart(bt: pd.DataFrame, col_price: str,
                 font=dict(size=9, color='#C9D1D9', family='JetBrains Mono'),
             ),
         ),
-        yaxis=dict(
-            title=dict(text=f"{label} ($)", font=dict(size=11, color='#8B949E')),
-            gridcolor='#21262D',
-            tickfont=dict(size=10, color='#8B949E', family='JetBrains Mono'),
-        ),
-        legend=dict(orientation='h', yanchor='bottom', y=1.02,
+        xaxis2=dict(gridcolor='#21262D',
+                    tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
+        yaxis=dict(title=dict(text="VXX ($)", font=dict(size=11, color='#8B949E')),
+                   gridcolor='#21262D',
+                   tickfont=dict(size=10, color='#8B949E', family='JetBrains Mono')),
+        yaxis2=dict(title=dict(text="Contango %", font=dict(size=10, color='#8B949E')),
+                    gridcolor='#21262D',
+                    tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono'),
+                    zeroline=True, zerolinecolor='#30363D'),
+        legend=dict(orientation='h', yanchor='bottom', y=1.05,
                     bgcolor='rgba(0,0,0,0)',
                     font=dict(size=9, color='#8B949E', family='JetBrains Mono')),
-        hovermode='x unified',
+        hovermode='x unified', dragmode=False, bargap=0,
     )
     return fig
 
@@ -1078,42 +867,15 @@ def build_term_chart(vix_spot, df_vx, show_prev=True):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# AUTO-REFRESH — JS real timer (no requiere interacción del usuario)
+# SIN AUTO-REFRESH — solo botón manual en sidebar
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-REFRESH_INTERVAL = 60  # segundos
-
-if "last_refresh" not in st.session_state:
-    st.session_state.last_refresh = time.time()
-
-elapsed = time.time() - st.session_state.last_refresh
-if elapsed > REFRESH_INTERVAL:
-    st.session_state.last_refresh = time.time()
-    st.cache_data.clear()
-    st.rerun()
-
-# JS countdown + page reload automático cada 60s sin interacción
-st.components.v1.html(f"""
-<script>
-(function() {{
-    var remaining = {REFRESH_INTERVAL};
-    var timer = setInterval(function() {{
-        remaining--;
-        var el = window.parent.document.getElementById('refresh-countdown');
-        if (el) el.textContent = remaining + 's';
-        if (remaining <= 0) {{
-            clearInterval(timer);
-            window.parent.location.reload();
-        }}
-    }}, 1000);
-}})();
-</script>
-""", height=0)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # HEADER
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-mkt_status = "MARKET OPEN" if datetime.now().hour >= 9 and datetime.now().hour < 16 and datetime.now().weekday() < 5 else "MARKET CLOSED"
+now_str = now_cdmx().strftime("%Y-%m-%d %H:%M:%S") + " CDMX"
+_h = now_cdmx().hour + now_cdmx().minute / 60
+mkt_status = "MARKET OPEN" if 8.5 <= _h < 15 and now_cdmx().weekday() < 5 else "MARKET CLOSED"
 mkt_clr = "#3FB950" if "OPEN" in mkt_status else "#8B949E"
 st.markdown(f"""
 <div class="hdr">
@@ -1126,7 +888,7 @@ st.markdown(f"""
     </div>
     <div class="sub">
         <span style="color:{mkt_clr};font-weight:600">{mkt_status}</span> · {now_str}<br>
-        Auto-refresh in <span id="refresh-countdown" style="color:#F7931A;font-weight:600">{REFRESH_INTERVAL}s</span> · Source: CBOE Delayed Quotes
+        Source: CBOE Delayed Quotes · Actualiza con botón manual
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -1139,9 +901,17 @@ with st.sidebar:
     N_MONTHS = st.slider("Max futures months", 4, 12, 8)
     SHOW_PREV = st.checkbox("Show previous day", True)
     SHOW_TABLE = st.checkbox("Show data table", True)
-    if st.button("🔄 Refresh Now"):
-        st.session_state.last_refresh = time.time()
-        st.cache_data.clear()
+    st.markdown("---")
+    st.markdown("**🔄 Actualizar datos**")
+    if st.button("📡 Refresh CBOE + yfinance", use_container_width=True):
+        scrape_cboe_futures.clear()
+        fetch_vix_spot.clear()
+        fetch_etps.clear()
+        fetch_today_prices.clear()
+        st.rerun()
+    if st.button("🗄️ Recargar Parquet (repo)", use_container_width=True):
+        load_master_parquet.clear()
+        build_strategy_cached.clear()
         st.rerun()
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1329,75 +1099,66 @@ with tab1:
 # ━━━━━━━━━━━━━━━━━ TAB 2: MONITOR OPERATIVO ━━━━━━━━━━━━━━━
 with tab2:
 
-    # ── Cargar datos ──────────────────────────────────────────
-    with st.spinner("📂 Cargando histórico desde Google Drive…"):
-        df_master = load_master_csv()
-
-    today_px = fetch_today_prices()
+    # ── Cargar parquet (del repo, instantáneo) ────────────────
+    df_master = load_master_parquet()
 
     if df_master.empty:
-        st.error("❌ No se pudo cargar el CSV desde Google Drive. Verifica que el archivo sea público.")
+        st.error("❌ No se encontró data/master.parquet en el repositorio.")
+        st.info("Ejecuta el notebook de actualización y haz push: df.to_parquet('data/master.parquet')")
         st.stop()
 
-    # ── Aplicar estrategia sobre histórico ───────────────────
-    bt = build_strategy(df_master)
-    trades_df = extract_trades(bt)
-    metrics = calc_metrics(bt)
+    # ── Aplicar estrategia (cacheado 1h) ──────────────────────
+    bt = build_strategy_cached(df_master)
 
-    # ── Señal de HOY ─────────────────────────────────────────
-    # BB: basado en histórico CSV + precio VXX de hoy (yfinance)
-    last_hist = bt.iloc[-1]
-    last_date = bt.index[-1]
+    # ── Precios de hoy (yfinance) ─────────────────────────────
+    today_px   = fetch_today_prices()
+    last_hist  = bt.iloc[-1]
+    last_date  = bt.index[-1]
 
-    # VXX de hoy desde yfinance
-    vxx_today   = today_px.get('VXX', {}).get('close', last_hist['VXX_Close'])
-    vxx_date    = today_px.get('VXX', {}).get('date', last_date.date())
-    sma20_today = last_hist['BB_SMA20']
-    bb_up_today = last_hist['BB_Upper']
+    vxx_today  = float(today_px.get('VXX',  {}).get('close', last_hist['VXX_Close']))
+    svxy_today = float(today_px.get('SVXY', {}).get('close', 0))
+    svix_today = float(today_px.get('SVIX', {}).get('close', 0))
+    vix_val    = float(today_px.get('VIX',  {}).get('close', last_hist.get('VIX_Close', 0)))
 
-    # BB signal de hoy (sin shift — es la señal que se ejecuta mañana)
-    bb_pos_hist = int(last_hist['sig_bb'])  # posición BB al cierre de ayer
-    if bb_pos_hist == 0 and vxx_today < sma20_today:
-        bb_sig_today = 1
-    elif bb_pos_hist == 1 and vxx_today > bb_up_today:
-        bb_sig_today = 0
-    else:
-        bb_sig_today = bb_pos_hist
+    sma20  = float(last_hist['BB_SMA20'])
+    bb_up  = float(last_hist['BB_Upper'])
 
-    # Contango de hoy: CBOE live (Tab 1) tiene prioridad
-    # m1p y m2p vienen del scope global (scrapeado del CBOE)
+    # BB signal de hoy (posición actual, sin shift)
+    bb_pos = int(last_hist['sig_bb'])
+    if bb_pos == 0 and vxx_today < sma20:   bb_sig_today = 1
+    elif bb_pos == 1 and vxx_today > bb_up: bb_sig_today = 0
+    else:                                    bb_sig_today = bb_pos
+
+    # Contango live del CBOE (del Tab 1 — m1p, m2p en scope global)
     if m1p and m2p and m1p > 0:
-        ct_today     = cpct(m1p, m2p)
-        ct_source    = "CBOE live"
-        m1_sym_today = df_vx['Symbol'].iloc[0] if not df_vx.empty else "M1"
-        m2_sym_today = df_vx['Symbol'].iloc[1] if len(df_vx) > 1 else "M2"
+        ct_today  = cpct(m1p, m2p)
+        ct_source = "CBOE live"
+        m1_sym    = df_vx['Symbol'].iloc[0] if not df_vx.empty else "M1"
+        m2_sym    = df_vx['Symbol'].iloc[1] if len(df_vx) > 1 else "M2"
     else:
-        ct_today     = float(last_hist.get('Contango_pct', 0))
-        ct_source    = "CSV histórico"
-        m1_sym_today = str(last_hist.get('M1_Symbol', 'M1'))
-        m2_sym_today = str(last_hist.get('M2_Symbol', 'M2'))
+        ct_today  = float(last_hist.get('Contango_pct', 0)) if 'Contango_pct' in last_hist else None
+        ct_source = "CSV histórico"
+        m1_sym    = str(last_hist.get('M1_Symbol', 'M1'))
+        m2_sym    = str(last_hist.get('M2_Symbol', 'M2'))
 
-    in_ct_today   = ct_today is not None and ct_today > 0
+    in_ct_today     = ct_today is not None and ct_today > 0
     final_sig_today = int(bb_sig_today == 1 and in_ct_today)
 
-    # Día de ejecución = mañana (siguiente día hábil)
-    exec_date = datetime.now().date() + timedelta(days=1)
+    exec_date = now_cdmx().date() + timedelta(days=1)
     while exec_date.weekday() >= 5:
         exec_date += timedelta(days=1)
 
-    pct_to_sma = (vxx_today / sma20_today - 1) * 100 if sma20_today else 0
-    pct_to_bb  = (vxx_today / bb_up_today  - 1) * 100 if bb_up_today else 0
+    pct_to_sma = (vxx_today / sma20 - 1) * 100 if sma20 else 0
+    pct_to_bb  = (vxx_today / bb_up  - 1) * 100 if bb_up  else 0
     ct_str     = f"{ct_today:+.2f}%" if ct_today is not None else "N/A"
-    vix_today  = today_px.get('VIX', {}).get('close', float(last_hist.get('VIX_Close', 0)))
-    svxy_today = today_px.get('SVXY', {}).get('close', 0)
-    svix_today = today_px.get('SVIX', {}).get('close', 0)
-    spy_today  = today_px.get('SPY',  {}).get('close', 0)
 
-    # Régimen VIX
-    if vix_today < 15:   regime, r_clr = "BAJO — óptimo",      "var(--g)"
-    elif vix_today < 20: regime, r_clr = "NORMAL — bueno",     "var(--g)"
-    elif vix_today < 28: regime, r_clr = "ELEVADO — precaución","var(--y)"
-    else:                regime, r_clr = "CRISIS — peligro",   "var(--r)"
+    if vix_val < 15:   regime, r_clr = "BAJO — óptimo",       "var(--g)"
+    elif vix_val < 20: regime, r_clr = "NORMAL — bueno",      "var(--g)"
+    elif vix_val < 28: regime, r_clr = "ELEVADO — precaución","var(--y)"
+    else:              regime, r_clr = "CRISIS — peligro",    "var(--r)"
+
+    def mcard(label, val, clr="nt"):
+        return f'<div class="mpill"><div class="ml">{label}</div><div class="mv {clr}">{val}</div></div>'
 
     # ═══════════════════════════════════════════
     # SECCIÓN 1 — SEÑAL DE HOY
@@ -1405,432 +1166,252 @@ with tab2:
     sig_cls = "sig-long" if final_sig_today else "sig-cash"
     sig_txt = "LONG SVXY" if final_sig_today else "CASH"
     sig_clr = "var(--g)" if final_sig_today else "var(--r)"
-    bb_ok   = "ok" if bb_sig_today == 1 else "no"
-    bb_mark = "✓" if bb_sig_today == 1 else "✗"
-    ct_ok   = "ok" if in_ct_today else "no"
-    ct_mark = "✓" if in_ct_today else "✗"
+    bb_ok   = "ok" if bb_sig_today else "no"
+    ct_ok   = "ok" if in_ct_today  else "no"
 
-    col_sig, col_bb, col_ct, col_veh = st.columns([1.3, 1.5, 1.5, 1.3])
+    c1, c2, c3, c4 = st.columns([1.3, 1.5, 1.5, 1.3])
 
-    with col_sig:
-        st.markdown(f"""
-        <div class="sig-box {sig_cls}" style="height:100%">
-            <div class="sl" style="color:{sig_clr};font-size:2.2rem">{sig_txt}</div>
-            <div class="sd" style="margin-top:0.4rem">Ejecución mañana al OPEN</div>
-            <div class="sd">{exec_date.strftime('%Y-%m-%d')} · {vxx_date}</div>
+    with c1:
+        st.markdown(f"""<div class="sig-box {sig_cls}">
+            <div class="sl" style="color:{sig_clr}">{sig_txt}</div>
+            <div class="sd">Ejecutar {exec_date.strftime('%Y-%m-%d')} al OPEN</div>
+            <div class="sd">Señal cierre {last_date.strftime('%Y-%m-%d')}</div>
         </div>""", unsafe_allow_html=True)
 
-    with col_bb:
-        sma_clr = "var(--g)" if vxx_today < sma20_today else "var(--r)"
-        bb_clr2 = "var(--g)" if vxx_today <= bb_up_today else "var(--r)"
-        st.markdown(f"""
-        <div class="icard">
+    with c2:
+        sma_clr = "var(--g)" if vxx_today < sma20 else "var(--r)"
+        bb_clr  = "var(--g)" if vxx_today <= bb_up else "var(--r)"
+        st.markdown(f"""<div class="icard">
             <div class="ic-title">📊 BB Timing — VXX</div>
             <div class="ic-row"><span class="ic-label">Señal BB</span>
-                <span class="ic-val"><span class="{bb_ok}" style="font-size:1rem">{bb_mark}</span>
-                {'LONG' if bb_sig_today else 'CASH'}</span></div>
-            <div class="ic-row"><span class="ic-label">VXX</span>
+                <span class="ic-val"><span class="{bb_ok}">{"✓" if bb_sig_today else "✗"}</span>
+                {"&nbsp;LONG" if bb_sig_today else "&nbsp;CASH"}</span></div>
+            <div class="ic-row"><span class="ic-label">VXX hoy</span>
                 <span class="ic-val" style="font-weight:700">${vxx_today:.2f}</span></div>
             <div class="ic-row"><span class="ic-label">SMA(20)</span>
-                <span class="ic-val" style="color:{sma_clr}">${sma20_today:.2f}
-                ({pct_to_sma:+.1f}%)</span></div>
+                <span class="ic-val" style="color:{sma_clr}">${sma20:.2f} ({pct_to_sma:+.1f}%)</span></div>
             <div class="ic-row"><span class="ic-label">BB 2σ</span>
-                <span class="ic-val" style="color:{bb_clr2}">${bb_up_today:.2f}
-                ({pct_to_bb:+.1f}%)</span></div>
+                <span class="ic-val" style="color:{bb_clr}">${bb_up:.2f} ({pct_to_bb:+.1f}%)</span></div>
         </div>""", unsafe_allow_html=True)
 
-    with col_ct:
-        ct_clr   = "var(--g)" if in_ct_today else "var(--r)"
+    with c3:
+        ct_clr    = "var(--g)" if in_ct_today else "var(--r)"
         ct_estado = "CONTANGO" if in_ct_today else "BACKWARDATION"
-        m1_disp  = f"${m1p:.2f}" if m1p else "—"
-        m2_disp  = f"${m2p:.2f}" if m2p else "—"
-        st.markdown(f"""
-        <div class="icard">
+        m1_disp   = f"${m1p:.2f}" if m1p else "—"
+        m2_disp   = f"${m2p:.2f}" if m2p else "—"
+        st.markdown(f"""<div class="icard">
             <div class="ic-title">📈 Contango ({ct_source})</div>
             <div class="ic-row"><span class="ic-label">Señal CT</span>
-                <span class="ic-val"><span class="{ct_ok}" style="font-size:1rem">{ct_mark}</span>
-                <span style="color:{ct_clr};font-weight:700"> {ct_estado}</span></span></div>
-            <div class="ic-row"><span class="ic-label">{m1_sym_today} (M1)</span>
+                <span class="ic-val"><span class="{ct_ok}">{"✓" if in_ct_today else "✗"}</span>
+                <span style="color:{ct_clr};font-weight:700">&nbsp;{ct_estado}</span></span></div>
+            <div class="ic-row"><span class="ic-label">{m1_sym} (M1)</span>
                 <span class="ic-val">{m1_disp}</span></div>
-            <div class="ic-row"><span class="ic-label">{m2_sym_today} (M2)</span>
+            <div class="ic-row"><span class="ic-label">{m2_sym} (M2)</span>
                 <span class="ic-val">{m2_disp}</span></div>
             <div class="ic-row"><span class="ic-label">Contango %</span>
                 <span class="ic-val" style="color:{ct_clr};font-weight:700">{ct_str}</span></div>
             <div class="ic-row"><span class="ic-label">VIX</span>
-                <span class="ic-val" style="color:{r_clr}">{vix_today:.1f} · {regime}</span></div>
+                <span class="ic-val" style="color:{r_clr}">{vix_val:.1f} · {regime}</span></div>
         </div>""", unsafe_allow_html=True)
 
-    with col_veh:
+    with c4:
         svxy_chg = ""
         if today_px.get('SVXY', {}).get('prev'):
             d = svxy_today - today_px['SVXY']['prev']
             svxy_chg = f" ({d:+.2f})"
-        st.markdown(f"""
-        <div class="icard">
+        st.markdown(f"""<div class="icard">
             <div class="ic-title">💼 Vehículos</div>
             <div class="ic-row"><span class="ic-label">SVXY (-0.5x)</span>
                 <span class="ic-val" style="color:var(--c);font-weight:700">${svxy_today:.2f}{svxy_chg}</span></div>
             <div class="ic-row"><span class="ic-label">SVIX (-1x)</span>
                 <span class="ic-val" style="color:var(--c)">${svix_today:.2f}</span></div>
-            <div class="ic-row"><span class="ic-label">SPY</span>
-                <span class="ic-val">${spy_today:.2f}</span></div>
             <div class="ic-row"><span class="ic-label">VIX Spot</span>
-                <span class="ic-val">{vix_today:.2f}</span></div>
+                <span class="ic-val">{vix_val:.2f}</span></div>
+            <div class="ic-row"><span class="ic-label">CSV al</span>
+                <span class="ic-val" style="color:var(--dim)">{last_date.strftime('%Y-%m-%d')}</span></div>
         </div>""", unsafe_allow_html=True)
 
     # Alertas
-    alerts = []
     if final_sig_today and pct_to_bb > -3:
-        alerts.append(f"⚠️ VXX a {abs(pct_to_bb):.1f}% de la BB Superior — posible salida pronto")
+        st.warning(f"⚠️ VXX a {abs(pct_to_bb):.1f}% de la BB Superior — posible salida pronto")
     if ct_today is not None and 0 < ct_today < 1:
-        alerts.append(f"⚠️ Contango muy bajo ({ct_today:.2f}%) — monitorear de cerca")
+        st.warning(f"⚠️ Contango muy bajo ({ct_today:.2f}%) — monitorear")
     if not final_sig_today and abs(pct_to_sma) < 2 and in_ct_today:
-        alerts.append(f"🔔 Posible entrada pronto — VXX a {abs(pct_to_sma):.1f}% de SMA(20)")
+        st.info(f"🔔 Posible entrada pronto — VXX a {abs(pct_to_sma):.1f}% de SMA(20)")
     if not in_ct_today and bb_sig_today == 1:
-        alerts.append("⚠️ BB dice LONG pero hay backwardation — CASH por Contango Rule")
-    for a in alerts:
-        st.warning(a)
+        st.warning("⚠️ BB dice LONG pero hay backwardation — CASH por Contango Rule")
 
-    st.markdown("<div style='height:0.3rem'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='border-top:1px solid #30363D;margin:0.8rem 0'></div>",
+                unsafe_allow_html=True)
 
     # ═══════════════════════════════════════════
-    # SECCIÓN 2 — MÉTRICAS RESUMEN + EQUITY CURVE
+    # SECCIÓN 2 — GRÁFICA VXX OPERATIVA
     # ═══════════════════════════════════════════
-    st.markdown("<div style='border-top:1px solid #30363D;margin:0.8rem 0 0.6rem'></div>",
-                unsafe_allow_html=True)
+    fig_mon = build_vxx_operational_chart(
+        bt=bt,
+        vxx_today=vxx_today,
+        final_sig_today=final_sig_today,
+        ct_today=ct_today,
+    )
+    st.plotly_chart(fig_mon, use_container_width=True,
+                    config=dict(displayModeBar=True, displaylogo=False,
+                                scrollZoom=False,
+                                modeBarButtonsToRemove=['select2d','lasso2d']))
 
-    # ── helper for metric cards ──
-    def mcard(label, val, clr="nt"):
-        return f'<div class="mpill"><div class="ml">{label}</div><div class="mv {clr}">{val}</div></div>'
-
-    if metrics:
-        m = metrics
-
-        st.markdown(f"""<div class="mrow">
-            {mcard("CAGR", f"{m['cagr']:+.1f}%", "up" if m['cagr']>0 else "dn")}
-            {mcard("Max DD", f"{m['mdd']:.1f}%", "dn")}
-            {mcard("Sharpe", f"{m['sharpe']:.2f}", "up" if m['sharpe']>1 else "nt")}
-            {mcard("Calmar", f"{m['calmar']:.2f}", "up" if m['calmar']>1 else "nt")}
-            {mcard("Win Rate", f"{m['wr']:.1f}%", "nt")}
-            {mcard("Exposición", f"{m['exp']:.1f}%", "nt")}
-        </div>""", unsafe_allow_html=True)
-
-        col_eq, col_yr = st.columns([2, 1])
-        with col_eq:
-            fig_eq = build_equity_chart(m['equity'])
-            st.plotly_chart(fig_eq, width="stretch",
-                            config=dict(displayModeBar=False, displaylogo=False))
-        with col_yr:
-            fig_yr = build_yearly_heatmap(m['yearly'])
-            st.plotly_chart(fig_yr, width="stretch",
-                            config=dict(displayModeBar=False, displaylogo=False))
-
-    # ═══════════════════════════════════════════
-    # SECCIÓN 3 — GRÁFICAS OPERATIVAS
-    # ═══════════════════════════════════════════
-    st.markdown("<div style='border-top:1px solid #30363D;margin:0.8rem 0 0.5rem'></div>",
-                unsafe_allow_html=True)
-    st.markdown("<div style='font-family:Inter;font-weight:700;font-size:0.9rem;"
-                "color:#F0F6FC;margin-bottom:0.6rem'>📊 Gráficas Operativas</div>",
-                unsafe_allow_html=True)
-
-    # ── Gráfica 1: VXX + BB ────────────────────────────────────
-    st.markdown("<div style='font-family:JetBrains Mono;font-size:0.72rem;"
-                "color:#8B949E;margin-bottom:0.2rem'>SEÑAL DE TIMING · VXX vs BB(20, 2σ)</div>",
-                unsafe_allow_html=True)
-    try:
-        fig_vxx = build_bb_chart(bt, window=250)
-        st.plotly_chart(fig_vxx, width="stretch",
-                        config=dict(displayModeBar=True, displaylogo=False,
-                                    modeBarButtonsToRemove=['select2d','lasso2d']))
-    except Exception as e:
-        st.error(f"Error en gráfica VXX: {e}")
-
-    # ── Gráfica 2: SVIX operativa ──────────────────────────────
-    if 'SVIX_Close' in bt.columns and bt['SVIX_Close'].notna().sum() > 10:
-        st.markdown("<div style='font-family:JetBrains Mono;font-size:0.72rem;"
-                    "color:#8B949E;margin:0.6rem 0 0.2rem'>VEHÍCULO AGRESIVO · SVIX (-1x)</div>",
-                    unsafe_allow_html=True)
-        try:
-            bt_svix = bt.tail(250)
-            fig_svix = build_operational_chart(
-                bt_svix, col_price='SVIX_Close', label='SVIX', color='#E91E63',
-                trades_df=trades_df,
-                today_price=svix_today, today_sig=final_sig_today,
-            )
-            st.plotly_chart(fig_svix, width="stretch",
-                            config=dict(displayModeBar=True, displaylogo=False,
-                                        modeBarButtonsToRemove=['select2d','lasso2d']))
-        except Exception as e:
-            st.error(f"Error en gráfica SVIX: {e}")
-
-    # ── Gráfica 3: SVXY operativa ──────────────────────────────
-    st.markdown("<div style='font-family:JetBrains Mono;font-size:0.72rem;"
-                "color:#8B949E;margin:0.6rem 0 0.2rem'>VEHÍCULO PRINCIPAL · SVXY (-0.5x)</div>",
-                unsafe_allow_html=True)
-    try:
-        bt_svxy = bt.tail(250)
-        fig_svxy = build_operational_chart(
-            bt_svxy, col_price='SVXY_Close', label='SVXY', color='#39D2C0',
-            trades_df=trades_df,
-            today_price=svxy_today, today_sig=final_sig_today,
-        )
-        st.plotly_chart(fig_svxy, width="stretch",
-                        config=dict(displayModeBar=True, displaylogo=False,
-                                    modeBarButtonsToRemove=['select2d','lasso2d']))
-    except Exception as e:
-        st.error(f"Error en gráfica SVXY: {e}")
-
-    # ═══════════════════════════════════════════
-    # SECCIÓN 4 — HISTORIAL DE OPERACIONES
-    # ═══════════════════════════════════════════
-    st.markdown("<div style='border-top:1px solid #30363D;margin:0.8rem 0 0.5rem'></div>",
-                unsafe_allow_html=True)
-    st.markdown("<div style='font-family:Inter;font-weight:700;font-size:0.9rem;"
-                "color:#F0F6FC;margin-bottom:0.4rem'>📋 Historial de Operaciones</div>",
-                unsafe_allow_html=True)
-
-    if not trades_df.empty:
-        n_total  = len(trades_df)
-        n_closed = len(trades_df[trades_df['Salida'] != '🔴 ABIERTO'])
-        n_win    = (trades_df[trades_df['Salida'] != '🔴 ABIERTO']['Retorno'] > 0).sum()
-        avg_ret  = trades_df[trades_df['Salida'] != '🔴 ABIERTO']['Retorno'].mean()
-        avg_dur  = trades_df[trades_df['Salida'] != '🔴 ABIERTO']['Días'].mean()
-
-        st.markdown(f"""<div class="mrow">
-            {mcard("Trades totales", str(n_total), "nt")}
-            {mcard("Ganadores", f"{n_win}/{n_closed}", "up")}
-            {mcard("Win Rate", f"{n_win/n_closed*100:.1f}%" if n_closed>0 else "—", "nt")}
-            {mcard("Ret. promedio", f"{avg_ret:+.1f}%" if not pd.isna(avg_ret) else "—",
-                   "up" if not pd.isna(avg_ret) and avg_ret>0 else "dn")}
-            {mcard("Duración media", f"{avg_dur:.0f}d" if not pd.isna(avg_dur) else "—", "nt")}
-        </div>""", unsafe_allow_html=True)
-
-        # Tabla HTML scrolleable
-        rows_html = ""
-        for _, t in trades_df.iloc[::-1].iterrows():
-            ret     = t['Retorno']
-            is_open = t['Salida'] == '🔴 ABIERTO'
-            ret_clr = "color:var(--g)" if ret > 0 else "color:var(--r)"
-            sal_clr = "color:var(--y);font-weight:700" if is_open else ""
-            vix_e   = f"{t['VIX entrada']:.1f}" if pd.notna(t.get('VIX entrada')) else "—"
-            ct_e    = f"{t['Contango entr.']:+.2f}%" if pd.notna(t.get('Contango entr.')) else "—"
-            rows_html += f"""<tr>
-                <td style="color:var(--b);font-weight:600">{t['Entrada']}</td>
-                <td style="{sal_clr}">{t['Salida']}</td>
-                <td>{t['Días']}</td>
-                <td style="{ret_clr};font-weight:700">{ret:+.2f}%</td>
-                <td>{t['Razón salida']}</td>
-                <td>{vix_e}</td>
-                <td>{ct_e}</td>
-            </tr>"""
-
-        st.markdown(f"""
-        <div style="max-height:400px;overflow-y:auto;margin-top:0.4rem;
-                    border:1px solid #30363D;border-radius:4px">
-        <table class="dtbl">
-            <thead style="position:sticky;top:0;background:#1C2128;z-index:1"><tr>
-                <th>Entrada</th><th>Salida</th><th>Días</th>
-                <th>Retorno</th><th>Razón salida</th>
-                <th>VIX entrada</th><th>Contango entr.</th>
-            </tr></thead>
-            <tbody>{rows_html}</tbody>
-        </table></div>""", unsafe_allow_html=True)
-
-        st.caption(
-            f"Histórico desde {bt.index[0].strftime('%Y-%m-%d')} · "
-            f"CSV actualizado: {last_date.strftime('%Y-%m-%d')} · "
-            f"Contango live: {ct_source}"
-        )
-    else:
-        st.info("No se encontraron trades en el histórico.")
+    st.caption(
+        f"Histórico: {bt.index[0].strftime('%Y-%m-%d')} → {last_date.strftime('%Y-%m-%d')} "
+        f"({len(bt):,} días) · Parquet del repo · "
+        f"Contango hoy: {ct_source} · "
+        f"▲=Entrada  ▼🟡=Salida BB  ▼🔴=Salida CT"
+    )
 
 
 # ━━━━━━━━━━━━━━━━━ TAB EDGE: EDGE ANALYTICS ━━━━━━━━━━━━━━━
 with tab_edge:
 
-    # Cargar Master CSV (reusar si ya está)
     if 'df_master' not in dir() or df_master.empty:
-        df_master_edge = load_master_csv()
+        df_master_edge = load_master_parquet()
     else:
         df_master_edge = df_master
 
     if df_master_edge.empty:
-        st.error("No se pudo cargar el Master CSV para Edge Analytics.")
-        st.stop()
-
-    with st.spinner("Calculando edge analytics..."):
-        edge_extra = fetch_edge_extra()
-        edge = compute_edge_analytics(df_master_edge, edge_extra)
-
-    if 'bt' not in edge:
-        st.error("Datos insuficientes para calcular edge analytics.")
+        st.error("No se pudo cargar el Master para Edge Analytics.")
     else:
-        ebt = edge['bt']
-        last_e = ebt.iloc[-1]
-        last_date_e = ebt.index[-1]
+        with st.spinner("Calculando edge analytics..."):
+            edge_extra = fetch_edge_extra()
+            edge = compute_edge_analytics(df_master_edge, edge_extra)
 
-        # ═══════════════════════════════════════════
-        # ROW 1: KPI CARDS — Estado del Edge
-        # ═══════════════════════════════════════════
-        def ecard(label, val, sub, clr="nt"):
-            c = "var(--g)" if clr == "up" else "var(--r)" if clr == "dn" else "var(--b)"
-            return (f'<div class="mpill"><div class="ml">{label}</div>'
-                    f'<div class="mv" style="color:{c}">{val}</div>'
-                    f'<div style="font-size:0.6rem;color:var(--dim)">{sub}</div></div>')
-
-        # Current values
-        vrp_val = last_e.get('VRP', np.nan)
-        vrp_pct = edge.get('vrp_percentile', '?')
-        rv20_val = last_e.get('RV20', np.nan)
-        ry_val = last_e.get('Roll_Yield', np.nan)
-        vvix_r = last_e.get('VVIX_VIX', np.nan)
-        skew_val = last_e.get('SKEW', np.nan)
-
-        vrp_str = f"{vrp_val:+.1f}" if pd.notna(vrp_val) else "N/A"
-        vrp_clr = "up" if pd.notna(vrp_val) and vrp_val > 2 else "dn" if pd.notna(vrp_val) and vrp_val < 0 else "nt"
-        ry_str = f"{ry_val:+.1f}%" if pd.notna(ry_val) else "N/A"
-        ry_clr = "up" if pd.notna(ry_val) and ry_val > 0 else "dn" if pd.notna(ry_val) and ry_val < 0 else "nt"
-        vvix_str = f"{vvix_r:.2f}" if pd.notna(vvix_r) else "N/A"
-        vvix_clr = "dn" if pd.notna(vvix_r) and vvix_r > 6 else "up" if pd.notna(vvix_r) and vvix_r < 5 else "nt"
-        skew_str = f"{skew_val:.0f}" if pd.notna(skew_val) else "N/A"
-        skew_clr = "dn" if pd.notna(skew_val) and skew_val > 150 else "up" if pd.notna(skew_val) and skew_val < 130 else "nt"
-
-        st.markdown(f"""<div class="mrow">
-            {ecard("VRP (IV−RV)", vrp_str, f"P{vrp_pct} hist" if vrp_pct != '?' else "", vrp_clr)}
-            {ecard("RV20 (SPX)", f"{rv20_val:.1f}" if pd.notna(rv20_val) else "N/A", "Realized Vol 20d", "nt")}
-            {ecard("Roll Yield", ry_str, "Carry anualizado", ry_clr)}
-            {ecard("VVIX/VIX", vvix_str, "> 6 = peligro", vvix_clr)}
-            {ecard("SKEW", skew_str, "> 150 = extremo", skew_clr)}
-            {ecard("VIX", f"{last_e['VIX_Close']:.1f}", f"RV20: {rv20_val:.1f}" if pd.notna(rv20_val) else "", "nt")}
-        </div>""", unsafe_allow_html=True)
-
-        # ═══════════════════════════════════════════
-        # CALENDARIO DE EVENTOS
-        # ═══════════════════════════════════════════
-        upcoming = edge.get('upcoming_events', [])
-        if upcoming:
-            ev_html = ""
-            for name, dt, days in upcoming:
-                if days == 0:
-                    ev_clr = "var(--r)"
-                    ev_tag = "HOY"
-                elif days <= 2:
-                    ev_clr = "var(--r)"
-                    ev_tag = f"en {days}d"
-                elif days <= 5:
-                    ev_clr = "var(--y)"
-                    ev_tag = f"en {days}d"
-                else:
-                    ev_clr = "var(--dim)"
-                    ev_tag = f"en {days}d"
-                ev_html += (f'<span style="background:var(--card);border:1px solid {ev_clr};'
-                           f'border-radius:4px;padding:0.2rem 0.6rem;margin-right:0.4rem;'
-                           f'font-family:JetBrains Mono;font-size:0.75rem;color:{ev_clr}">'
-                           f'{name} {dt.strftime("%b %d")} · {ev_tag}</span>')
-            st.markdown(f'<div style="margin:0.4rem 0 0.8rem">{ev_html}</div>',
-                        unsafe_allow_html=True)
+        if 'bt' not in edge:
+            st.error("Datos insuficientes para edge analytics.")
         else:
-            st.markdown('<div style="font-family:JetBrains Mono;font-size:0.75rem;color:#3FB950;'
-                        'margin:0.4rem 0 0.8rem">✓ Sin eventos macro en los próximos 14 días</div>',
+            ebt = edge['bt']
+            last_e = ebt.iloc[-1]
+
+            def ecard(label, val, sub, clr="nt"):
+                c = "var(--g)" if clr == "up" else "var(--r)" if clr == "dn" else "var(--b)"
+                return (f'<div class="mpill"><div class="ml">{label}</div>'
+                        f'<div class="mv" style="color:{c}">{val}</div>'
+                        f'<div style="font-size:0.6rem;color:var(--dim)">{sub}</div></div>')
+
+            vrp_val = last_e.get('VRP', np.nan)
+            vrp_pct = edge.get('vrp_percentile', '?')
+            rv20_val = last_e.get('RV20', np.nan)
+            ry_val = last_e.get('Roll_Yield', np.nan)
+            vvix_r = last_e.get('VVIX_VIX', np.nan)
+            skew_val = last_e.get('SKEW', np.nan)
+
+            vrp_str = f"{vrp_val:+.1f}" if pd.notna(vrp_val) else "N/A"
+            vrp_clr = "up" if pd.notna(vrp_val) and vrp_val > 2 else "dn" if pd.notna(vrp_val) and vrp_val < 0 else "nt"
+            ry_str = f"{ry_val:+.1f}%" if pd.notna(ry_val) else "N/A"
+            ry_clr = "up" if pd.notna(ry_val) and ry_val > 0 else "dn" if pd.notna(ry_val) and ry_val < 0 else "nt"
+            vvix_str = f"{vvix_r:.2f}" if pd.notna(vvix_r) else "N/A"
+            vvix_clr = "dn" if pd.notna(vvix_r) and vvix_r > 6 else "up" if pd.notna(vvix_r) and vvix_r < 5 else "nt"
+            skew_str = f"{skew_val:.0f}" if pd.notna(skew_val) else "N/A"
+            skew_clr = "dn" if pd.notna(skew_val) and skew_val > 150 else "up" if pd.notna(skew_val) and skew_val < 130 else "nt"
+
+            st.markdown(f"""<div class="mrow">
+                {ecard("VRP (IV-RV)", vrp_str, f"P{vrp_pct} hist" if vrp_pct != '?' else "", vrp_clr)}
+                {ecard("RV20 (SPX)", f"{rv20_val:.1f}" if pd.notna(rv20_val) else "N/A", "Realized Vol 20d", "nt")}
+                {ecard("Roll Yield", ry_str, "Carry anualizado", ry_clr)}
+                {ecard("VVIX/VIX", vvix_str, "> 6 = peligro", vvix_clr)}
+                {ecard("SKEW", skew_str, "> 150 = extremo", skew_clr)}
+                {ecard("VIX", f"{last_e['VIX_Close']:.1f}", f"RV20: {rv20_val:.1f}" if pd.notna(rv20_val) else "", "nt")}
+            </div>""", unsafe_allow_html=True)
+
+            # Calendario de eventos
+            upcoming = edge.get('upcoming_events', [])
+            if upcoming:
+                ev_html = ""
+                for name, dt, days in upcoming:
+                    ev_clr = "var(--r)" if days <= 2 else "var(--y)" if days <= 5 else "var(--dim)"
+                    ev_tag = "HOY" if days == 0 else f"en {days}d"
+                    ev_html += (f'<span style="background:var(--card);border:1px solid {ev_clr};'
+                               f'border-radius:4px;padding:0.2rem 0.6rem;margin-right:0.4rem;'
+                               f'font-family:JetBrains Mono;font-size:0.75rem;color:{ev_clr}">'
+                               f'{name} {dt.strftime("%b %d")} · {ev_tag}</span>')
+                st.markdown(f'<div style="margin:0.4rem 0 0.8rem">{ev_html}</div>', unsafe_allow_html=True)
+            else:
+                st.markdown('<div style="font-family:JetBrains Mono;font-size:0.75rem;color:#3FB950;'
+                            'margin:0.4rem 0 0.8rem">Sin eventos macro en los proximos 14 dias</div>',
+                            unsafe_allow_html=True)
+
+            # Edge Verdict
+            warnings_e = []
+            if pd.notna(vrp_val) and vrp_val < 0:
+                warnings_e.append("VRP negativo — estas pagando por estar posicionado")
+            if pd.notna(vvix_r) and vvix_r > 6:
+                warnings_e.append("VVIX/VIX > 6 — dealers anticipan spike")
+            if pd.notna(ry_val) and ry_val < 0:
+                warnings_e.append("Roll Yield negativo — backwardation erosiona el carry")
+            if pd.notna(skew_val) and skew_val > 150:
+                warnings_e.append("SKEW extremo — alta demanda de proteccion")
+            if any(ev[2] <= 2 for ev in upcoming):
+                warnings_e.append("Evento macro inminente — considerar reducir exposicion")
+
+            if len(warnings_e) >= 3:
+                verdict, v_clr, v_bg = "EDGE COMPROMETIDO", "var(--r)", "var(--rbg)"
+            elif len(warnings_e) >= 1:
+                verdict, v_clr, v_bg = "EDGE ACTIVO — CON PRECAUCION", "var(--y)", "#3D2E00"
+            else:
+                verdict, v_clr, v_bg = "EDGE SALUDABLE", "var(--g)", "var(--gbg)"
+
+            st.markdown(f"""<div style="background:{v_bg};border:1px solid {v_clr};
+                border-radius:6px;padding:0.6rem 1rem;margin-bottom:0.8rem">
+                <span style="font-family:Inter;font-weight:800;font-size:1rem;color:{v_clr}">{verdict}</span>
+                <span style="font-family:JetBrains Mono;font-size:0.7rem;color:var(--dim);margin-left:1rem">
+                {len(warnings_e)} warning{'s' if len(warnings_e) != 1 else ''}</span>
+            </div>""", unsafe_allow_html=True)
+            for w in warnings_e:
+                st.warning(w)
+
+            st.markdown("<div style='border-top:1px solid #30363D;margin:0.6rem 0'></div>",
                         unsafe_allow_html=True)
 
-        # ═══════════════════════════════════════════
-        # EDGE VERDICT
-        # ═══════════════════════════════════════════
-        warnings_e = []
-        if pd.notna(vrp_val) and vrp_val < 0:
-            warnings_e.append("VRP negativo — estás pagando por estar posicionado")
-        if pd.notna(vvix_r) and vvix_r > 6:
-            warnings_e.append("VVIX/VIX > 6 — dealers anticipan spike")
-        if pd.notna(ry_val) and ry_val < 0:
-            warnings_e.append("Roll Yield negativo — backwardation erosiona el carry")
-        if pd.notna(skew_val) and skew_val > 150:
-            warnings_e.append("SKEW extremo — alta demanda de protección")
-        if any(ev[2] <= 2 for ev in upcoming):
-            warnings_e.append("Evento macro inminente — considerar reducir exposición")
-
-        if len(warnings_e) >= 3:
-            verdict = "EDGE COMPROMETIDO"
-            v_clr = "var(--r)"
-            v_bg = "var(--rbg)"
-        elif len(warnings_e) >= 1:
-            verdict = "EDGE ACTIVO — CON PRECAUCIÓN"
-            v_clr = "var(--y)"
-            v_bg = "#3D2E00"
-        else:
-            verdict = "EDGE SALUDABLE"
-            v_clr = "var(--g)"
-            v_bg = "var(--gbg)"
-
-        st.markdown(f"""<div style="background:{v_bg};border:1px solid {v_clr};
-            border-radius:6px;padding:0.6rem 1rem;margin-bottom:0.8rem">
-            <span style="font-family:Inter;font-weight:800;font-size:1rem;color:{v_clr}">{verdict}</span>
-            <span style="font-family:JetBrains Mono;font-size:0.7rem;color:var(--dim);margin-left:1rem">
-            {len(warnings_e)} warning{'s' if len(warnings_e) != 1 else ''}</span>
-        </div>""", unsafe_allow_html=True)
-
-        for w in warnings_e:
-            st.warning(w)
-
-        # ═══════════════════════════════════════════
-        # CHARTS
-        # ═══════════════════════════════════════════
-        st.markdown("<div style='border-top:1px solid #30363D;margin:0.6rem 0'></div>",
-                    unsafe_allow_html=True)
-
-        # VRP
-        try:
-            fig_vrp = build_vrp_chart(ebt, window=252)
-            st.plotly_chart(fig_vrp, width="stretch", config=dict(displayModeBar=False))
-        except Exception as e:
-            st.error(f"Error VRP chart: {e}")
-
-        # RV Multi-timeframe
-        try:
-            fig_rv = build_rv_chart(ebt, window=252)
-            st.plotly_chart(fig_rv, width="stretch", config=dict(displayModeBar=False))
-        except Exception as e:
-            st.error(f"Error RV chart: {e}")
-
-        # Two columns: Roll Yield + VVIX/VIX
-        col_ry, col_vv = st.columns(2)
-        with col_ry:
+            # Charts
             try:
-                fig_ry = build_roll_yield_chart(ebt, window=252)
-                st.plotly_chart(fig_ry, width="stretch", config=dict(displayModeBar=False))
+                st.plotly_chart(build_vrp_chart(ebt), width="stretch", config=dict(displayModeBar=False))
             except Exception as e:
-                st.error(f"Error Roll Yield chart: {e}")
-        with col_vv:
-            try:
-                fig_vv = build_vvix_ratio_chart(ebt, window=252)
-                st.plotly_chart(fig_vv, width="stretch", config=dict(displayModeBar=False))
-            except Exception as e:
-                st.error(f"Error VVIX chart: {e}")
+                st.error(f"Error VRP: {e}")
 
-        # Two columns: SKEW + Credit
-        col_sk, col_cr = st.columns(2)
-        with col_sk:
             try:
-                fig_sk = build_skew_chart(ebt, window=252)
-                if fig_sk.data:
-                    st.plotly_chart(fig_sk, width="stretch", config=dict(displayModeBar=False))
-                else:
-                    st.info("SKEW data no disponible")
+                st.plotly_chart(build_rv_chart(ebt), width="stretch", config=dict(displayModeBar=False))
             except Exception as e:
-                st.error(f"Error SKEW chart: {e}")
-        with col_cr:
-            try:
-                fig_cr = build_credit_chart(ebt, window=252)
-                if fig_cr.data:
-                    st.plotly_chart(fig_cr, width="stretch", config=dict(displayModeBar=False))
-                else:
-                    st.info("Credit spread data no disponible")
-            except Exception as e:
-                st.error(f"Error Credit chart: {e}")
+                st.error(f"Error RV: {e}")
 
-        st.caption(f"Edge Analytics · Datos hasta {last_date_e.strftime('%Y-%m-%d')} · "
-                   f"Ventana: 1 año · Fuentes: Master CSV + Yahoo Finance (SKEW, HYG, IEF)")
+            col_ry, col_vv = st.columns(2)
+            with col_ry:
+                try:
+                    st.plotly_chart(build_roll_yield_chart(ebt), width="stretch", config=dict(displayModeBar=False))
+                except Exception as e:
+                    st.error(f"Error Roll Yield: {e}")
+            with col_vv:
+                try:
+                    st.plotly_chart(build_vvix_ratio_chart(ebt), width="stretch", config=dict(displayModeBar=False))
+                except Exception as e:
+                    st.error(f"Error VVIX: {e}")
+
+            col_sk, col_cr = st.columns(2)
+            with col_sk:
+                try:
+                    fig_sk = build_skew_chart(ebt)
+                    if fig_sk.data:
+                        st.plotly_chart(fig_sk, width="stretch", config=dict(displayModeBar=False))
+                    else:
+                        st.info("SKEW data no disponible")
+                except Exception as e:
+                    st.error(f"Error SKEW: {e}")
+            with col_cr:
+                try:
+                    fig_cr = build_credit_chart(ebt)
+                    if fig_cr.data:
+                        st.plotly_chart(fig_cr, width="stretch", config=dict(displayModeBar=False))
+                    else:
+                        st.info("Credit spread data no disponible")
+                except Exception as e:
+                    st.error(f"Error Credit: {e}")
+
+            st.caption(f"Edge Analytics · Ventana: 1 ano · "
+                       f"Fuentes: Master Parquet + Yahoo Finance (SKEW, HYG, IEF)")
 
 
 # ━━━━━━━━━━━━━━━━━ TAB 3: RECOMENDACIONES ━━━━━━━━━━━━━━━━━
