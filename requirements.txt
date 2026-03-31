@@ -9,4 +9,3 @@ lxml>=4.9.0
 html5lib>=1.1
 pyarrow>=14.0.0
 curl_cffi>=0.6.0
-cot_reports>=0.1.0
