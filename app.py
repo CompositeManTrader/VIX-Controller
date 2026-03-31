@@ -301,6 +301,569 @@ def fetch_edge_extra():
     return out
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# VOL SKEW & IV SURFACE — DATA LAYER
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@st.cache_data(ttl=300)
+def fetch_options_chains(ticker: str = "SPY", n_exp: int = 9) -> tuple:
+    """
+    Descarga cadenas de opciones via yfinance.
+    Retorna (chains_dict, spot_price).
+    chains_dict: {exp_str: {"calls": df, "puts": df, "dte": int}}
+    Filtros aplicados: OI > 0, IV ∈ [0.01, 5.0], spread bid-ask razonable.
+    """
+    log = logging.getLogger("vix_controller")
+    try:
+        t = yf.Ticker(ticker)
+        expirations = t.options
+        if not expirations:
+            return {}, None
+
+        hist = t.history(period="2d")
+        spot = float(hist["Close"].iloc[-1]) if not hist.empty else None
+        if not spot:
+            return {}, None
+
+        today = date.today()
+        chains = {}
+
+        for exp_str in expirations[:n_exp]:
+            try:
+                exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
+                dte = (exp_date - today).days
+                if dte < 1:
+                    continue
+
+                chain = t.option_chain(exp_str)
+
+                def clean_chain(df_raw):
+                    df_c = df_raw.copy()
+                    df_c["impliedVolatility"] = pd.to_numeric(
+                        df_c["impliedVolatility"], errors="coerce"
+                    )
+                    df_c["openInterest"] = pd.to_numeric(
+                        df_c.get("openInterest", 0), errors="coerce"
+                    ).fillna(0)
+                    df_c["volume"] = pd.to_numeric(
+                        df_c.get("volume", 0), errors="coerce"
+                    ).fillna(0)
+                    df_c["strike"] = pd.to_numeric(df_c["strike"], errors="coerce")
+                    # Filtros de calidad
+                    df_c = df_c[df_c["impliedVolatility"].between(0.01, 4.5)]
+                    df_c = df_c[df_c["openInterest"] > 0]
+                    df_c = df_c.dropna(subset=["strike", "impliedVolatility"])
+                    df_c["moneyness"] = df_c["strike"] / spot
+                    return df_c.sort_values("strike").reset_index(drop=True)
+
+                calls_clean = clean_chain(chain.calls)
+                puts_clean  = clean_chain(chain.puts)
+
+                if len(calls_clean) < 3 or len(puts_clean) < 3:
+                    continue
+
+                chains[exp_str] = {
+                    "calls": calls_clean,
+                    "puts":  puts_clean,
+                    "dte":   dte,
+                }
+            except Exception as e:
+                log.warning(f"Options chain {ticker} {exp_str}: {e}")
+                continue
+
+        log.info(f"Options chains {ticker}: {len(chains)} expirations · spot={spot:.2f}")
+        return chains, spot
+
+    except Exception as e:
+        log.error(f"fetch_options_chains {ticker}: {e}")
+        return {}, None
+
+
+# ─── Métricas de skew ──────────────────────────────────────────────────────
+def compute_skew_metrics(chains: dict, spot: float) -> dict:
+    """
+    Calcula métricas clave de skew para el vencimiento más próximo con suficiente data.
+    Retorna dict con: atm_iv, rr25 (25d risk reversal), bf25 (butterfly),
+    skew_slope (pendiente %-pts / 10% move), put_call_ratio_vol.
+    """
+    metrics = {}
+    if not chains or not spot:
+        return metrics
+
+    # Tomar primer vencimiento con ≥5 puts y ≥5 calls
+    for exp_str, data in sorted(chains.items(), key=lambda x: x[1]["dte"]):
+        puts  = data["puts"]
+        calls = data["calls"]
+        dte   = data["dte"]
+        if len(puts) < 5 or len(calls) < 5:
+            continue
+
+        # ATM IV: interpolación lineal alrededor de spot
+        def get_iv_at_moneyness(df, target_m, tol=0.05):
+            sub = df[df["moneyness"].between(target_m - tol, target_m + tol)]
+            if sub.empty:
+                return np.nan
+            # Weighted average por OI
+            w = sub["openInterest"].values
+            iv = sub["impliedVolatility"].values
+            return float(np.average(iv, weights=w)) if w.sum() > 0 else float(iv.mean())
+
+        atm_iv  = get_iv_at_moneyness(puts,  1.00, 0.03)
+        if np.isnan(atm_iv):
+            atm_iv = get_iv_at_moneyness(calls, 1.00, 0.03)
+
+        # 25-delta proxy: puts ≈ 0.90 moneyness, calls ≈ 1.10
+        put_25d  = get_iv_at_moneyness(puts,  0.90, 0.04)
+        call_25d = get_iv_at_moneyness(calls, 1.10, 0.04)
+
+        # Risk reversal = call_25d - put_25d  (negativo = put skew dominante)
+        rr25 = (call_25d - put_25d) * 100 if not (np.isnan(put_25d) or np.isnan(call_25d)) else np.nan
+        # Butterfly = (call_25d + put_25d)/2 - atm
+        bf25 = ((call_25d + put_25d) / 2 - atm_iv) * 100 if not np.isnan(atm_iv) else np.nan
+
+        # Skew slope: regresión lineal IV ~ moneyness en puts [0.80, 1.00]
+        slope_puts = puts[puts["moneyness"].between(0.80, 1.00)]
+        if len(slope_puts) >= 3:
+            m_ = slope_puts["moneyness"].values
+            iv_ = slope_puts["impliedVolatility"].values
+            coef = np.polyfit(m_, iv_, 1)[0]
+            skew_slope = coef * 0.10 * 100  # %-pts IV change per 10% move
+        else:
+            skew_slope = np.nan
+
+        # P/C ratio (volume)
+        total_put_vol  = puts["volume"].sum()
+        total_call_vol = calls["volume"].sum()
+        pc_ratio = (total_put_vol / total_call_vol) if total_call_vol > 0 else np.nan
+
+        metrics = {
+            "exp":        exp_str,
+            "dte":        dte,
+            "atm_iv":     round(atm_iv * 100, 2) if not np.isnan(atm_iv) else None,
+            "put_25d_iv": round(put_25d * 100, 2) if not np.isnan(put_25d) else None,
+            "call_25d_iv":round(call_25d * 100, 2) if not np.isnan(call_25d) else None,
+            "rr25":       round(rr25, 2) if not np.isnan(rr25) else None,
+            "bf25":       round(bf25, 2) if not np.isnan(bf25) else None,
+            "skew_slope": round(skew_slope, 2) if not np.isnan(skew_slope) else None,
+            "pc_ratio":   round(pc_ratio, 3) if not np.isnan(pc_ratio) else None,
+        }
+        break  # usar sólo el primer vencimiento válido
+
+    return metrics
+
+
+# ─── Chart: Skew Curves ────────────────────────────────────────────────────
+SKEW_PALETTE = [
+    "#58A6FF", "#F0883E", "#3FB950", "#BC8CFF",
+    "#39D2C0", "#D29922", "#F85149", "#79C0FF",
+]
+
+def build_skew_curves(chains: dict, spot: float, moneyness_range=(0.75, 1.25)) -> go.Figure:
+    """
+    Curvas de IV vs Moneyness (K/S) por vencimiento.
+    Combina puts (lado izquierdo) + calls (lado derecho) en una sola curva continua.
+    """
+    fig = go.Figure()
+    if not chains or not spot:
+        return fig
+
+    lo, hi = moneyness_range
+
+    for idx, (exp_str, data) in enumerate(
+        sorted(chains.items(), key=lambda x: x[1]["dte"])
+    ):
+        clr   = SKEW_PALETTE[idx % len(SKEW_PALETTE)]
+        dte   = data["dte"]
+        puts  = data["puts"]
+        calls = data["calls"]
+
+        # Puts: zona izquierda (moneyness < 1.02), calls: zona derecha (≥ 0.98)
+        puts_f  = puts[puts["moneyness"].between(lo, 1.02)].copy()
+        calls_f = calls[calls["moneyness"].between(0.98, hi)].copy()
+
+        # Merge: preferir puts a la izquierda, calls a la derecha del spot
+        combined = pd.concat([puts_f, calls_f]).drop_duplicates("strike")
+        combined = combined.sort_values("moneyness")
+
+        if len(combined) < 3:
+            continue
+
+        # Suavizado con media rodante si hay ruido
+        iv_smooth = combined["impliedVolatility"].rolling(3, min_periods=1, center=True).mean()
+
+        fig.add_trace(go.Scatter(
+            x=combined["moneyness"] * 100 - 100,   # → % OTM/ITM
+            y=iv_smooth * 100,
+            mode="lines+markers",
+            name=f"{exp_str} ({dte}d)",
+            line=dict(color=clr, width=2.5, shape="spline"),
+            marker=dict(size=5, color=clr, opacity=0.7),
+            hovertemplate=(
+                f"<b>{exp_str}</b><br>"
+                "Δ Spot: %{x:.1f}%<br>"
+                "IV: %{y:.1f}%<extra></extra>"
+            ),
+        ))
+
+    # Línea ATM
+    fig.add_vline(
+        x=0, line_dash="dash", line_color="#8B949E", line_width=1.5,
+        annotation_text="ATM", annotation_font=dict(size=10, color="#8B949E"),
+    )
+
+    fig.update_layout(
+        title=dict(
+            text=(
+                "<b>Volatility Skew</b>"
+                "<sup>  IV vs Distancia al Spot · Puts izquierda · Calls derecha</sup>"
+            ),
+            font=dict(size=13, color="#C9D1D9", family="Inter"),
+            x=0.5,
+        ),
+        template="plotly_dark",
+        paper_bgcolor="#0D1117",
+        plot_bgcolor="#161B22",
+        height=420,
+        margin=dict(l=55, r=30, t=60, b=50),
+        xaxis=dict(
+            title=dict(text="% vs Spot  (neg = OTM puts | pos = OTM calls)",
+                       font=dict(size=10, color="#8B949E")),
+            gridcolor="#21262D",
+            zeroline=True, zerolinecolor="#30363D",
+            tickfont=dict(size=10, color="#8B949E", family="JetBrains Mono"),
+            ticksuffix="%",
+        ),
+        yaxis=dict(
+            title=dict(text="Implied Volatility (%)", font=dict(size=10, color="#8B949E")),
+            gridcolor="#21262D",
+            tickfont=dict(size=10, color="#8B949E", family="JetBrains Mono"),
+            ticksuffix="%",
+        ),
+        legend=dict(
+            orientation="v", yanchor="top", y=0.99, xanchor="right", x=0.99,
+            bgcolor="rgba(22,27,34,0.9)", bordercolor="#30363D", borderwidth=1,
+            font=dict(size=9, color="#C9D1D9", family="JetBrains Mono"),
+        ),
+        hovermode="x unified",
+    )
+    return fig
+
+
+# ─── Chart: ATM Term Structure ─────────────────────────────────────────────
+def build_atm_term_structure(chains: dict, spot: float) -> go.Figure:
+    """
+    ATM IV en función del vencimiento (term structure de volatilidad implícita).
+    Complementa la term structure de futuros VIX.
+    """
+    fig = go.Figure()
+    if not chains or not spot:
+        return fig
+
+    rows = []
+    for exp_str, data in sorted(chains.items(), key=lambda x: x[1]["dte"]):
+        puts  = data["puts"]
+        calls = data["calls"]
+        dte   = data["dte"]
+
+        atm_puts  = puts[puts["moneyness"].between(0.97, 1.03)]
+        atm_calls = calls[calls["moneyness"].between(0.97, 1.03)]
+        atm_all   = pd.concat([atm_puts, atm_calls])
+
+        if atm_all.empty:
+            continue
+
+        atm_iv = float(
+            np.average(
+                atm_all["impliedVolatility"].values,
+                weights=atm_all["openInterest"].values + 1,
+            )
+        )
+        rows.append({"dte": dte, "atm_iv": atm_iv * 100, "exp": exp_str})
+
+    if not rows:
+        return fig
+
+    df_atm = pd.DataFrame(rows).sort_values("dte")
+
+    fig.add_trace(go.Scatter(
+        x=df_atm["dte"],
+        y=df_atm["atm_iv"],
+        mode="lines+markers+text",
+        name="ATM IV",
+        line=dict(color="#39D2C0", width=3, shape="spline"),
+        marker=dict(size=10, color="#39D2C0", line=dict(width=2, color="#0D1117")),
+        text=[f"{v:.1f}%" for v in df_atm["atm_iv"]],
+        textposition="top center",
+        textfont=dict(size=9, color="#C9D1D9", family="JetBrains Mono"),
+        hovertemplate="DTE: %{x}d<br>ATM IV: %{y:.2f}%<extra></extra>",
+    ))
+
+    # Línea de referencia VIX (~30d IV del mercado)
+    fig.update_layout(
+        title=dict(
+            text=(
+                "<b>ATM IV Term Structure</b>"
+                "<sup>  Volatilidad implícita en el dinero por vencimiento</sup>"
+            ),
+            font=dict(size=13, color="#C9D1D9", family="Inter"),
+            x=0.5,
+        ),
+        template="plotly_dark",
+        paper_bgcolor="#0D1117",
+        plot_bgcolor="#161B22",
+        height=300,
+        margin=dict(l=55, r=30, t=60, b=50),
+        xaxis=dict(
+            title=dict(text="Días al Vencimiento (DTE)", font=dict(size=10, color="#8B949E")),
+            gridcolor="#21262D",
+            tickfont=dict(size=10, color="#8B949E", family="JetBrains Mono"),
+        ),
+        yaxis=dict(
+            title=dict(text="ATM IV (%)", font=dict(size=10, color="#8B949E")),
+            gridcolor="#21262D",
+            tickfont=dict(size=10, color="#8B949E", family="JetBrains Mono"),
+            ticksuffix="%",
+        ),
+        hovermode="x unified",
+        showlegend=False,
+    )
+    return fig
+
+
+# ─── Chart: IV Surface (3D) ────────────────────────────────────────────────
+def build_iv_surface(chains: dict, spot: float,
+                     moneyness_range=(0.80, 1.20), n_strike_bins=40) -> go.Figure:
+    """
+    Superficie de volatilidad implícita en 3D:
+    X = Moneyness (K/S en %), Y = DTE, Z = IV (%)
+    Construye una grilla regular por interpolación lineal sobre los datos reales.
+    """
+    fig = go.Figure()
+    if not chains or not spot:
+        return fig
+
+    lo, hi = moneyness_range
+    all_points = []
+
+    for exp_str, data in chains.items():
+        dte   = data["dte"]
+        puts  = data["puts"]
+        calls = data["calls"]
+
+        # Puts para moneyness < 1, calls para moneyness ≥ 1
+        p_f = puts[puts["moneyness"].between(lo, 1.02)][["moneyness", "impliedVolatility"]].copy()
+        c_f = calls[calls["moneyness"].between(0.98, hi)][["moneyness", "impliedVolatility"]].copy()
+
+        combo = pd.concat([p_f, c_f]).drop_duplicates("moneyness").sort_values("moneyness")
+        if len(combo) < 4:
+            continue
+
+        combo["dte"] = dte
+        all_points.append(combo)
+
+    if not all_points:
+        return fig
+
+    pts = pd.concat(all_points, ignore_index=True)
+    pts["iv_pct"] = pts["impliedVolatility"] * 100
+
+    # Crear grilla regular
+    mon_grid = np.linspace(lo, hi, n_strike_bins)
+    dte_vals  = sorted(pts["dte"].unique())
+
+    grid_rows = []
+    for dte_val in dte_vals:
+        slice_df = pts[pts["dte"] == dte_val].sort_values("moneyness")
+        if len(slice_df) < 3:
+            continue
+        # Interpolación lineal al grid de moneyness
+        iv_interp = np.interp(
+            mon_grid,
+            slice_df["moneyness"].values,
+            slice_df["iv_pct"].values,
+            left=np.nan, right=np.nan,
+        )
+        grid_rows.append(iv_interp)
+
+    if not grid_rows:
+        return fig
+
+    Z = np.array(grid_rows)       # shape: (n_dte, n_strikes)
+    X = mon_grid * 100 - 100      # % vs spot
+    Y = np.array(dte_vals)
+
+    # Suavizar filas con media rodante
+    from numpy.lib.stride_tricks import sliding_window_view
+    for i in range(Z.shape[0]):
+        row = Z[i]
+        valid = ~np.isnan(row)
+        if valid.sum() > 5:
+            kernel = np.ones(5) / 5
+            row[valid] = np.convolve(row[valid], kernel, mode="same")
+        Z[i] = row
+
+    fig.add_trace(go.Surface(
+        x=X,
+        y=Y,
+        z=Z,
+        colorscale=[
+            [0.0,  "#1a237e"],
+            [0.15, "#1565C0"],
+            [0.30, "#0288D1"],
+            [0.45, "#00ACC1"],
+            [0.55, "#3FB950"],
+            [0.65, "#D29922"],
+            [0.80, "#F0883E"],
+            [1.0,  "#F85149"],
+        ],
+        colorbar=dict(
+            title=dict(text="IV %", font=dict(color="#8B949E", size=10)),
+            tickfont=dict(color="#8B949E", size=9),
+            len=0.6, thickness=12,
+        ),
+        contours=dict(
+            z=dict(show=True, usecolormap=True, highlightcolor="#F0F6FC", project_z=False),
+        ),
+        hovertemplate=(
+            "Δ Spot: %{x:.1f}%<br>"
+            "DTE: %{y}d<br>"
+            "IV: %{z:.1f}%<extra></extra>"
+        ),
+        opacity=0.92,
+    ))
+
+    fig.update_layout(
+        title=dict(
+            text="<b>Implied Volatility Surface</b>",
+            font=dict(size=14, color="#C9D1D9", family="Inter"),
+            x=0.5,
+        ),
+        scene=dict(
+            xaxis=dict(
+                title="% vs Spot",
+                gridcolor="#30363D", backgroundcolor="#0D1117",
+                tickfont=dict(size=9, color="#8B949E"),
+            ),
+            yaxis=dict(
+                title="DTE (días)",
+                gridcolor="#30363D", backgroundcolor="#0D1117",
+                tickfont=dict(size=9, color="#8B949E"),
+            ),
+            zaxis=dict(
+                title="IV (%)",
+                gridcolor="#30363D", backgroundcolor="#0D1117",
+                tickfont=dict(size=9, color="#8B949E"),
+            ),
+            bgcolor="#0D1117",
+            camera=dict(
+                eye=dict(x=-1.6, y=-1.6, z=0.9),
+                up=dict(x=0, y=0, z=1),
+            ),
+        ),
+        paper_bgcolor="#0D1117",
+        height=520,
+        margin=dict(l=0, r=0, t=50, b=0),
+    )
+    return fig
+
+
+# ─── Chart: IV Heatmap (2D) ────────────────────────────────────────────────
+def build_iv_heatmap(chains: dict, spot: float,
+                     moneyness_range=(0.82, 1.18), n_bins=35) -> go.Figure:
+    """
+    Heatmap 2D: filas = DTE, columnas = Moneyness, color = IV%.
+    Más legible que la superficie 3D para análisis cuantitativo.
+    """
+    fig = go.Figure()
+    if not chains or not spot:
+        return fig
+
+    lo, hi = moneyness_range
+    mon_grid = np.linspace(lo, hi, n_bins)
+    dte_vals, iv_rows, labels_x = [], [], []
+
+    for exp_str, data in sorted(chains.items(), key=lambda x: x[1]["dte"]):
+        dte   = data["dte"]
+        pts_p = data["puts"][data["puts"]["moneyness"].between(lo, 1.02)]
+        pts_c = data["calls"][data["calls"]["moneyness"].between(0.98, hi)]
+        combo = pd.concat([pts_p, pts_c]).drop_duplicates("moneyness").sort_values("moneyness")
+        if len(combo) < 3:
+            continue
+
+        iv_interp = np.interp(
+            mon_grid,
+            combo["moneyness"].values,
+            (combo["impliedVolatility"] * 100).values,
+            left=np.nan, right=np.nan,
+        )
+        dte_vals.append(dte)
+        iv_rows.append(iv_interp)
+
+    if not iv_rows:
+        return fig
+
+    Z = np.array(iv_rows)
+    labels_x = [f"{(m*100-100):+.0f}%" for m in mon_grid]
+    labels_y = [f"{d}d" for d in dte_vals]
+
+    fig.add_trace(go.Heatmap(
+        z=Z,
+        x=labels_x,
+        y=labels_y,
+        colorscale=[
+            [0.0,  "#1565C0"],
+            [0.25, "#0288D1"],
+            [0.50, "#3FB950"],
+            [0.70, "#D29922"],
+            [0.85, "#F0883E"],
+            [1.0,  "#F85149"],
+        ],
+        colorbar=dict(
+            title=dict(text="IV %", font=dict(color="#8B949E", size=10)),
+            tickfont=dict(color="#8B949E", size=9),
+            len=0.8, thickness=14,
+        ),
+        hoverongaps=False,
+        hovertemplate="Δ Spot: %{x}<br>DTE: %{y}<br>IV: %{z:.1f}%<extra></extra>",
+        xgap=1, ygap=1,
+    ))
+
+    # Marcar columna ATM (moneyness = 1 → +0%)
+    atm_idx = int(np.argmin(np.abs(mon_grid - 1.0)))
+    fig.add_vline(
+        x=labels_x[atm_idx],
+        line_dash="dash", line_color="#8B949E", line_width=1.5,
+        annotation_text="ATM", annotation_font=dict(size=9, color="#8B949E"),
+    )
+
+    fig.update_layout(
+        title=dict(
+            text=(
+                "<b>IV Surface — Heatmap</b>"
+                "<sup>  Filas = DTE · Columnas = % vs Spot · Color = IV%</sup>"
+            ),
+            font=dict(size=13, color="#C9D1D9", family="Inter"),
+            x=0.5,
+        ),
+        template="plotly_dark",
+        paper_bgcolor="#0D1117",
+        plot_bgcolor="#161B22",
+        height=380,
+        margin=dict(l=55, r=20, t=60, b=60),
+        xaxis=dict(
+            tickfont=dict(size=8, color="#8B949E", family="JetBrains Mono"),
+            title=dict(text="Distancia al Spot", font=dict(size=10, color="#8B949E")),
+            tickangle=-45,
+        ),
+        yaxis=dict(
+            tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono"),
+            title=dict(text="DTE", font=dict(size=10, color="#8B949E")),
+            autorange="reversed",
+        ),
+    )
+    return fig
+
+
 def compute_edge_analytics(df, edge_extra):
     out = {}
     bt = df[df['VIX_Close'].notna() & df['SPY_Close'].notna()].copy()
@@ -960,7 +1523,14 @@ def fp(v):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # TABS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-tab1, tab2, tab_edge, tab3, tab4 = st.tabs(["📈  Term Structure", "🎯  Monitor Operativo", "🔬  Edge Analytics", "💡  Recomendaciones", "ℹ️  Help"])
+tab1, tab2, tab_edge, tab_skew, tab3, tab4 = st.tabs([
+    "📈  Term Structure",
+    "🎯  Monitor Operativo",
+    "🔬  Edge Analytics",
+    "📐  Vol Skew & Surface",
+    "💡  Recomendaciones",
+    "ℹ️  Help",
+])
 
 # ━━━━━━━━━━━━━━━━━ TAB 1: TERM STRUCTURE ━━━━━━━━━━━━━━━━━━
 with tab1:
@@ -1412,6 +1982,234 @@ with tab_edge:
 
             st.caption(f"Edge Analytics · Ventana: 1 ano · "
                        f"Fuentes: Master Parquet + Yahoo Finance (SKEW, HYG, IEF)")
+
+
+# ━━━━━━━━━━━━━━━━━ TAB: VOL SKEW & SURFACE ━━━━━━━━━━━━━━━━━
+with tab_skew:
+
+    # ── Controls ──────────────────────────────────────────────
+    col_ctrl1, col_ctrl2, col_ctrl3, col_ctrl4 = st.columns([1, 1, 1, 1])
+    with col_ctrl1:
+        skew_ticker = st.selectbox(
+            "Subyacente",
+            ["SPY", "QQQ", "IWM", "GLD", "TLT"],
+            index=0,
+            help="SPY es el proxy más líquido para el mercado amplio",
+        )
+    with col_ctrl2:
+        n_exps = st.slider("Nº Vencimientos", 3, 9, 6, help="Vencimientos a mostrar en skew y superficie")
+    with col_ctrl3:
+        mon_lo = st.slider("Moneyness mín (%)", 70, 90, 80,
+                           help="Strike mínimo como % del spot") / 100
+    with col_ctrl4:
+        mon_hi = st.slider("Moneyness máx (%)", 110, 135, 120,
+                           help="Strike máximo como % del spot") / 100
+
+    if st.button("🔄 Actualizar opciones", key="refresh_options"):
+        fetch_options_chains.clear()
+
+    # ── Load data ─────────────────────────────────────────────
+    with st.spinner(f"📡 Descargando cadenas de opciones {skew_ticker}…"):
+        opt_chains, opt_spot = fetch_options_chains(skew_ticker, n_exp=n_exps)
+
+    if not opt_chains or not opt_spot:
+        st.error(
+            f"❌ No se pudieron obtener opciones para **{skew_ticker}**. "
+            "Verifica tu conexión o prueba durante horario de mercado."
+        )
+        st.stop()
+
+    n_valid_chains = len(opt_chains)
+    spot_disp = f"${opt_spot:.2f}"
+    exp_list  = sorted(opt_chains.keys())
+
+    # ── Métricas de skew ─────────────────────────────────────
+    sk_metrics = compute_skew_metrics(opt_chains, opt_spot)
+
+    def _m(v, suffix="", sign=False, color_fn=None):
+        if v is None:
+            return "—"
+        s = f"{'+' if sign and v >= 0 else ''}{v:.2f}{suffix}"
+        return s
+
+    atm_v  = _m(sk_metrics.get("atm_iv"),  "%")
+    rr_v   = _m(sk_metrics.get("rr25"),    " pts", sign=True)
+    bf_v   = _m(sk_metrics.get("bf25"),    " pts", sign=True)
+    slp_v  = _m(sk_metrics.get("skew_slope"), " pts/10%")
+    pc_v   = _m(sk_metrics.get("pc_ratio"))
+    sk_exp = sk_metrics.get("exp", exp_list[0] if exp_list else "—")
+    sk_dte = sk_metrics.get("dte", "?")
+
+    # Colores semafóricos
+    rr_raw  = sk_metrics.get("rr25")
+    pc_raw  = sk_metrics.get("pc_ratio")
+    rr_clr  = "var(--r)" if (rr_raw is not None and rr_raw < -3) else "var(--y)" if (rr_raw is not None and rr_raw < 0) else "var(--g)"
+    pc_clr  = "var(--r)" if (pc_raw is not None and pc_raw > 1.5) else "var(--y)" if (pc_raw is not None and pc_raw > 1.0) else "var(--g)"
+
+    st.markdown(f"""
+    <div class="mrow">
+        <div class="mpill">
+            <div class="ml">{skew_ticker} Spot</div>
+            <div class="mv nt">{spot_disp}</div>
+        </div>
+        <div class="mpill">
+            <div class="ml">ATM IV · {sk_exp} ({sk_dte}d)</div>
+            <div class="mv nt">{atm_v}</div>
+        </div>
+        <div class="mpill">
+            <div class="ml">25Δ Risk Reversal</div>
+            <div class="mv" style="color:{rr_clr}">{rr_v}</div>
+        </div>
+        <div class="mpill">
+            <div class="ml">25Δ Butterfly</div>
+            <div class="mv nt">{bf_v}</div>
+        </div>
+        <div class="mpill">
+            <div class="ml">Put Skew Slope</div>
+            <div class="mv nt">{slp_v}</div>
+        </div>
+        <div class="mpill">
+            <div class="ml">P/C Vol Ratio</div>
+            <div class="mv" style="color:{pc_clr}">{pc_v}</div>
+        </div>
+        <div class="mpill">
+            <div class="ml">Vencimientos</div>
+            <div class="mv nt">{n_valid_chains}</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Interpretación rápida ─────────────────────────────────
+    interp_parts = []
+    if rr_raw is not None:
+        if rr_raw < -4:
+            interp_parts.append("🔴 **Risk Reversal muy negativo** — el mercado paga prima fuerte por protección put; régimen de fear elevado")
+        elif rr_raw < -2:
+            interp_parts.append("🟡 **Risk Reversal negativo moderado** — skew put normal, demanda de cobertura activa")
+        else:
+            interp_parts.append("🟢 **Risk Reversal cerca de cero** — skew equilibrado, apetito por riesgo presente")
+    if pc_raw is not None:
+        if pc_raw > 1.5:
+            interp_parts.append("🔴 **P/C Ratio > 1.5** — flujo dominantemente en puts, posible hedging institucional o miedo")
+        elif pc_raw > 1.0:
+            interp_parts.append("🟡 **P/C Ratio > 1.0** — ligero sesgo a puts, mercado defensivo")
+        else:
+            interp_parts.append("🟢 **P/C Ratio < 1.0** — flujo en calls domina, risk-on")
+    if interp_parts:
+        with st.expander("📊 Lectura del Skew", expanded=True):
+            for line in interp_parts:
+                st.markdown(line)
+
+    st.markdown("<div style='border-top:1px solid #30363D;margin:0.5rem 0'></div>",
+                unsafe_allow_html=True)
+
+    # ── Charts: Skew + ATM Term Structure ────────────────────
+    col_skew, col_atm = st.columns([1.6, 1])
+
+    with col_skew:
+        try:
+            fig_sk = build_skew_curves(opt_chains, opt_spot,
+                                       moneyness_range=(mon_lo, mon_hi))
+            if fig_sk.data:
+                st.plotly_chart(fig_sk, use_container_width=True,
+                                config=dict(displayModeBar=True,
+                                            modeBarButtonsToRemove=["lasso2d","select2d"]))
+            else:
+                st.info("No hay suficientes datos para graficar el skew.")
+        except Exception as e:
+            st.error(f"Error skew curves: {e}")
+
+    with col_atm:
+        try:
+            fig_atm = build_atm_term_structure(opt_chains, opt_spot)
+            if fig_atm.data:
+                st.plotly_chart(fig_atm, use_container_width=True,
+                                config=dict(displayModeBar=False))
+            else:
+                st.info("No hay datos ATM.")
+        except Exception as e:
+            st.error(f"Error ATM TS: {e}")
+
+    st.markdown("<div style='border-top:1px solid #30363D;margin:0.5rem 0'></div>",
+                unsafe_allow_html=True)
+
+    # ── IV Surface selector ───────────────────────────────────
+    view_mode = st.radio(
+        "Vista de superficie",
+        ["🌐 3D Surface", "🗺️ Heatmap 2D"],
+        horizontal=True,
+        help="El heatmap es más preciso para leer valores; la superficie 3D muestra la geometría de la vol.",
+    )
+
+    if view_mode == "🌐 3D Surface":
+        try:
+            fig_surf = build_iv_surface(opt_chains, opt_spot,
+                                        moneyness_range=(mon_lo, mon_hi))
+            if fig_surf.data:
+                st.plotly_chart(fig_surf, use_container_width=True,
+                                config=dict(displayModeBar=True))
+            else:
+                st.info("No hay suficientes datos para construir la superficie 3D.")
+        except Exception as e:
+            st.error(f"Error IV Surface: {e}")
+    else:
+        try:
+            fig_hm = build_iv_heatmap(opt_chains, opt_spot,
+                                      moneyness_range=(mon_lo, mon_hi))
+            if fig_hm.data:
+                st.plotly_chart(fig_hm, use_container_width=True,
+                                config=dict(displayModeBar=False))
+            else:
+                st.info("No hay suficientes datos para el heatmap.")
+        except Exception as e:
+            st.error(f"Error IV Heatmap: {e}")
+
+    # ── Data table de vencimientos ─────────────────────────────
+    with st.expander("📋 Tabla resumen por vencimiento"):
+        rows_tbl = []
+        for exp_str, data in sorted(opt_chains.items(), key=lambda x: x[1]["dte"]):
+            dte_t   = data["dte"]
+            puts_t  = data["puts"]
+            calls_t = data["calls"]
+
+            atm_p = puts_t[puts_t["moneyness"].between(0.97, 1.03)]
+            atm_c = calls_t[calls_t["moneyness"].between(0.97, 1.03)]
+            atm_all_t = pd.concat([atm_p, atm_c])
+
+            atm_iv_t = (
+                float(np.average(atm_all_t["impliedVolatility"].values,
+                                 weights=atm_all_t["openInterest"].values + 1)) * 100
+                if not atm_all_t.empty else np.nan
+            )
+
+            p90 = puts_t[puts_t["moneyness"].between(0.88, 0.92)]["impliedVolatility"].mean()
+            c110 = calls_t[calls_t["moneyness"].between(1.08, 1.12)]["impliedVolatility"].mean()
+            rr_t = (c110 - p90) * 100 if not (np.isnan(p90) if isinstance(p90, float) else False) else np.nan
+
+            rows_tbl.append({
+                "Vencimiento": exp_str,
+                "DTE": dte_t,
+                "ATM IV": f"{atm_iv_t:.1f}%" if not np.isnan(atm_iv_t) else "—",
+                "IV 90% (puts)": f"{p90*100:.1f}%" if pd.notna(p90) else "—",
+                "IV 110% (calls)": f"{c110*100:.1f}%" if pd.notna(c110) else "—",
+                "RR ~25Δ": f"{rr_t:+.1f} pts" if not np.isnan(rr_t) else "—",
+                "Puts (OI>0)": len(puts_t),
+                "Calls (OI>0)": len(calls_t),
+            })
+
+        if rows_tbl:
+            st.dataframe(
+                pd.DataFrame(rows_tbl),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    st.caption(
+        f"Fuente: Yahoo Finance (opciones con OI > 0) · "
+        f"Spot {skew_ticker}: {spot_disp} · "
+        f"Actualizado: {now_cdmx().strftime('%H:%M:%S')} CDMX · "
+        "Precios con delay ~15 min"
+    )
 
 
 # ━━━━━━━━━━━━━━━━━ TAB 3: RECOMENDACIONES ━━━━━━━━━━━━━━━━━
