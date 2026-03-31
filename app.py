@@ -341,24 +341,44 @@ def fetch_options_chains(ticker: str = "SPY", n_exp: int = 5) -> tuple:
                 raise  # re-raise si no es rate-limit o se agotaron intentos
         return None
 
+    def _get_with_backoff(fn, label, max_retries=4):
+        """Llama fn() con backoff exponencial ante rate-limit."""
+        for attempt in range(max_retries):
+            try:
+                return fn()
+            except Exception as e:
+                err_str = str(e).lower()
+                is_rl = any(k in err_str for k in
+                            ["rate limit", "too many requests", "429", "throttle"])
+                if is_rl and attempt < max_retries - 1:
+                    wait = 2 ** (attempt + 1)  # 2s, 4s, 8s, 16s
+                    log.warning(f"{label} rate-limit → retry {attempt+1}/{max_retries} en {wait}s")
+                    time.sleep(wait)
+                else:
+                    raise
+        return None
+
     try:
-        # No session= : yfinance maneja curl_cffi internamente
+        # Sin session= : yfinance >=0.2.x usa curl_cffi internamente
         t = yf.Ticker(ticker)
 
-        # Obtener lista de expiraciones (no suele ser bloqueada)
+        # 1. Lista de vencimientos — con backoff
         try:
-            expirations = t.options
+            expirations = _get_with_backoff(lambda: t.options, f"{ticker}.options")
         except Exception as e:
-            log.error(f"fetch_options_chains {ticker}: no se pudo obtener expirations — {e}")
+            log.error(f"fetch_options_chains {ticker}: expirations fallida — {e}")
             return {}, None
 
         if not expirations:
             return {}, None
 
-        # Spot price
+        # 2. Spot price — con backoff + delay previo
+        time.sleep(0.5)
         try:
-            hist = t.history(period="2d")
-            spot = float(hist["Close"].iloc[-1]) if not hist.empty else None
+            hist = _get_with_backoff(
+                lambda: t.history(period="2d"), f"{ticker}.history"
+            )
+            spot = float(hist["Close"].iloc[-1]) if hist is not None and not hist.empty else None
         except Exception:
             spot = None
         if not spot:
@@ -368,7 +388,7 @@ def fetch_options_chains(ticker: str = "SPY", n_exp: int = 5) -> tuple:
         chains = {}
         consecutive_rate_limits = 0
 
-        # Priorizar vencimientos con DTE ≥ 14 (mensuales, más líquidos y menos ruido)
+        # Filtrar vencimientos futuros con DTE ≥ 7 (descartar weeklys muy cortos)
         valid_exps = []
         for exp_str in expirations:
             try:
@@ -378,13 +398,15 @@ def fetch_options_chains(ticker: str = "SPY", n_exp: int = 5) -> tuple:
                     valid_exps.append((exp_str, dte))
             except Exception:
                 continue
-        # Ordenar por DTE y tomar los n_exp más próximos
         valid_exps = sorted(valid_exps, key=lambda x: x[1])[:n_exp]
+
+        # Pequeño delay antes de empezar las cadenas individuales
+        time.sleep(1.0)
 
         for exp_str, dte in valid_exps:
             if consecutive_rate_limits >= 2:
-                log.warning(f"Múltiples rate limits — pausa 8s antes de continuar")
-                time.sleep(8)
+                log.warning(f"Múltiples rate limits consecutivos — pausa 10s")
+                time.sleep(10)
                 consecutive_rate_limits = 0
 
             try:
@@ -425,7 +447,7 @@ def fetch_options_chains(ticker: str = "SPY", n_exp: int = 5) -> tuple:
                 }
 
                 # Pausa entre expiraciones para no saturar la API
-                time.sleep(1.2)
+                time.sleep(1.5)  # throttle: ~1.5s entre cada vencimiento
 
             except Exception as e:
                 err_str = str(e).lower()
@@ -2074,19 +2096,23 @@ with tab_skew:
         fetch_options_chains.clear()
 
     # ── Load data ─────────────────────────────────────────────
-    with st.spinner(f"📡 Descargando cadenas de opciones {skew_ticker}…"):
+    est_secs = n_exps * 1.5 + 2
+    with st.spinner(
+        f"📡 Descargando {n_exps} vencimientos de {skew_ticker} "
+        f"(~{est_secs:.0f}s · throttle anti-rate-limit)…"
+    ):
         opt_chains, opt_spot = fetch_options_chains(skew_ticker, n_exp=n_exps)
 
     if not opt_chains or not opt_spot:
         st.error(
-            f"❌ **Rate limit de Yahoo Finance** — no se pudieron cargar opciones para **{skew_ticker}**."
+            f"❌ **Yahoo Finance rate limit** — no se pudieron cargar opciones para **{skew_ticker}**."
         )
         st.info(
             "💡 **Pasos para resolver:**\n"
-            "1. Espera **2-3 minutos** y presiona 🔄 Actualizar opciones\n"
-            "2. Reduce el slider de vencimientos a **2 o 3**\n"
-            "3. El caché dura **15 min** — no recarga si ya tienes datos frescos\n"
-            "4. yfinance tiene throttling no documentado; es más estable en horario de mercado (9:30–16:00 ET)"
+            "1. Espera **3-5 minutos** y presiona 🔄 Actualizar opciones\n"
+            "2. Baja el slider **Nº Vencimientos** a **2**\n"
+            "3. El caché dura 15 min — si ya cargó antes, no volverá a pedir hasta que expire\n"
+            "4. yfinance/Yahoo tiene cuotas no documentadas; funciona mejor en horario de mercado (9:30–16:00 ET)"
         )
         st.stop()
 
