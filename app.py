@@ -2724,6 +2724,509 @@ def fetch_today_prices():
     return out
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# WALK-FORWARD BACKTEST ENGINE
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@st.cache_data(ttl=3600)
+def run_walkforward_backtest(bt: pd.DataFrame,
+                              svxy_col: str = "SVXY_Close",
+                              spy_col:  str = "SPY_Close",
+                              rf_annual: float = 0.043,
+                              wf_months: int = 6) -> dict:
+    """
+    Walk-Forward Analysis de la estrategia BB×Contango.
+
+    METODOLOGÍA:
+    ─────────────────────────────────────────────────────────
+    1. FULL-SAMPLE backtest: aplica la señal sobre todo el histórico.
+       - Retorno diario: sig_final(t-1) × ret_SVXY(t)
+       - Benchmark: Buy & Hold SVXY
+       - Benchmark2: Buy & Hold SPY
+
+    2. WALK-FORWARD: ventanas deslizantes de `wf_months` meses.
+       Por cada ventana calcula Sharpe, Calmar, Win Rate, etc.
+       Permite ver si el edge se mantiene o se deteriora en el tiempo.
+
+    3. SHARPE ROLLING 6M: señal de alerta si Sharpe < 0.5 dos meses
+       consecutivos → edge en deterioro.
+
+    4. MÉTRICAS COMPLETAS:
+       - CAGR, Sharpe, Sortino, Calmar, Max Drawdown
+       - Win rate por trade, Avg hold time
+       - Alpha vs SPY (Jensen's alpha mensual)
+       - Hit rate contango filter (% días en contango con señal activa)
+
+    RETORNA dict con:
+      - full:   dict métricas full-sample
+      - wf_df:  DataFrame walk-forward por ventana
+      - equity: Series equity curve diaria
+      - trades: DataFrame trades individuales
+      - monthly: DataFrame retornos mensuales para heatmap
+    """
+    from scipy import stats as _stats
+    log = logging.getLogger("vix_controller")
+
+    needed = ["sig_final", "VXX_Close", "In_Contango", "Contango_pct"]
+    for c in needed:
+        if c not in bt.columns:
+            log.warning(f"WF backtest: columna faltante {c}")
+            return {}
+
+    # ── 1. Retornos diarios ────────────────────────────────────────────────
+    df = bt.copy()
+
+    # Retorno del vehículo: SVXY si disponible, sino aprox -0.5×VXX
+    if svxy_col in df.columns and df[svxy_col].notna().sum() > 100:
+        df["ret_vehicle"] = df[svxy_col].pct_change()
+    else:
+        # Aproximación: -0.5 × cambio % VXX (antes de costos)
+        df["ret_vehicle"] = -0.5 * df["VXX_Close"].pct_change()
+        log.info("WF: usando aproximación -0.5×VXX como retorno")
+
+    if spy_col in df.columns and df[spy_col].notna().sum() > 100:
+        df["ret_spy"] = df[spy_col].pct_change()
+    else:
+        df["ret_spy"] = np.nan
+
+    # Retorno de la estrategia: señal del día anterior × retorno del vehículo
+    df["ret_strat"] = df["sig_final"].shift(1).fillna(0) * df["ret_vehicle"]
+    df["ret_bh"]    = df["ret_vehicle"]   # buy & hold SVXY
+
+    df = df.dropna(subset=["ret_strat"]).copy()
+    if len(df) < 60:
+        return {}
+
+    rf_daily = (1 + rf_annual)**(1/252) - 1
+
+    # ── 2. Función métricas de un período ─────────────────────────────────
+    def _metrics(ret_series: pd.Series, rf_d: float = rf_daily) -> dict:
+        r = ret_series.dropna()
+        if len(r) < 20:
+            return {}
+        n    = len(r)
+        days = (r.index[-1] - r.index[0]).days or 1
+        years = days / 365.25
+
+        eq   = (1 + r).cumprod()
+        cagr = float(eq.iloc[-1]**(1/years) - 1) if years > 0 else np.nan
+
+        excess = r - rf_d
+        sharpe = float(excess.mean() / excess.std() * np.sqrt(252)) if excess.std() > 0 else np.nan
+
+        neg    = r[r < 0]
+        sortino= float(excess.mean() / neg.std() * np.sqrt(252)) if len(neg) > 0 and neg.std() > 0 else np.nan
+
+        roll_max = eq.cummax()
+        dd       = (eq - roll_max) / roll_max
+        max_dd   = float(dd.min())
+        calmar   = float(cagr / abs(max_dd)) if max_dd < 0 else np.nan
+
+        total_ret  = float(eq.iloc[-1] - 1)
+        volatility = float(r.std() * np.sqrt(252))
+        win_days   = (r > 0).sum() / n
+
+        return dict(
+            n_days=n, years=round(years, 2),
+            cagr=round(cagr*100, 2) if not np.isnan(cagr) else None,
+            sharpe=round(sharpe, 3) if not np.isnan(sharpe) else None,
+            sortino=round(sortino, 3) if not np.isnan(sortino) else None,
+            calmar=round(calmar, 3) if not np.isnan(calmar) else None,
+            max_dd=round(max_dd*100, 2),
+            total_ret=round(total_ret*100, 2),
+            volatility=round(volatility*100, 2),
+            win_days=round(win_days*100, 1),
+        )
+
+    # ── 3. Full-sample metrics ─────────────────────────────────────────────
+    full = _metrics(df["ret_strat"])
+    full_bh  = _metrics(df["ret_bh"])
+    full_spy = _metrics(df["ret_spy"].dropna()) if "ret_spy" in df else {}
+
+    # Alpha vs SPY (monthly OLS)
+    if "ret_spy" in df.columns:
+        mret_strat = df["ret_strat"].resample("ME").apply(lambda x: (1+x).prod()-1)
+        mret_spy   = df["ret_spy"].resample("ME").apply(lambda x: (1+x).prod()-1)
+        merged_m   = pd.concat([mret_strat, mret_spy], axis=1).dropna()
+        merged_m.columns = ["strat","spy"]
+        if len(merged_m) >= 12:
+            slope, intercept, r_val, _, _ = _stats.linregress(
+                merged_m["spy"].values, merged_m["strat"].values)
+            full["alpha_monthly"]   = round(float(intercept)*100, 3)
+            full["beta"]            = round(float(slope), 3)
+            full["r2_vs_spy"]       = round(float(r_val**2), 3)
+        else:
+            full["alpha_monthly"] = np.nan
+
+    full["bh_sharpe"]   = full_bh.get("sharpe")
+    full["bh_cagr"]     = full_bh.get("cagr")
+    full["spy_sharpe"]  = full_spy.get("sharpe")
+    full["spy_cagr"]    = full_spy.get("cagr")
+
+    # ── 4. Trades individuales ─────────────────────────────────────────────
+    sig  = df["sig_final"].shift(1).fillna(0).astype(int)
+    ret  = df["ret_vehicle"]
+    equity_vec = [1.0]
+    trades_list = []
+    in_trade = False; entry_date = None; entry_eq = 1.0; trade_ret = 1.0
+
+    for i in range(len(df)):
+        s_prev = sig.iloc[i]
+        r_i    = ret.iloc[i] if not np.isnan(ret.iloc[i]) else 0.0
+
+        if s_prev == 1 and not in_trade:
+            in_trade = True; entry_date = df.index[i]; entry_eq = equity_vec[-1]
+
+        if s_prev == 1:
+            trade_ret = (equity_vec[-1] + equity_vec[-1] * r_i) / entry_eq
+            equity_vec.append(equity_vec[-1] * (1 + r_i))
+        else:
+            equity_vec.append(equity_vec[-1])
+            if in_trade:
+                trades_list.append({
+                    "entry":    entry_date,
+                    "exit":     df.index[i],
+                    "hold_d":   (df.index[i] - entry_date).days,
+                    "ret_pct":  round((trade_ret - 1)*100, 2),
+                    "exit_why": "BB" if df["sig_bb"].iloc[i] == 0 else "CT",
+                })
+                in_trade = False; trade_ret = 1.0
+
+    equity = pd.Series(equity_vec[1:], index=df.index, name="equity")
+    trades_df = pd.DataFrame(trades_list) if trades_list else pd.DataFrame()
+
+    if not trades_df.empty:
+        full["n_trades"]   = len(trades_df)
+        full["win_rate"]   = round((trades_df["ret_pct"] > 0).mean()*100, 1)
+        full["avg_hold_d"] = round(trades_df["hold_d"].mean(), 1)
+        full["avg_win"]    = round(trades_df.loc[trades_df["ret_pct"]>0,"ret_pct"].mean(), 2)
+        full["avg_loss"]   = round(trades_df.loc[trades_df["ret_pct"]<0,"ret_pct"].mean(), 2)
+        full["profit_factor"] = round(
+            abs(trades_df.loc[trades_df["ret_pct"]>0,"ret_pct"].sum() /
+                trades_df.loc[trades_df["ret_pct"]<0,"ret_pct"].sum())
+            if (trades_df["ret_pct"] < 0).any() else np.inf, 2)
+
+    # ── 5. Walk-Forward: ventanas de wf_months meses ───────────────────────
+    wf_rows = []
+    window_days = wf_months * 21   # aprox días hábiles
+
+    for start_i in range(0, len(df) - window_days, 21):
+        end_i = start_i + window_days
+        if end_i > len(df): break
+        window = df.iloc[start_i:end_i]
+        m = _metrics(window["ret_strat"])
+        if not m: continue
+        m_bh = _metrics(window["ret_bh"])
+        m["period_start"] = window.index[0].date()
+        m["period_end"]   = window.index[-1].date()
+        m["bh_sharpe"]    = m_bh.get("sharpe")
+        m["pct_invested"] = round(window["sig_final"].mean()*100, 1)
+        m["ct_ratio"]     = round(window["In_Contango"].mean()*100, 1) if "In_Contango" in window else None
+        wf_rows.append(m)
+
+    wf_df = pd.DataFrame(wf_rows)
+    if not wf_df.empty:
+        wf_df = wf_df.sort_values("period_start").reset_index(drop=True)
+
+    # ── 6. Sharpe rolling 6M ───────────────────────────────────────────────
+    roll_window = 126   # ~6 meses hábiles
+    df["sharpe_roll"] = (
+        df["ret_strat"].rolling(roll_window).apply(
+            lambda x: (x - rf_daily).mean() / x.std() * np.sqrt(252)
+            if x.std() > 0 else np.nan, raw=True)
+    )
+    df["dd_roll"] = (equity / equity.rolling(roll_window).max() - 1) * 100
+
+    # ── 7. Retornos mensuales ──────────────────────────────────────────────
+    monthly_strat = df["ret_strat"].resample("ME").apply(lambda x: (1+x).prod()-1) * 100
+    monthly_bh    = df["ret_bh"].resample("ME").apply(lambda x: (1+x).prod()-1) * 100
+    monthly_df    = pd.DataFrame({"Estrategia": monthly_strat, "SVXY B&H": monthly_bh})
+    monthly_df.index = monthly_df.index.to_period("M").astype(str)
+
+    log.info(f"WF Backtest: {full.get('n_trades',0)} trades · Sharpe={full.get('sharpe','?')} · CAGR={full.get('cagr','?')}%")
+
+    return {
+        "full":    full,
+        "wf_df":   wf_df,
+        "equity":  equity,
+        "trades":  trades_df,
+        "monthly": monthly_df,
+        "df_with_rolling": df,
+        "wf_months": wf_months,
+    }
+
+
+def build_equity_curve_chart(result: dict) -> go.Figure:
+    """Curva de equity de la estrategia vs Buy & Hold SVXY y SPY."""
+    from plotly.subplots import make_subplots
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        row_heights=[0.65, 0.35], vertical_spacing=0.03)
+
+    eq   = result.get("equity", pd.Series(dtype=float))
+    df_r = result.get("df_with_rolling", pd.DataFrame())
+
+    if eq.empty: return fig
+
+    # Normalizar a base 100
+    eq_norm = eq / eq.iloc[0] * 100
+
+    # Benchmark B&H SVXY
+    if "ret_bh" in df_r.columns:
+        bh_eq = (1 + df_r["ret_bh"].fillna(0)).cumprod()
+        bh_eq = bh_eq / bh_eq.iloc[0] * 100
+        fig.add_trace(go.Scatter(
+            x=df_r.index, y=bh_eq, name="SVXY Buy & Hold",
+            line=dict(color="#484F58", width=1.5, dash="dot"),
+            hovertemplate="%{x|%Y-%m-%d}<br>B&H: %{y:.0f}<extra></extra>"), row=1, col=1)
+
+    if "ret_spy" in df_r.columns:
+        spy_eq = (1 + df_r["ret_spy"].fillna(0)).cumprod()
+        spy_eq = spy_eq / spy_eq.iloc[0] * 100
+        fig.add_trace(go.Scatter(
+            x=df_r.index, y=spy_eq, name="SPY Buy & Hold",
+            line=dict(color="#8B949E", width=1.5, dash="dot"),
+            hovertemplate="%{x|%Y-%m-%d}<br>SPY: %{y:.0f}<extra></extra>"), row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=eq.index, y=eq_norm, name="Estrategia BB×CT",
+        line=dict(color="#3FB950", width=2.5),
+        hovertemplate="%{x|%Y-%m-%d}<br>Estrategia: %{y:.0f}<extra></extra>"), row=1, col=1)
+
+    # Panel 2: Sharpe rolling 6M
+    if "sharpe_roll" in df_r.columns:
+        sr = df_r["sharpe_roll"].dropna()
+        colors_sr = ["#3FB950" if v >= 1.0 else "#D29922" if v >= 0.5 else "#F85149" for v in sr]
+        fig.add_trace(go.Scatter(
+            x=sr.index, y=sr, name="Sharpe Rolling 6M",
+            line=dict(color="#58A6FF", width=1.8),
+            hovertemplate="%{x|%Y-%m-%d}<br>Sharpe 6M: %{y:.2f}<extra></extra>"), row=2, col=1)
+        fig.add_hline(y=1.0, line_dash="dash", line_color="#3FB950", line_width=1,
+                      annotation_text="  1.0 (óptimo)", annotation_font=dict(color="#3FB950", size=8),
+                      row=2, col=1)
+        fig.add_hline(y=0.5, line_dash="dot", line_color="#D29922", line_width=1,
+                      annotation_text="  0.5 (alerta)", annotation_font=dict(color="#D29922", size=8),
+                      row=2, col=1)
+        fig.add_hline(y=0, line_dash="solid", line_color="#484F58", line_width=1,
+                      row=2, col=1)
+
+    wf_m = result.get("wf_months", 6)
+    fig.update_layout(
+        title=dict(
+            text=f"<b>Equity Curve + Sharpe Rolling {wf_m}M</b>"
+                 "<sup>  Base 100 · Verde=estrategia · Gris=benchmarks</sup>",
+            font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5),
+        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+        height=520, margin=dict(l=55, r=30, t=65, b=40),
+        xaxis=dict(gridcolor="#21262D",
+                   tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono"),
+                   rangeselector=dict(
+                       buttons=[dict(count=1,label="1A",step="year",stepmode="backward"),
+                                dict(count=3,label="3A",step="year",stepmode="backward"),
+                                dict(count=5,label="5A",step="year",stepmode="backward"),
+                                dict(step="all",label="Todo")],
+                       bgcolor="#161B22", activecolor="#F7931A",
+                       font=dict(size=9, color="#C9D1D9", family="JetBrains Mono"))),
+        xaxis2=dict(gridcolor="#21262D",
+                    tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono")),
+        yaxis=dict(title="Índice (base 100)", gridcolor="#21262D",
+                   tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono")),
+        yaxis2=dict(title="Sharpe 6M", gridcolor="#21262D",
+                    tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono"),
+                    zeroline=True, zerolinecolor="#484F58"),
+        legend=dict(orientation="h", y=1.03, bgcolor="rgba(0,0,0,0)",
+                    font=dict(size=9, color="#C9D1D9", family="JetBrains Mono")),
+        hovermode="x unified")
+    return fig
+
+
+def build_drawdown_chart(result: dict) -> go.Figure:
+    """Drawdown diario de la estrategia."""
+    eq   = result.get("equity", pd.Series(dtype=float))
+    if eq.empty: return go.Figure()
+    roll_max = eq.cummax()
+    dd       = (eq / roll_max - 1) * 100
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=dd.index, y=dd, name="Drawdown",
+        fill="tozeroy", line=dict(color="#F85149", width=1.5),
+        fillcolor="rgba(248,81,73,0.2)",
+        hovertemplate="%{x|%Y-%m-%d}<br>DD: %{y:.1f}%<extra></extra>"))
+    fig.add_hline(y=-10, line_dash="dot", line_color="#D29922", line_width=1,
+                  annotation_text="  -10%", annotation_font=dict(color="#D29922", size=8))
+    fig.add_hline(y=-20, line_dash="dash", line_color="#F85149", line_width=1,
+                  annotation_text="  -20%", annotation_font=dict(color="#F85149", size=8))
+    fig.update_layout(
+        title=dict(text="<b>Drawdown Histórico</b>",
+                   font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5),
+        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+        height=280, margin=dict(l=55, r=30, t=55, b=40),
+        xaxis=dict(gridcolor="#21262D",
+                   tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono")),
+        yaxis=dict(title="Drawdown %", gridcolor="#21262D",
+                   tickfont=dict(size=9, color="#8B949E"),
+                   ticksuffix="%"),
+        showlegend=False, hovermode="x unified")
+    return fig
+
+
+def build_walkforward_chart(wf_df: pd.DataFrame, wf_months: int = 6) -> go.Figure:
+    """Sharpe por ventana walk-forward + % tiempo invertido."""
+    if wf_df.empty or "sharpe" not in wf_df.columns: return go.Figure()
+    from plotly.subplots import make_subplots
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        row_heights=[0.6, 0.4], vertical_spacing=0.04)
+
+    # Panel 1: Sharpe por ventana
+    xs = wf_df["period_end"].astype(str)
+    colors_wf = ["#3FB950" if v >= 1.0 else "#D29922" if v >= 0.5 else "#F85149"
+                 for v in wf_df["sharpe"]]
+    fig.add_trace(go.Bar(
+        x=xs, y=wf_df["sharpe"], name=f"Sharpe {wf_months}M",
+        marker_color=colors_wf, opacity=0.8,
+        hovertemplate="Fin: %{x}<br>Sharpe: %{y:.2f}<extra></extra>"), row=1, col=1)
+
+    if "bh_sharpe" in wf_df.columns:
+        fig.add_trace(go.Scatter(
+            x=xs, y=wf_df["bh_sharpe"], name="Sharpe B&H SVXY",
+            line=dict(color="#484F58", width=1.5, dash="dot"),
+            hovertemplate="B&H Sharpe: %{y:.2f}<extra></extra>"), row=1, col=1)
+
+    fig.add_hline(y=1.0, line_dash="dash", line_color="#3FB950", line_width=1.2, row=1, col=1)
+    fig.add_hline(y=0.5, line_dash="dot", line_color="#D29922", line_width=1, row=1, col=1)
+    fig.add_hline(y=0, line_dash="solid", line_color="#484F58", line_width=1, row=1, col=1)
+
+    # Panel 2: % tiempo invertido
+    if "pct_invested" in wf_df.columns:
+        fig.add_trace(go.Bar(
+            x=xs, y=wf_df["pct_invested"], name="% Tiempo invertido",
+            marker_color="#58A6FF", opacity=0.6,
+            hovertemplate="%{x}<br>Invertido: %{y:.0f}%<extra></extra>"), row=2, col=1)
+        if "ct_ratio" in wf_df.columns:
+            fig.add_trace(go.Scatter(
+                x=xs, y=wf_df["ct_ratio"], name="% Días contango",
+                line=dict(color="#39D2C0", width=1.5),
+                hovertemplate="Contango: %{y:.0f}%<extra></extra>"), row=2, col=1)
+
+    fig.update_layout(
+        title=dict(
+            text=f"<b>Walk-Forward Analysis — Ventanas de {wf_months} Meses</b>"
+                 "<sup>  Verde=Sharpe≥1 · Amarillo=0.5-1 · Rojo=<0.5</sup>",
+            font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5),
+        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+        height=440, margin=dict(l=55, r=30, t=65, b=40),
+        xaxis2=dict(gridcolor="#21262D",
+                    tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono"),
+                    tickangle=-30),
+        xaxis=dict(gridcolor="#21262D",
+                   tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono")),
+        yaxis=dict(title="Sharpe", gridcolor="#21262D",
+                   tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono")),
+        yaxis2=dict(title="%", gridcolor="#21262D",
+                    tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono")),
+        legend=dict(orientation="h", y=1.03, bgcolor="rgba(0,0,0,0)",
+                    font=dict(size=9, color="#C9D1D9", family="JetBrains Mono")),
+        hovermode="x unified", bargap=0.1)
+    return fig
+
+
+def build_monthly_returns_heatmap(monthly_df: pd.DataFrame) -> go.Figure:
+    """Heatmap de retornos mensuales año × mes."""
+    if monthly_df.empty: return go.Figure()
+    fig = go.Figure()
+
+    strat = monthly_df["Estrategia"]
+    periods = strat.index  # "2023-01", "2023-02", …
+
+    # Reshape en matriz año × mes
+    years  = sorted(set(p[:4] for p in periods))
+    months = [f"{m:02d}" for m in range(1, 13)]
+    month_names = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"]
+
+    Z    = np.full((len(years), 12), np.nan)
+    text = [[""] * 12 for _ in range(len(years))]
+
+    for p, v in strat.items():
+        yr  = p[:4]; mo = int(p[5:7]) - 1
+        if yr in years:
+            ri = years.index(yr)
+            Z[ri, mo]    = round(float(v), 1)
+            text[ri][mo] = f"{v:+.1f}%"
+
+    colorscale = [
+        [0.0,  "#7B0000"], [0.1,  "#C62828"], [0.25, "#EF5350"],
+        [0.40, "#FFCDD2"], [0.50, "#F5F5F5"],
+        [0.60, "#C8E6C9"], [0.75, "#4CAF50"], [0.90, "#2E7D32"], [1.0,  "#1B5E20"],
+    ]
+
+    fig.add_trace(go.Heatmap(
+        z=Z, x=month_names, y=years,
+        text=text, texttemplate="%{text}",
+        textfont=dict(size=9, color="#F0F6FC", family="JetBrains Mono"),
+        colorscale=colorscale,
+        zmid=0,
+        colorbar=dict(title=dict(text="Ret%", font=dict(color="#8B949E", size=9)),
+                      tickfont=dict(color="#8B949E", size=8),
+                      len=0.8, thickness=12, ticksuffix="%"),
+        hovertemplate="Año: %{y}<br>Mes: %{x}<br>Ret: %{z:.1f}%<extra></extra>",
+        xgap=2, ygap=2))
+
+    fig.update_layout(
+        title=dict(text="<b>Retornos Mensuales — Estrategia BB×Contango</b>",
+                   font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5),
+        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+        height=max(280, len(years)*38 + 80),
+        margin=dict(l=60, r=20, t=60, b=40),
+        xaxis=dict(tickfont=dict(size=10, color="#C9D1D9", family="JetBrains Mono")),
+        yaxis=dict(tickfont=dict(size=10, color="#C9D1D9", family="JetBrains Mono"),
+                   autorange="reversed"))
+    return fig
+
+
+def build_trades_chart(trades_df: pd.DataFrame) -> go.Figure:
+    """Barras de retorno por trade + curva acumulada."""
+    if trades_df.empty: return go.Figure()
+    from plotly.subplots import make_subplots
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=False,
+                        row_heights=[0.5, 0.5], vertical_spacing=0.06)
+
+    colors_t = ["#3FB950" if v > 0 else "#F85149" for v in trades_df["ret_pct"]]
+    fig.add_trace(go.Bar(
+        x=list(range(1, len(trades_df)+1)), y=trades_df["ret_pct"],
+        marker_color=colors_t, opacity=0.8, name="Ret % por trade",
+        hovertemplate="Trade %{x}<br>%{y:+.1f}%<br>Hold: " +
+                      trades_df.get("hold_d", pd.Series()).astype(str).fillna("?") +
+                      "d<extra></extra>"), row=1, col=1)
+
+    # Curva acumulada de trades
+    cum = (1 + trades_df["ret_pct"]/100).cumprod() * 100
+    fig.add_trace(go.Scatter(
+        x=list(range(1, len(cum)+1)), y=cum, name="Equity por trade (base 100)",
+        line=dict(color="#58A6FF", width=2.5),
+        hovertemplate="Trade %{x}<br>Eq: %{y:.0f}<extra></extra>"), row=2, col=1)
+
+    fig.add_hline(y=0, line_dash="dash", line_color="#484F58", row=1, col=1)
+    fig.add_hline(y=100, line_dash="dash", line_color="#484F58", row=2, col=1)
+
+    fig.update_layout(
+        title=dict(text="<b>Trades Individuales</b><sup>  Verde=ganador · Rojo=perdedor</sup>",
+                   font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5),
+        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+        height=400, margin=dict(l=55, r=30, t=60, b=40),
+        xaxis=dict(title="Trade #", gridcolor="#21262D",
+                   tickfont=dict(size=9, color="#8B949E")),
+        xaxis2=dict(title="Trade #", gridcolor="#21262D",
+                    tickfont=dict(size=9, color="#8B949E")),
+        yaxis=dict(title="Retorno %", gridcolor="#21262D",
+                   tickfont=dict(size=9, color="#8B949E"), ticksuffix="%"),
+        yaxis2=dict(title="Equity (base 100)", gridcolor="#21262D",
+                    tickfont=dict(size=9, color="#8B949E")),
+        legend=dict(orientation="h", y=1.03, bgcolor="rgba(0,0,0,0)",
+                    font=dict(size=9, color="#C9D1D9", family="JetBrains Mono")),
+        showlegend=True, hovermode="x unified", bargap=0.15)
+    return fig
+
+
 @st.cache_data(ttl=3600)
 def build_strategy_cached(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -3447,6 +3950,195 @@ with tab2:
         f"Contango hoy: {ct_source} · "
         f"▲=Entrada  ▼🟡=Salida BB  ▼🔴=Salida CT"
     )
+
+    # ═══════════════════════════════════════════════════════════
+    # SECCIÓN 3 — BACKTEST WALK-FORWARD
+    # ═══════════════════════════════════════════════════════════
+    st.markdown("<div style='border-top:2px solid #F7931A;margin:1rem 0 0.5rem'></div>",
+                unsafe_allow_html=True)
+    st.markdown("## 📊 Backtest Walk-Forward — BB×Contango")
+
+    col_wf1, col_wf2 = st.columns([2, 1])
+    with col_wf1:
+        wf_window = st.select_slider(
+            "Ventana walk-forward",
+            options=[3, 6, 9, 12],
+            value=6,
+            format_func=lambda x: f"{x} meses",
+            help="Longitud de cada ventana de evaluación fuera de muestra")
+    with col_wf2:
+        if st.button("🔄 Recalcular backtest", key="btn_wf"):
+            run_walkforward_backtest.clear()
+
+    with st.spinner("⚙️ Calculando walk-forward…"):
+        wf_result = run_walkforward_backtest(bt, wf_months=wf_window)
+
+    if not wf_result:
+        st.warning("⚠️ Datos insuficientes para el backtest. Verifica que el parquet tenga VXX_Close y sig_final.")
+    else:
+        full   = wf_result["full"]
+        wf_df  = wf_result["wf_df"]
+        trades = wf_result["trades"]
+
+        # ── Alerta de deterioro de edge ──────────────────────
+        if not wf_df.empty and "sharpe" in wf_df.columns:
+            last2 = wf_df["sharpe"].tail(2).values
+            if len(last2) == 2 and all(v is not None and v < 0.5 for v in last2):
+                st.error("🚨 **ALERTA EDGE:** Sharpe < 0.5 en las últimas 2 ventanas walk-forward — el edge puede estar deteriorándose")
+            elif not wf_df.empty and wf_df["sharpe"].iloc[-1] is not None and wf_df["sharpe"].iloc[-1] < 0.5:
+                st.warning("⚠️ **Sharpe < 0.5 en la última ventana** — monitorear el edge de cerca")
+            else:
+                last_sharpe = wf_df["sharpe"].iloc[-1]
+                st.success(f"✅ Edge activo — Sharpe última ventana: {last_sharpe:.2f}")
+
+        # ── Métricas full-sample ──────────────────────────────
+        def _fmt_m(v, sfx="", prec=2):
+            return f"{v:.{prec}f}{sfx}" if v is not None and not (isinstance(v, float) and np.isnan(v)) else "—"
+
+        st.markdown(f"""
+        <div class="mrow">
+            <div class="mpill">
+                <div class="ml">CAGR (full)</div>
+                <div class="mv {'up' if (full.get('cagr') or 0) > 0 else 'dn'}">{_fmt_m(full.get('cagr'), '%')}</div>
+            </div>
+            <div class="mpill">
+                <div class="ml">Sharpe (full)</div>
+                <div class="mv {'up' if (full.get('sharpe') or 0) > 1 else 'nt'}">{_fmt_m(full.get('sharpe'))}</div>
+            </div>
+            <div class="mpill">
+                <div class="ml">Sortino</div>
+                <div class="mv nt">{_fmt_m(full.get('sortino'))}</div>
+            </div>
+            <div class="mpill">
+                <div class="ml">Calmar</div>
+                <div class="mv nt">{_fmt_m(full.get('calmar'))}</div>
+            </div>
+            <div class="mpill">
+                <div class="ml">Max Drawdown</div>
+                <div class="mv dn">{_fmt_m(full.get('max_dd'), '%')}</div>
+            </div>
+            <div class="mpill">
+                <div class="ml">Vol anualizada</div>
+                <div class="mv nt">{_fmt_m(full.get('volatility'), '%')}</div>
+            </div>
+            <div class="mpill">
+                <div class="ml">Alpha mensual</div>
+                <div class="mv {'up' if (full.get('alpha_monthly') or 0) > 0 else 'dn'}">{_fmt_m(full.get('alpha_monthly'), '%', 3)}</div>
+            </div>
+            <div class="mpill">
+                <div class="ml">Beta vs SPY</div>
+                <div class="mv nt">{_fmt_m(full.get('beta'))}</div>
+            </div>
+        </div>
+        <div class="mrow">
+            <div class="mpill">
+                <div class="ml">Nº Trades</div>
+                <div class="mv nt">{full.get('n_trades', '—')}</div>
+            </div>
+            <div class="mpill">
+                <div class="ml">Win Rate</div>
+                <div class="mv nt">{_fmt_m(full.get('win_rate'), '%')}</div>
+            </div>
+            <div class="mpill">
+                <div class="ml">Avg Hold</div>
+                <div class="mv nt">{_fmt_m(full.get('avg_hold_d'), 'd', 0)}</div>
+            </div>
+            <div class="mpill">
+                <div class="ml">Avg Win</div>
+                <div class="mv up">{_fmt_m(full.get('avg_win'), '%')}</div>
+            </div>
+            <div class="mpill">
+                <div class="ml">Avg Loss</div>
+                <div class="mv dn">{_fmt_m(full.get('avg_loss'), '%')}</div>
+            </div>
+            <div class="mpill">
+                <div class="ml">Profit Factor</div>
+                <div class="mv nt">{_fmt_m(full.get('profit_factor'))}</div>
+            </div>
+            <div class="mpill">
+                <div class="ml">CAGR B&H SVXY</div>
+                <div class="mv nt">{_fmt_m(full.get('bh_cagr'), '%')}</div>
+            </div>
+            <div class="mpill">
+                <div class="ml">Sharpe B&H SVXY</div>
+                <div class="mv nt">{_fmt_m(full.get('bh_sharpe'))}</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.markdown("<div style='border-top:1px solid #30363D;margin:0.5rem 0'></div>",
+                    unsafe_allow_html=True)
+
+        # ── Equity curve + Sharpe rolling ────────────────────
+        try:
+            fig_eq = build_equity_curve_chart(wf_result)
+            if fig_eq.data:
+                st.plotly_chart(fig_eq, width="stretch", config=dict(displayModeBar=True))
+        except Exception as e:
+            st.error(f"Error equity curve: {e}")
+
+        # ── Drawdown + Walk-forward ───────────────────────────
+        col_dd, col_wfc = st.columns([1, 1.3])
+        with col_dd:
+            try:
+                fig_dd = build_drawdown_chart(wf_result)
+                if fig_dd.data:
+                    st.plotly_chart(fig_dd, width="stretch", config=dict(displayModeBar=False))
+            except Exception as e:
+                st.error(f"Error drawdown: {e}")
+        with col_wfc:
+            try:
+                fig_wf = build_walkforward_chart(wf_df, wf_months=wf_window)
+                if fig_wf.data:
+                    st.plotly_chart(fig_wf, width="stretch", config=dict(displayModeBar=False))
+            except Exception as e:
+                st.error(f"Error walk-forward: {e}")
+
+        # ── Monthly returns heatmap ───────────────────────────
+        try:
+            fig_mh = build_monthly_returns_heatmap(wf_result.get("monthly", pd.DataFrame()))
+            if fig_mh.data:
+                st.plotly_chart(fig_mh, width="stretch", config=dict(displayModeBar=False))
+        except Exception as e:
+            st.error(f"Error heatmap mensual: {e}")
+
+        # ── Trades individuales ───────────────────────────────
+        if not trades.empty:
+            with st.expander(f"📋 Trades individuales ({len(trades)} operaciones)", expanded=False):
+                try:
+                    fig_tr = build_trades_chart(trades)
+                    if fig_tr.data:
+                        st.plotly_chart(fig_tr, width="stretch", config=dict(displayModeBar=False))
+                except Exception as e:
+                    st.error(f"Error trades chart: {e}")
+
+                # Tabla completa
+                st.dataframe(
+                    trades.style.format({
+                        "ret_pct": "{:+.2f}%",
+                        "hold_d":  "{:.0f}d",
+                    }).applymap(
+                        lambda v: "color: #3FB950" if isinstance(v, (int, float)) and v > 0
+                                  else "color: #F85149" if isinstance(v, (int, float)) and v < 0 else "",
+                        subset=["ret_pct"]
+                    ),
+                    use_container_width=True, hide_index=True
+                )
+
+                # Resumen de salidas
+                if "exit_why" in trades.columns:
+                    bb_exits = (trades["exit_why"] == "BB").sum()
+                    ct_exits = (trades["exit_why"] == "CT").sum()
+                    st.markdown(
+                        f"Salidas por **BB**: {bb_exits} ({bb_exits/len(trades)*100:.0f}%) · "
+                        f"Salidas por **Contango Rule**: {ct_exits} ({ct_exits/len(trades)*100:.0f}%)"
+                    )
+
+        st.caption(
+            f"Walk-Forward: ventanas de {wf_window}M · "
+            f"Retorno vehículo: {'SVXY_Close' if 'SVXY_Close' in bt.columns else '-0.5×VXX aprox'} · "
+            f"RF: {0.043*100:.1f}% anual · Alpha vs SPY (regresión mensual)"
+        )
 
 
 # ━━━━━━━━━━━━━━━━━ TAB EDGE: EDGE ANALYTICS ━━━━━━━━━━━━━━━
