@@ -291,15 +291,22 @@ def fetch_etps():
 
 @st.cache_data(ttl=300)
 def fetch_edge_extra():
+    """Fetches VVIX, SKEW, HYG, IEF live from yfinance.
+    Index is timezone-normalized to UTC-naive for safe joining."""
     out = {}
-    for name, sym in [("SKEW", "^SKEW"), ("HYG", "HYG"), ("IEF", "IEF")]:
+    for name, sym in [("VVIX","^VVIX"), ("SKEW","^SKEW"), ("HYG","HYG"), ("IEF","IEF")]:
         try:
-            h = yf.download(sym, period="2y", progress=False)
+            h = yf.download(sym, period="2y", progress=False, auto_adjust=True)
             if isinstance(h.columns, pd.MultiIndex):
                 h.columns = h.columns.get_level_values(0)
             if not h.empty:
+                # Normalize index: remove timezone so join with parquet works
+                if hasattr(h.index, "tz") and h.index.tz is not None:
+                    h.index = h.index.tz_localize(None)
+                h.index = pd.DatetimeIndex(h.index).normalize()
                 out[name] = h
-        except:
+        except Exception as ex:
+            logging.getLogger("vix_controller").warning(f"fetch_edge_extra {sym}: {ex}")
             continue
     return out
 
@@ -495,6 +502,304 @@ def compute_bs_iv_for_chains(chains: dict, spot: float, r: float, q: float) -> d
         if len(data["calls"]) >= 3 and len(data["puts"]) >= 3:
             result[exp_str] = data
     return result
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# GEX — GAMMA EXPOSURE ENGINE
+# GEX = OI × Gamma_BS × SpotPrice² × ContractMultiplier × ΔSpot(1%)
+# Convención: Dealers son contraparte de retail → short calls, long puts
+#   → dealer_gamma_calls = -OI × Gamma × S² × 100 × 0.01
+#   → dealer_gamma_puts  = +OI × Gamma × S² × 100 × 0.01
+# Net Dealer GEX = sum de puts - sum de calls
+# Niveles positivos = dealer compra cuando S baja (soporte)
+# Niveles negativos = dealer vende cuando S baja (acelera caída)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _bs_gamma(S: float, X: float, r: float, T: float, v: float, q: float) -> float:
+    """Gamma Black-Scholes: ∂²C/∂S² = ∂²P/∂S² (igual para call y put)."""
+    if S <= 0 or X <= 0 or T <= 0 or v <= 0:
+        return 0.0
+    d1 = (np.log(S / X) + (r - q + 0.5 * v**2) * T) / (v * np.sqrt(T))
+    return float(np.exp(-q * T) * norm.pdf(d1) / (S * v * np.sqrt(T)))
+
+
+def compute_gex_profile(chains: dict, spot: float,
+                        r: float = 0.043, q: float = 0.013,
+                        contract_mult: int = 100) -> pd.DataFrame:
+    """
+    Calcula el GEX neto de dealers por strike, sumando todos los vencimientos.
+    Usa la IV calculada por BS (columna 'iv') si está disponible,
+    sino reintenta con la IV de yfinance como fallback.
+
+    Retorna DataFrame con:
+      strike, calls_gex, puts_gex, net_gex (todo en USD millones)
+    """
+    rows = []
+    for exp_str, data in chains.items():
+        dte = data["dte"]
+        T   = dte / 365.0
+        if T <= 0:
+            continue
+
+        for side, sign in [("calls", -1), ("puts", +1)]:
+            df = data[side].copy()
+            if df.empty:
+                continue
+            # Usar IV BS si disponible, si no yfinance impliedVolatility
+            if "iv" in df.columns and df["iv"].notna().any():
+                iv_col = "iv"
+            elif "impliedVolatility" in df.columns:
+                iv_col = "impliedVolatility"
+            else:
+                continue
+
+            df = df[df[iv_col].notna() & (df[iv_col] > 0.005)]
+            if df.empty:
+                continue
+
+            df["gamma"] = df.apply(
+                lambda row: _bs_gamma(spot, row["strike"], r, T,
+                                      row[iv_col], q),
+                axis=1
+            )
+            # GEX en dólares: OI × Gamma × S² × multiplier × 1% move
+            df["gex_usd"] = (
+                sign
+                * df["openInterest"]
+                * df["gamma"]
+                * (spot ** 2)
+                * contract_mult
+                * 0.01   # 1% move
+            )
+            for _, row in df.iterrows():
+                rows.append({
+                    "strike":   row["strike"],
+                    "side":     side,
+                    "dte":      dte,
+                    "gex_usd":  row["gex_usd"],
+                    "oi":       row["openInterest"],
+                })
+
+    if not rows:
+        return pd.DataFrame()
+
+    df_all = pd.DataFrame(rows)
+    # Agrupar por strike
+    gex_by_strike = (
+        df_all.groupby(["strike", "side"])["gex_usd"]
+        .sum()
+        .unstack(fill_value=0)
+        .reset_index()
+    )
+    # Garantizar columnas
+    for col in ["calls", "puts"]:
+        if col not in gex_by_strike.columns:
+            gex_by_strike[col] = 0.0
+
+    gex_by_strike["calls_gex"] = gex_by_strike["calls"] / 1e6   # → millones USD
+    gex_by_strike["puts_gex"]  = gex_by_strike["puts"]  / 1e6
+    gex_by_strike["net_gex"]   = gex_by_strike["puts_gex"] + gex_by_strike["calls_gex"]
+
+    return gex_by_strike.sort_values("strike").reset_index(drop=True)
+
+
+def compute_gex_summary(gex_df: pd.DataFrame, spot: float) -> dict:
+    """
+    Métricas clave del GEX profile:
+    - gamma_flip: strike donde GEX neto cambia de positivo a negativo
+    - total_gex:  GEX neto total (positivo = mercado anclado, negativo = amplificador)
+    - biggest_call_wall: strike con mayor GEX de calls (resistencia)
+    - biggest_put_wall:  strike con mayor GEX de puts (soporte)
+    - gex_percentile:    % de OTM strikes con GEX positivo
+    """
+    if gex_df.empty or spot <= 0:
+        return {}
+
+    total_gex = float(gex_df["net_gex"].sum())
+
+    # Gamma flip: strike donde la suma acumulada cambia de signo
+    df_sorted = gex_df.sort_values("strike")
+    cumsum    = df_sorted["net_gex"].cumsum().values
+    flip_idx  = np.where(np.diff(np.sign(cumsum)))[0]
+    if len(flip_idx) > 0:
+        flip_strike = float(df_sorted["strike"].iloc[flip_idx[0]])
+    else:
+        flip_strike = None
+
+    # Paredes
+    call_wall = float(gex_df.loc[gex_df["calls_gex"].abs().idxmax(), "strike"]) \
+                if not gex_df.empty else None
+    put_wall  = float(gex_df.loc[gex_df["puts_gex"].abs().idxmax(), "strike"]) \
+                if not gex_df.empty else None
+
+    # Zona OTM: strikes en ±15% del spot
+    otm_zone = gex_df[gex_df["strike"].between(spot * 0.85, spot * 1.15)]
+    pct_pos  = (otm_zone["net_gex"] > 0).mean() * 100 if not otm_zone.empty else None
+
+    return {
+        "total_gex":    round(total_gex, 2),
+        "flip_strike":  round(flip_strike, 2) if flip_strike else None,
+        "call_wall":    round(call_wall, 2)   if call_wall   else None,
+        "put_wall":     round(put_wall, 2)    if put_wall    else None,
+        "pct_pos_otm":  round(pct_pos, 1)     if pct_pos is not None else None,
+        "regime":       "POSITIVE" if total_gex > 0 else "NEGATIVE",
+    }
+
+
+def build_gex_profile_chart(gex_df: pd.DataFrame, spot: float,
+                             summary: dict, ticker: str = "SPY",
+                             strike_range_pct: float = 0.12) -> go.Figure:
+    """
+    Gráfico de barras GEX por strike:
+    - Barras verdes: GEX positivo (zona pin, dealers compran dips)
+    - Barras rojas:  GEX negativo (zona acelerador, dealers venden dips)
+    - Línea spot, gamma flip, call wall, put wall
+    """
+    fig = go.Figure()
+    if gex_df.empty or spot <= 0:
+        return fig
+
+    lo = spot * (1 - strike_range_pct)
+    hi = spot * (1 + strike_range_pct)
+    df = gex_df[gex_df["strike"].between(lo, hi)].copy()
+    if df.empty:
+        return fig
+
+    colors = ["#3FB950" if v >= 0 else "#F85149" for v in df["net_gex"]]
+
+    fig.add_trace(go.Bar(
+        x=df["strike"], y=df["net_gex"],
+        name="Net GEX (dealers)",
+        marker_color=colors,
+        opacity=0.8,
+        hovertemplate="Strike: $%{x:.0f}<br>Net GEX: $%{y:.2f}M<extra></extra>",
+    ))
+
+    # Spot
+    fig.add_vline(x=spot, line_dash="solid", line_color="#F0F6FC", line_width=2,
+                  annotation_text=f"  Spot ${spot:.1f}",
+                  annotation_font=dict(size=10, color="#F0F6FC", family="JetBrains Mono"))
+
+    # Gamma flip
+    gf = summary.get("flip_strike")
+    if gf:
+        fig.add_vline(x=gf, line_dash="dash", line_color="#D29922", line_width=1.5,
+                      annotation_text=f"  Flip ${gf:.0f}",
+                      annotation_font=dict(size=9, color="#D29922", family="JetBrains Mono"),
+                      annotation_position="top right")
+
+    # Call wall
+    cw = summary.get("call_wall")
+    if cw and lo <= cw <= hi:
+        fig.add_vline(x=cw, line_dash="dot", line_color="#BC8CFF", line_width=1.5,
+                      annotation_text=f"  Call Wall ${cw:.0f}",
+                      annotation_font=dict(size=9, color="#BC8CFF", family="JetBrains Mono"),
+                      annotation_position="bottom right")
+
+    # Put wall
+    pw = summary.get("put_wall")
+    if pw and lo <= pw <= hi:
+        fig.add_vline(x=pw, line_dash="dot", line_color="#39D2C0", line_width=1.5,
+                      annotation_text=f"  Put Wall ${pw:.0f}",
+                      annotation_font=dict(size=9, color="#39D2C0", family="JetBrains Mono"),
+                      annotation_position="bottom left")
+
+    regime    = summary.get("regime", "?")
+    total_gex = summary.get("total_gex", 0)
+    regime_clr = "#3FB950" if regime == "POSITIVE" else "#F85149"
+
+    fig.update_layout(
+        title=dict(
+            text=(
+                f"<b>GEX Profile — {ticker}</b>"
+                f"<sup>  Net GEX: <span style='color:{regime_clr}'>${total_gex:+.1f}M · {regime}</span>"
+                f"  |  Gamma Flip: ${gf:.0f}" if gf else
+                f"<b>GEX Profile — {ticker}</b>"
+                f"<sup>  Net GEX: ${total_gex:+.1f}M · {regime}</sup>"
+            ),
+            font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5,
+        ),
+        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+        height=420, margin=dict(l=55, r=30, t=65, b=50),
+        xaxis=dict(
+            title=dict(text="Strike Price ($)", font=dict(size=10, color="#8B949E")),
+            gridcolor="#21262D",
+            tickfont=dict(size=10, color="#8B949E", family="JetBrains Mono"),
+            tickprefix="$",
+        ),
+        yaxis=dict(
+            title=dict(text="Net GEX ($M / 1% move)", font=dict(size=10, color="#8B949E")),
+            gridcolor="#21262D",
+            tickfont=dict(size=10, color="#8B949E", family="JetBrains Mono"),
+            ticksuffix="M",
+            zeroline=True, zerolinecolor="#484F58", zerolinewidth=2,
+        ),
+        showlegend=False,
+        hovermode="x unified",
+        bargap=0.1,
+    )
+    return fig
+
+
+def build_gex_by_expiry_chart(chains: dict, spot: float,
+                               r: float = 0.043, q: float = 0.013) -> go.Figure:
+    """
+    GEX total por vencimiento — muestra qué expiración concentra más gamma.
+    """
+    fig = go.Figure()
+    if not chains or not spot:
+        return fig
+
+    rows = []
+    for exp_str, data in sorted(chains.items(), key=lambda x: x[1]["dte"]):
+        dte = data["dte"]; T = dte / 365.0
+        if T <= 0:
+            continue
+        net = 0.0
+        for side, sign in [("calls", -1), ("puts", +1)]:
+            df = data[side].copy()
+            if df.empty:
+                continue
+            iv_col = "iv" if "iv" in df.columns and df["iv"].notna().any() \
+                     else "impliedVolatility"
+            if iv_col not in df.columns:
+                continue
+            df = df[df[iv_col].notna() & (df[iv_col] > 0.005)]
+            for _, row in df.iterrows():
+                g = _bs_gamma(spot, row["strike"], r, T, row[iv_col], q)
+                net += sign * row["openInterest"] * g * spot**2 * 100 * 0.01
+        rows.append({"exp": exp_str, "dte": dte,
+                     "net_gex_m": net / 1e6})
+
+    if not rows:
+        return fig
+
+    df_e = pd.DataFrame(rows)
+    colors = ["#3FB950" if v >= 0 else "#F85149" for v in df_e["net_gex_m"]]
+
+    fig.add_trace(go.Bar(
+        x=df_e["exp"], y=df_e["net_gex_m"],
+        marker_color=colors, opacity=0.8,
+        hovertemplate="%{x}<br>GEX: $%{y:.2f}M<extra></extra>",
+    ))
+    fig.add_hline(y=0, line_dash="solid", line_color="#484F58", line_width=1.5)
+    fig.update_layout(
+        title=dict(
+            text="<b>GEX por Vencimiento</b><sup>  Qué expiración concentra más gamma</sup>",
+            font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5,
+        ),
+        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+        height=280, margin=dict(l=55, r=30, t=60, b=50),
+        xaxis=dict(tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono"),
+                   title=dict(text="Vencimiento", font=dict(size=10, color="#8B949E"))),
+        yaxis=dict(title=dict(text="Net GEX ($M)", font=dict(size=10, color="#8B949E")),
+                   gridcolor="#21262D",
+                   tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono"),
+                   ticksuffix="M", zeroline=True, zerolinecolor="#484F58"),
+        showlegend=False, bargap=0.2,
+    )
+    return fig
+
 
 # ─── Métricas de skew (usa columna 'iv' BS) ────────────────────────────────
 def compute_skew_metrics(chains: dict, spot: float) -> dict:
@@ -705,7 +1010,11 @@ def build_iv_surface(chains: dict, spot: float,
 
     fig.add_trace(go.Surface(
         x=xi, y=yi, z=zi,
-        colorscale="Viridis",
+        colorscale=[
+            [0.0,"#1a237e"],[0.15,"#1565C0"],[0.30,"#0288D1"],
+            [0.45,"#00ACC1"],[0.55,"#3FB950"],[0.65,"#D29922"],
+            [0.80,"#F0883E"],[1.0,"#F85149"],
+        ],
         colorbar=dict(title=dict(text="IV %", font=dict(color="#8B949E",size=10)),
                       tickfont=dict(color="#8B949E",size=9), len=0.6, thickness=12),
         hovertemplate="DTE: %{x:.0f}d<br>Y: %{y:.2f}<br>IV: %{z:.1f}%<extra></extra>",
@@ -738,19 +1047,15 @@ def build_iv_heatmap(chains: dict, spot: float,
     mon_grid = np.linspace(lo, hi, n_bins)
     dte_vals, iv_rows = [], []
 
-    for exp_str, data in sorted(chains.items(), key=lambda x: int(x[1]["dte"])):
-        dte = int(data["dte"])
+    for exp_str, data in sorted(chains.items(), key=lambda x: x[1]["dte"]):
+        dte = data["dte"]
         pts = pd.concat([
             data["puts"][data["puts"]["moneyness"].between(lo, 1.02)],
             data["calls"][data["calls"]["moneyness"].between(0.98, hi)],
         ]).drop_duplicates("moneyness").sort_values("moneyness")
         if len(pts) < 3 or "iv" not in pts.columns: continue
-        iv_vals = pd.to_numeric(pts["iv"], errors="coerce").values * 100
-        mon_vals = pd.to_numeric(pts["moneyness"], errors="coerce").values
-        mask = np.isfinite(iv_vals) & np.isfinite(mon_vals)
-        if mask.sum() < 3: continue
-        iv_interp = np.interp(mon_grid, mon_vals[mask], iv_vals[mask],
-                              left=np.nan, right=np.nan)
+        iv_interp = np.interp(mon_grid, pts["moneyness"].values,
+                              pts["iv"].values * 100, left=np.nan, right=np.nan)
         dte_vals.append(dte); iv_rows.append(iv_interp)
 
     if not iv_rows: return fig
@@ -787,73 +1092,96 @@ def build_iv_heatmap(chains: dict, spot: float,
     return fig
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# COT — Commitments of Traders via CFTC Socrata API (sin cot_reports)
-# Fuente: publicreporting.cftc.gov — Disaggregated Futures report
-# VIX Futures: CFTC_Market_Code = "1170E1"
+# COT — Commitments of Traders via cot_reports library
+# Fuente: CFTC "Traders in Financial Futures" report
+# VIX Futures: buscamos "VIX" en Market and Exchange Names
+# Leveraged Funds ≈ Managed Money (hedge funds / CTAs)
+# Asset Manager ≈ Institucionales pasivos
+# Publicación: cada martes ~15:30 ET con datos del martes anterior
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @st.cache_data(ttl=3600 * 6)
 def fetch_cot_vix(n_weeks: int = 104) -> pd.DataFrame:
     """
-    Descarga COT directo de la API Socrata del CFTC.
-    Dataset: Disaggregated Futures — 72hh-3qpy
-    Filtro: cftc_market_code = '1170E1' (VIX)
+    Descarga el COT de Traders in Financial Futures para VIX via cot_reports.
+    Columnas clave:
+      - mm_long / mm_short   : Leveraged Funds (hedge funds/CTAs)
+      - asset_long / short   : Asset Managers (institucionales)
+      - dealer_long / short  : Dealer Intermediaries
+      - net_mm               : Leveraged Funds net
+      - net_mm_pct           : % del Open Interest
     """
     log = logging.getLogger("vix_controller")
-    import urllib.request, json
-
-    # Socrata API — Disaggregated Futures
-    api_id = "72hh-3qpy"
-    limit = min(n_weeks + 20, 2000)
-    url = (f"https://publicreporting.cftc.gov/resource/{api_id}.json"
-           f"?$where=cftc_market_code='1170E1'"
-           f"&$order=report_date_as_yyyy_mm_dd DESC"
-           f"&$limit={limit}")
+    try:
+        import cot_reports
+    except ImportError:
+        log.error("cot_reports no instalado. Agrega 'cot_reports' a requirements.txt")
+        return pd.DataFrame()
 
     try:
-        req = urllib.request.Request(url, headers={"Accept": "application/json",
-                                                    "User-Agent": "VIXController/1.0"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode())
+        current_year = datetime.now().year
+        years_needed = max(1, (n_weeks // 52) + 2)
+        frames = []
+        for yr in range(current_year - years_needed + 1, current_year + 1):
+            try:
+                df_yr = cot_reports.cot_year(
+                    year=yr,
+                    cot_report_type="traders_in_financial_futures_fut"
+                )
+                frames.append(df_yr)
+                log.info(f"COT: año {yr} OK ({len(df_yr)} filas)")
+            except Exception as e:
+                log.warning(f"COT año {yr}: {e}")
+                continue
 
-        if not data:
-            log.error("COT API: respuesta vacía")
+        if not frames:
+            log.error("COT: no se pudo descargar ningún año")
             return pd.DataFrame()
 
-        df = pd.DataFrame(data)
-        log.info(f"COT API: {len(df)} filas descargadas")
+        df = pd.concat(frames, ignore_index=True)
+
+        # Filtrar VIX futures
+        mask = df["Market and Exchange Names"].str.contains("VIX", case=False, na=False)
+        df   = df[mask].copy()
+        if df.empty:
+            log.error("COT: no se encontraron filas de VIX futures")
+            return pd.DataFrame()
 
         # Parsear fecha
-        if "report_date_as_yyyy_mm_dd" in df.columns:
-            df["date"] = pd.to_datetime(df["report_date_as_yyyy_mm_dd"], errors="coerce")
-        elif "as_of_date_in_form_yymmdd" in df.columns:
-            df["date"] = pd.to_datetime(df["as_of_date_in_form_yymmdd"], errors="coerce")
+        date_col = "As of Date in Form YYYY-MM-DD"
+        if date_col in df.columns:
+            df["date"] = pd.to_datetime(df[date_col], errors="coerce")
+        else:
+            # Alternativa: buscar columna con fecha
+            date_cols = [c for c in df.columns if "date" in c.lower() or "yyyy" in c.lower()]
+            df["date"] = pd.to_datetime(df[date_cols[0]], errors="coerce") if date_cols else pd.NaT
 
-        # Mapear columnas Socrata → nuestro esquema
-        socrata_map = {
-            "open_interest_all":                       "oi",
-            "lev_money_positions_long_all":             "mm_long",
-            "lev_money_positions_short_all":            "mm_short",
-            "lev_money_positions_spread_all":           "mm_spread",
-            "asset_mgr_positions_long_all":             "asset_long",
-            "asset_mgr_positions_short_all":            "asset_short",
-            "dealer_positions_long_all":                "dealer_long",
-            "dealer_positions_short_all":               "dealer_short",
-            "other_rept_positions_long_all":            "other_long",
-            "other_rept_positions_short_all":           "other_short",
+        df = df.sort_values("date").reset_index(drop=True)
+
+        # Renombrar columnas (TFF report)
+        col_map = {
+            "Open Interest (All)":                        "oi",
+            "Leveraged Funds-Long (All)":                 "mm_long",
+            "Leveraged Funds-Short (All)":                "mm_short",
+            "Leveraged Funds-Spreading (All)":            "mm_spread",
+            "Asset Manager/Institutional-Long (All)":     "asset_long",
+            "Asset Manager/Institutional-Short (All)":    "asset_short",
+            "Dealer Intermediary-Long (All)":             "dealer_long",
+            "Dealer Intermediary-Short (All)":            "dealer_short",
+            "Other Reportables-Long (All)":               "other_long",
+            "Other Reportables-Short (All)":              "other_short",
         }
-        df = df.rename(columns={k: v for k, v in socrata_map.items() if k in df.columns})
+        df = df.rename(columns={k:v for k,v in col_map.items() if k in df.columns})
 
         # Convertir a numérico
-        num_cols = ["oi", "mm_long", "mm_short", "mm_spread", "asset_long",
-                    "asset_short", "dealer_long", "dealer_short", "other_long", "other_short"]
-        for c in num_cols:
+        for c in ["oi","mm_long","mm_short","mm_spread","asset_long","asset_short",
+                  "dealer_long","dealer_short","other_long","other_short"]:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
 
         # Métricas derivadas
         if "mm_long" in df.columns and "mm_short" in df.columns:
-            df["net_mm"] = df["mm_long"] - df["mm_short"]
+            df["net_mm"]     = df["mm_long"] - df["mm_short"]
             df["net_mm_pct"] = (df["net_mm"] / df["oi"] * 100).where(df["oi"] > 0)
             df["net_mm_pct_pctile"] = df["net_mm_pct"].rank(pct=True) * 100
 
@@ -863,9 +1191,8 @@ def fetch_cot_vix(n_weeks: int = 104) -> pd.DataFrame:
         if "asset_long" in df.columns and "asset_short" in df.columns:
             df["net_commercial"] = df["asset_long"] - df["asset_short"]
 
-        df = df.sort_values("date").reset_index(drop=True)
         last_ok = df["date"].dropna().iloc[-1].strftime("%Y-%m-%d") if not df["date"].dropna().empty else "?"
-        log.info(f"COT VIX: {len(df)} semanas · última: {last_ok}")
+        log.info(f"COT VIX (TFF): {len(df)} semanas · última: {last_ok}")
         return df.tail(n_weeks).reset_index(drop=True)
 
     except Exception as e:
@@ -885,95 +1212,98 @@ COT_DISAGG_ID  = "72hh-3qpy"                     # Disaggregated Futures & Optio
 COT_LEGACY_ID  = "6dca-aqww"                     # Legacy (si disagg falla)
 
 
-def build_cot_positioning_chart(cot_df, window=104):
-    """Net Managed Money positioning + percentile bands."""
-    p = cot_df.tail(window).copy()
-    if 'net_mm' not in p.columns or 'date' not in p.columns:
-        return go.Figure()
-    p = p.dropna(subset=['net_mm', 'date'])
-    if len(p) < 5:
-        return go.Figure()
-    colors = ['#3FB950' if v >= 0 else '#F85149' for v in p['net_mm']]
-    fig = go.Figure()
-    fig.add_trace(go.Bar(x=p['date'], y=p['net_mm'], marker_color=colors,
-        name='Net MM', opacity=0.7))
-    if 'net_mm_pct' in p.columns:
-        fig.add_trace(go.Scatter(x=p['date'], y=p['net_mm'].rolling(8).mean(),
-            name='SMA(8w)', line=dict(color='#39D2C0', width=2)))
-    fig.add_hline(y=0, line_dash='dash', line_color='#8B949E', line_width=1)
-    fig.update_layout(
-        title=dict(text='<b>Managed Money Net Positioning</b><sup>  VIX Futures · CFTC COT</sup>',
-                   font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
-        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
-        height=350, margin=dict(l=50, r=30, t=55, b=40),
-        xaxis=dict(gridcolor='#21262D', tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
-        yaxis=dict(title='Contratos (net)', gridcolor='#21262D',
-                   tickfont=dict(size=9, color='#8B949E')),
-        legend=dict(orientation='h', y=1.02, bgcolor='rgba(0,0,0,0)',
-                    font=dict(size=9, color='#8B949E', family='JetBrains Mono')),
-        hovermode='x unified')
-    return fig
+@st.cache_data(ttl=3600 * 6)  # 6h — datos semanales, no cambian intraday
+def _compute_har_rv(spy_close: pd.Series, vix_close: pd.Series,
+                    window: int = 252, h: int = 22) -> pd.DataFrame:
+    """
+    HAR-RV (Heterogeneous Autoregressive Realized Volatility) model.
+    Ref: Corsi (2009) — A Simple Approximate Long-Memory Model of Realized Volatility.
+
+    El VIX es una medida de volatilidad IMPLÍCITA futura (30 días calendario).
+    El RV20 trailing es volatilidad PASADA — compararlo directamente con VIX es incorrecto
+    porque mezcla horizontes temporales distintos.
+
+    Solución HAR-RV:
+      E[RV_{t,t+h}] = β₀ + β₁·RV_d + β₂·RV_w + β₃·RV_m + ε
+    donde:
+      RV_d = volatilidad diaria (|r_t| × √252 × 100)
+      RV_w = media de RV_d en los últimos 5 días (horizonte semanal)
+      RV_m = media de RV_d en los últimos 22 días (horizonte mensual)
+      h    = 22 días hábiles ≈ 30 días calendario (mismo horizonte que VIX)
+
+    VRP_HAR = VIX_t - E[RV_{t,t+h}]  (prima de riesgo de volatilidad verdadera)
+    """
+    log_ret = np.log(spy_close / spy_close.shift(1))
+
+    # Componentes HAR: vol diaria, semanal, mensual (annualizada, en %)
+    rv_d = log_ret.abs() * np.sqrt(252) * 100
+    rv_w = rv_d.rolling(5,  min_periods=3).mean()
+    rv_m = rv_d.rolling(22, min_periods=10).mean()
+
+    # Variable objetivo: RV promedio h días hacia adelante (lo que VIX predice)
+    rv_fwd = log_ret.rolling(h, min_periods=int(h*0.8)).std().shift(-h) * np.sqrt(252) * 100
+
+    n = len(spy_close)
+    rv_d_a = rv_d.values
+    rv_w_a = rv_w.values
+    rv_m_a = rv_m.values
+    rv_f_a = rv_fwd.values
+
+    forecasts = np.full(n, np.nan)
+    betas_log  = []           # Para diagnóstico / expander
+
+    for i in range(window + 22, n - h):
+        t0 = i - window
+        X = np.column_stack([
+            np.ones(window),
+            rv_d_a[t0:i],
+            rv_w_a[t0:i],
+            rv_m_a[t0:i],
+        ])
+        y = rv_f_a[t0:i]
+        valid = np.isfinite(X).all(axis=1) & np.isfinite(y)
+        if valid.sum() < 60:
+            continue
+        beta, _, _, _ = np.linalg.lstsq(X[valid], y[valid], rcond=None)
+        x_i = np.array([1.0, rv_d_a[i], rv_w_a[i], rv_m_a[i]])
+        if np.isfinite(x_i).all():
+            fc = float(np.dot(beta, x_i))
+            forecasts[i] = max(fc, 1.0)   # vol no puede ser negativa
+            betas_log.append(beta)
+
+    idx = spy_close.index
+    result = pd.DataFrame(index=idx)
+    result['rv_d']        = rv_d.values
+    result['rv_w']        = rv_w.values
+    result['rv_m']        = rv_m.values
+    result['rv_fwd']      = rv_fwd.values      # Realized vol futura (solo conocible ex-post)
+    result['har_forecast']= forecasts           # E[RV_futura] del modelo HAR
+    result['vix']         = vix_close.values
+    result['vrp_har']     = vix_close.values - forecasts
+    result['vrp_rv20']    = vix_close.values - rv_m.values   # definición tradicional (referencia)
+
+    # Últimos coeficientes para el expander de diagnóstico
+    if betas_log:
+        last_beta = betas_log[-1]
+        result.attrs['har_beta'] = {
+            'β0 (intercepto)': round(float(last_beta[0]), 3),
+            'β1 (RV diaria)':  round(float(last_beta[1]), 3),
+            'β2 (RV semanal)': round(float(last_beta[2]), 3),
+            'β3 (RV mensual)': round(float(last_beta[3]), 3),
+        }
+    return result
 
 
-def build_cot_oi_chart(cot_df, window=104):
-    """Open Interest total."""
-    p = cot_df.tail(window).copy()
-    if 'oi' not in p.columns or 'date' not in p.columns:
-        return go.Figure()
-    p = p.dropna(subset=['oi', 'date'])
-    if len(p) < 5:
-        return go.Figure()
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=p['date'], y=p['oi'], name='Open Interest',
-        line=dict(color='#58A6FF', width=2), fill='tozeroy',
-        fillcolor='rgba(88,166,255,0.1)'))
-    fig.update_layout(
-        title=dict(text='<b>Open Interest</b><sup>  VIX Futures</sup>',
-                   font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
-        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
-        height=280, margin=dict(l=50, r=30, t=55, b=40),
-        xaxis=dict(gridcolor='#21262D', tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
-        yaxis=dict(title='Contratos', gridcolor='#21262D',
-                   tickfont=dict(size=9, color='#8B949E')),
-        hovermode='x unified', showlegend=False)
-    return fig
-
-
-def build_cot_breakdown_chart(cot_df, window=104):
-    """Breakdown: MM, Dealers, Asset Managers."""
-    p = cot_df.tail(window).copy()
-    if 'date' not in p.columns:
-        return go.Figure()
-    p = p.dropna(subset=['date'])
-    fig = go.Figure()
-    traces = [
-        ('net_mm', 'Managed Money', '#3FB950'),
-        ('net_dealer', 'Dealers', '#F0883E'),
-        ('net_commercial', 'Asset Managers', '#58A6FF'),
-    ]
-    for col, name, color in traces:
-        if col in p.columns:
-            fig.add_trace(go.Scatter(x=p['date'], y=p[col], name=name,
-                line=dict(color=color, width=2)))
-    fig.add_hline(y=0, line_dash='dash', line_color='#8B949E', line_width=1)
-    fig.update_layout(
-        title=dict(text='<b>Net Positioning by Category</b>',
-                   font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
-        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
-        height=280, margin=dict(l=50, r=30, t=55, b=40),
-        xaxis=dict(gridcolor='#21262D', tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
-        yaxis=dict(title='Contratos (net)', gridcolor='#21262D',
-                   tickfont=dict(size=9, color='#8B949E')),
-        legend=dict(orientation='h', y=1.02, bgcolor='rgba(0,0,0,0)',
-                    font=dict(size=9, color='#8B949E', family='JetBrains Mono')),
-        hovermode='x unified')
-    return fig
-
-
-# Sin cache — recibe DataFrame (unhashable)
 def compute_edge_analytics(df, edge_extra):
+    log = logging.getLogger("vix_controller")
     out = {}
+
+    # Normalizar índice del parquet a UTC-naive para joins seguros
     bt = df[df['VIX_Close'].notna() & df['SPY_Close'].notna()].copy()
+    if bt.index.tz is not None:
+        bt.index = bt.index.tz_localize(None)
+    bt.index = pd.DatetimeIndex(bt.index).normalize()
+
     if len(bt) < 60:
         return out
 
@@ -982,9 +1312,24 @@ def compute_edge_analytics(df, edge_extra):
     bt['RV10'] = log_ret.rolling(10).std() * np.sqrt(252) * 100
     bt['RV20'] = log_ret.rolling(20).std() * np.sqrt(252) * 100
     bt['RV60'] = log_ret.rolling(60).std() * np.sqrt(252) * 100
-    bt['VRP']  = bt['VIX_Close'] - bt['RV20']
+    bt['VRP']  = bt['VIX_Close'] - bt['RV20']   # definición tradicional (mantenida para compatibilidad)
 
-    vrp_2y = bt['VRP'].tail(504).dropna()
+    # ── HAR-RV: VRP correctamente definido ──────────────────────────
+    try:
+        har_df = _compute_har_rv(bt['SPY_Close'], bt['VIX_Close'])
+        bt['HAR_Forecast'] = har_df['har_forecast'].values
+        bt['VRP_HAR']      = har_df['vrp_har'].values
+        bt['RV_Fwd_22']    = har_df['rv_fwd'].values
+        out['har_beta']    = har_df.attrs.get('har_beta', {})
+        log.info("HAR-RV model computed OK")
+    except Exception as e:
+        log.warning(f"HAR-RV error: {e}")
+        bt['HAR_Forecast'] = np.nan
+        bt['VRP_HAR']      = bt['VRP']   # fallback a definición tradicional
+
+    # VRP percentile (usa VRP_HAR si disponible)
+    vrp_col = 'VRP_HAR' if 'VRP_HAR' in bt.columns else 'VRP'
+    vrp_2y = bt[vrp_col].tail(504).dropna()
     if len(vrp_2y) > 20:
         out['vrp_percentile'] = round((vrp_2y < vrp_2y.iloc[-1]).mean() * 100, 0)
 
@@ -993,20 +1338,35 @@ def compute_edge_analytics(df, edge_extra):
         valid = (m1 > 0) & (dte > 0) & m1.notna() & dte.notna() & spot.notna()
         bt['Roll_Yield'] = np.where(valid, (m1 - spot) / m1 * (365 / dte) * 100, np.nan)
 
-    if 'VVIX_Close' in bt.columns:
+    # ── VVIX live desde yfinance ────────────────────────────────────
+    if 'VVIX' in edge_extra and not edge_extra['VVIX'].empty:
+        vvix_s = edge_extra['VVIX'][['Close']].rename(columns={'Close': 'VVIX_Live'})
+        bt = bt.join(vvix_s, how='left')
+        if 'VVIX_Live' in bt.columns:
+            bt['VVIX_VIX'] = np.where(
+                (bt['VIX_Close'] > 0) & bt['VVIX_Live'].notna(),
+                bt['VVIX_Live'] / bt['VIX_Close'], np.nan
+            )
+    elif 'VVIX_Close' in bt.columns:
+        # fallback: parquet
         bt['VVIX_VIX'] = np.where(bt['VIX_Close'] > 0, bt['VVIX_Close'] / bt['VIX_Close'], np.nan)
 
+    # ── SKEW live ───────────────────────────────────────────────────
     if 'SKEW' in edge_extra and not edge_extra['SKEW'].empty:
-        skew_df = edge_extra['SKEW'][['Close']].rename(columns={'Close': 'SKEW'})
-        bt = bt.join(skew_df, how='left')
+        skew_s = edge_extra['SKEW'][['Close']].rename(columns={'Close': 'SKEW'})
+        bt = bt.join(skew_s, how='left')
+        log.info(f"SKEW joined: {bt['SKEW'].notna().sum()} valid rows" if 'SKEW' in bt.columns else "SKEW join failed")
 
+    # ── Credit Spread live (HYG vs IEF) ─────────────────────────────
     if 'HYG' in edge_extra and 'IEF' in edge_extra:
         hyg = edge_extra['HYG'][['Close']].rename(columns={'Close': 'HYG'})
         ief = edge_extra['IEF'][['Close']].rename(columns={'Close': 'IEF'})
         bt = bt.join(hyg, how='left').join(ief, how='left')
         if 'HYG' in bt.columns and 'IEF' in bt.columns:
-            bt['Credit_Spread'] = -(bt['HYG'].pct_change().rolling(20).sum() -
-                                    bt['IEF'].pct_change().rolling(20).sum()) * 100
+            bt['Credit_Spread'] = -(
+                bt['HYG'].pct_change().rolling(20).sum() -
+                bt['IEF'].pct_change().rolling(20).sum()
+            ) * 100
 
     # Calendario de eventos 2026
     today = pd.Timestamp(now_cdmx().date())
@@ -1034,26 +1394,94 @@ def compute_edge_analytics(df, edge_extra):
 
 
 def build_vrp_chart(bt, window=252):
-    p = bt.tail(window).dropna(subset=['VRP'])
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=p.index, y=p['VIX_Close'], name='VIX (Implied)',
-        line=dict(color='#F85149', width=2)))
-    fig.add_trace(go.Scatter(x=p.index, y=p['RV20'], name='RV20 (Realized)',
-        line=dict(color='#58A6FF', width=2)))
-    fig.add_trace(go.Scatter(x=p.index, y=p['VRP'], name='VRP (IV - RV)',
-        fill='tozeroy', line=dict(color='#3FB950', width=1),
-        fillcolor='rgba(63,185,80,0.15)'))
-    fig.add_hline(y=0, line_dash='dash', line_color='#8B949E', line_width=1)
+    """
+    VRP con modelo HAR-RV.
+    Muestra VIX vs HAR_Forecast (E[vol futura]) y VRP_HAR como area.
+    También muestra la vol realizada ex-post (RV_Fwd_22) para referencia visual.
+    """
+    from plotly.subplots import make_subplots
+
+    use_har = 'HAR_Forecast' in bt.columns and bt['HAR_Forecast'].notna().sum() > 20
+
+    if use_har:
+        col_vrp = 'VRP_HAR'
+        p = bt.tail(window).copy()
+        p = p[p['VIX_Close'].notna()]
+    else:
+        col_vrp = 'VRP'
+        p = bt.tail(window).dropna(subset=['VRP'])
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        row_heights=[0.65, 0.35], vertical_spacing=0.03)
+
+    # Panel 1: VIX, HAR forecast, RV realizada ex-post
+    fig.add_trace(go.Scatter(
+        x=p.index, y=p['VIX_Close'], name='VIX (IV implícita)',
+        line=dict(color='#F85149', width=2.5),
+        hovertemplate='VIX: %{y:.1f}<extra></extra>'), row=1, col=1)
+
+    if use_har:
+        fig.add_trace(go.Scatter(
+            x=p.index, y=p['HAR_Forecast'], name='HAR-RV Forecast (E[vol])',
+            line=dict(color='#58A6FF', width=2, dash='dash'),
+            hovertemplate='HAR Forecast: %{y:.1f}<extra></extra>'), row=1, col=1)
+        if 'RV_Fwd_22' in p.columns:
+            fig.add_trace(go.Scatter(
+                x=p.index, y=p['RV_Fwd_22'], name='RV Realizada 22d (ex-post)',
+                line=dict(color='#39D2C0', width=1.5, dash='dot'),
+                hovertemplate='RV realizada: %{y:.1f}<extra></extra>'), row=1, col=1)
+    else:
+        fig.add_trace(go.Scatter(
+            x=p.index, y=p['RV20'], name='RV20 (trailing)',
+            line=dict(color='#58A6FF', width=2),
+            hovertemplate='RV20: %{y:.1f}<extra></extra>'), row=1, col=1)
+
+    # Panel 2: VRP como área
+    if col_vrp in p.columns and p[col_vrp].notna().sum() > 5:
+        vrp_vals = p[col_vrp].fillna(0)
+        colors_vrp = ['#3FB950' if v >= 0 else '#F85149' for v in vrp_vals]
+        fig.add_trace(go.Bar(
+            x=p.index, y=vrp_vals,
+            name='VRP = VIX − E[RV]' if use_har else 'VRP = VIX − RV20',
+            marker_color=colors_vrp, opacity=0.7,
+            hovertemplate='VRP: %{y:+.1f} pts<extra></extra>'), row=2, col=1)
+        fig.add_hline(y=0, line_dash='dash', line_color='#484F58',
+                      line_width=1.5, row=2, col=1)
+
+        # Líneas de percentil P25/P75 en VRP
+        vrp_clean = vrp_vals[vrp_vals.notna()]
+        if len(vrp_clean) > 20:
+            p25 = float(vrp_clean.quantile(0.25))
+            p75 = float(vrp_clean.quantile(0.75))
+            fig.add_hline(y=p25, line_dash='dot', line_color='#D29922',
+                          line_width=1, row=2, col=1,
+                          annotation_text=f' P25: {p25:.1f}',
+                          annotation_font=dict(size=8, color='#D29922'))
+            fig.add_hline(y=p75, line_dash='dot', line_color='#3FB950',
+                          line_width=1, row=2, col=1,
+                          annotation_text=f' P75: {p75:.1f}',
+                          annotation_font=dict(size=8, color='#3FB950'))
+
+    subtitle = ('VIX vs HAR-RV Forecast · VRP = prima pagada sobre vol esperada'
+                if use_har else 'VIX - RV20 trailing (definición simplificada)')
     fig.update_layout(
-        title=dict(text='<b>Volatility Risk Premium</b><sup>  VIX - RV20 · Tu edge en puntos</sup>',
-                   font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
+        title=dict(
+            text=f'<b>Volatility Risk Premium</b><sup>  {subtitle}</sup>',
+            font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
         template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
-        height=350, margin=dict(l=50, r=30, t=55, b=40),
-        xaxis=dict(gridcolor='#21262D', tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
-        yaxis=dict(title='Vol Points', gridcolor='#21262D', tickfont=dict(size=9, color='#8B949E')),
-        legend=dict(orientation='h', y=1.02, bgcolor='rgba(0,0,0,0)',
-                    font=dict(size=9, color='#8B949E', family='JetBrains Mono')),
-        hovermode='x unified')
+        height=480, margin=dict(l=55, r=30, t=60, b=40),
+        xaxis2=dict(gridcolor='#21262D',
+                    tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
+        xaxis=dict(gridcolor='#21262D',
+                   tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
+        yaxis=dict(title='Vol %', gridcolor='#21262D',
+                   tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
+        yaxis2=dict(title='VRP (pts)', gridcolor='#21262D',
+                    tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono'),
+                    zeroline=True, zerolinecolor='#30363D'),
+        legend=dict(orientation='h', y=1.03, bgcolor='rgba(0,0,0,0)',
+                    font=dict(size=9, color='#C9D1D9', family='JetBrains Mono')),
+        hovermode='x unified', bargap=0)
     return fig
 
 
@@ -1104,77 +1532,175 @@ def build_roll_yield_chart(bt, window=252):
 
 
 def build_vvix_ratio_chart(bt, window=252):
-    if 'VVIX_VIX' not in bt.columns:
+    """VVIX/VIX ratio — usa VVIX_Live (yfinance) cuando está disponible."""
+    # Detectar fuente: preferir live, caer a parquet
+    vvix_col = None
+    if 'VVIX_Live' in bt.columns and bt['VVIX_Live'].notna().sum() > 10:
+        vvix_col = 'VVIX_Live'
+        src_label = "yfinance live"
+    elif 'VVIX_VIX' in bt.columns and bt['VVIX_VIX'].notna().sum() > 10:
+        vvix_col = 'VVIX_VIX'   # ya es el ratio calculado
+        src_label = "parquet (ratio)"
+    else:
         return go.Figure()
-    p = bt.tail(window).dropna(subset=['VVIX_VIX'])
+
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=p.index, y=p['VVIX_VIX'], name='VVIX/VIX',
-        line=dict(color='#BC8CFF', width=2)))
+    if vvix_col == 'VVIX_VIX':
+        p = bt.tail(window).dropna(subset=['VVIX_VIX'])
+        y_vals = p['VVIX_VIX']
+    else:
+        # Calcular ratio con VVIX_Live directamente
+        sub = bt[['VIX_Close', 'VVIX_Live']].tail(window).dropna()
+        if sub.empty or (sub['VIX_Close'] == 0).all():
+            return go.Figure()
+        y_vals = sub['VVIX_Live'] / sub['VIX_Close'].replace(0, np.nan)
+        p = sub  # índice para x-axis
+        src_label = "^VVIX / ^VIX (yfinance)"
+
+    fig.add_trace(go.Scatter(
+        x=p.index, y=y_vals, name='VVIX/VIX',
+        line=dict(color='#BC8CFF', width=2),
+        fill='tozeroy', fillcolor='rgba(188,140,255,0.07)',
+        hovertemplate='%{x|%Y-%m-%d}<br>VVIX/VIX: %{y:.2f}<extra></extra>'))
+
+    # Bands contextuales
+    fig.add_hrect(y0=6, y1=max(float(y_vals.max(skipna=True)) + 1, 8),
+                  fillcolor='rgba(248,81,73,0.07)', line_width=0)
     fig.add_hline(y=6, line_dash='dash', line_color='#F85149', line_width=1.5,
-        annotation_text='  Danger > 6', annotation_font=dict(color='#F85149', size=10))
+        annotation_text='  ⚠ Danger > 6', annotation_font=dict(color='#F85149', size=10))
     fig.add_hline(y=5, line_dash='dot', line_color='#D29922', line_width=1,
         annotation_text='  Warning > 5', annotation_font=dict(color='#D29922', size=9))
+    fig.add_hline(y=4, line_dash='dot', line_color='#3FB950', line_width=0.8,
+        annotation_text='  Calm < 4', annotation_font=dict(color='#3FB950', size=8))
+
+    # SMA 20d
+    sma = pd.Series(y_vals.values, index=p.index).rolling(20, min_periods=5).mean()
+    fig.add_trace(go.Scatter(
+        x=p.index, y=sma, name='SMA(20)',
+        line=dict(color='#39D2C0', width=1.2, dash='dot'), showlegend=True,
+        hovertemplate='SMA20: %{y:.2f}<extra></extra>'))
+
     fig.update_layout(
-        title=dict(text='<b>VVIX / VIX Ratio</b><sup>  > 6 = dealers anticipan spike</sup>',
-                   font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
+        title=dict(
+            text=f'<b>VVIX / VIX Ratio</b><sup>  Fuente: {src_label} · > 6 = dealers anticipan spike</sup>',
+            font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
         template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
         height=300, margin=dict(l=50, r=30, t=55, b=40),
-        xaxis=dict(gridcolor='#21262D', tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
-        yaxis=dict(title='Ratio', gridcolor='#21262D', tickfont=dict(size=9, color='#8B949E')),
+        xaxis=dict(gridcolor='#21262D',
+                   tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
+        yaxis=dict(title='Ratio', gridcolor='#21262D',
+                   tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
+        legend=dict(orientation='h', y=1.02, bgcolor='rgba(0,0,0,0)',
+                    font=dict(size=9, color='#8B949E', family='JetBrains Mono')),
         hovermode='x unified')
     return fig
 
 
 def build_skew_chart(bt, window=252):
+    """CBOE SKEW — usa datos live de yfinance (^SKEW) via join en bt."""
     if 'SKEW' not in bt.columns:
         return go.Figure()
-    p = bt.tail(window).dropna(subset=['SKEW'])
+    p = bt[['SKEW', 'VIX_Close']].tail(window).dropna(subset=['SKEW'])
     if len(p) < 10:
         return go.Figure()
+    mean_skew = float(p['SKEW'].mean())
+    std_skew  = float(p['SKEW'].std())
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=p.index, y=p['SKEW'], name='CBOE SKEW',
-        line=dict(color='#F0883E', width=2)))
-    fig.add_hline(y=p['SKEW'].mean(), line_dash='dot', line_color='#8B949E', line_width=1,
-        annotation_text=f'  Media: {p["SKEW"].mean():.0f}',
-        annotation_font=dict(color='#8B949E', size=9))
-    fig.add_hline(y=150, line_dash='dash', line_color='#F85149', line_width=1,
-        annotation_text='  Extremo > 150', annotation_font=dict(color='#F85149', size=9))
+    # Banda ±1σ
+    fig.add_hrect(
+        y0=mean_skew - std_skew, y1=mean_skew + std_skew,
+        fillcolor='rgba(88,166,255,0.06)', line_width=0)
+    fig.add_trace(go.Scatter(
+        x=p.index, y=p['SKEW'], name='CBOE SKEW (^SKEW · yfinance)',
+        line=dict(color='#F0883E', width=2),
+        hovertemplate='%{x|%Y-%m-%d}<br>SKEW: %{y:.0f}<extra></extra>'))
+    # SMA 20
+    skew_sma = p['SKEW'].rolling(20, min_periods=5).mean()
+    fig.add_trace(go.Scatter(
+        x=p.index, y=skew_sma, name='SMA(20)',
+        line=dict(color='#8B949E', width=1.2, dash='dot'),
+        hovertemplate='SMA: %{y:.0f}<extra></extra>'))
+    fig.add_hline(y=mean_skew, line_dash='dot', line_color='#58A6FF', line_width=1,
+        annotation_text=f'  μ={mean_skew:.0f}',
+        annotation_font=dict(color='#58A6FF', size=9))
+    fig.add_hline(y=150, line_dash='dash', line_color='#F85149', line_width=1.5,
+        annotation_text='  Extremo > 150 (tail-risk hedging)',
+        annotation_font=dict(color='#F85149', size=9))
+    fig.add_hline(y=130, line_dash='dot', line_color='#D29922', line_width=1,
+        annotation_text='  Elevado > 130',
+        annotation_font=dict(color='#D29922', size=8))
     fig.update_layout(
-        title=dict(text='<b>CBOE SKEW</b><sup>  Demanda de proteccion · > 150 = extremo</sup>',
+        title=dict(text='<b>CBOE SKEW Index</b><sup>  ^SKEW yfinance · > 150 = demanda extrema de cola</sup>',
                    font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
         template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
         height=280, margin=dict(l=50, r=30, t=55, b=40),
-        xaxis=dict(gridcolor='#21262D', tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
-        yaxis=dict(title='SKEW', gridcolor='#21262D', tickfont=dict(size=9, color='#8B949E')),
-        hovermode='x unified', showlegend=False)
+        xaxis=dict(gridcolor='#21262D',
+                   tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
+        yaxis=dict(title='SKEW', gridcolor='#21262D',
+                   tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
+        legend=dict(orientation='h', y=1.02, bgcolor='rgba(0,0,0,0)',
+                    font=dict(size=9, color='#8B949E', family='JetBrains Mono')),
+        hovermode='x unified')
     return fig
-
-
 def build_credit_chart(bt, window=252):
-    if 'Credit_Spread' not in bt.columns:
+    """
+    Credit Spread vs VIX — HYG/IEF live desde yfinance.
+    Credit Spread = HYG yield spread proxy: -(HYG_ret_20 - IEF_ret_20)
+    Spread positivo = crédito se amplía = risk-off → alertar al VRP trader.
+    """
+    needed = ['Credit_Spread', 'VIX_Close']
+    if not all(c in bt.columns for c in needed):
         return go.Figure()
-    p = bt.tail(window).dropna(subset=['Credit_Spread'])
+    p = bt[needed].tail(window).dropna(subset=['Credit_Spread'])
     if len(p) < 10:
         return go.Figure()
+
+    # Percentiles para bandas de contexto
+    p75 = float(p['Credit_Spread'].quantile(0.75))
+    p90 = float(p['Credit_Spread'].quantile(0.90))
+
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=p.index, y=p['Credit_Spread'], name='Credit Spread (HYG-IEF)',
-        line=dict(color='#D29922', width=2)))
-    fig.add_trace(go.Scatter(x=p.index, y=p['VIX_Close'], name='VIX', yaxis='y2',
-        line=dict(color='#F85149', width=1.5, dash='dot')))
+    # Área credit spread
+    colors_cs = ['#F85149' if v > 0 else '#3FB950' for v in p['Credit_Spread']]
+    fig.add_trace(go.Scatter(
+        x=p.index, y=p['Credit_Spread'].clip(lower=0),
+        name='Spread widening (risk-off)',
+        fill='tozeroy', line=dict(color='#F85149', width=0),
+        fillcolor='rgba(248,81,73,0.15)',
+        hoverinfo='skip'))
+    fig.add_trace(go.Scatter(
+        x=p.index, y=p['Credit_Spread'], name='Credit Spread (HYG-IEF · yfinance)',
+        line=dict(color='#D29922', width=2),
+        hovertemplate='%{x|%Y-%m-%d}<br>Spread: %{y:.2f}<extra></extra>'))
+    # VIX en eje derecho
+    fig.add_trace(go.Scatter(
+        x=p.index, y=p['VIX_Close'], name='VIX (^VIX)',
+        yaxis='y2', line=dict(color='#F85149', width=1.5, dash='dot'),
+        hovertemplate='VIX: %{y:.1f}<extra></extra>'))
+    # Líneas de percentil
+    fig.add_hline(y=0, line_dash='dash', line_color='#484F58', line_width=1)
+    fig.add_hline(y=p75, line_dash='dot', line_color='#D29922', line_width=1,
+        annotation_text=f'  P75: {p75:.2f}',
+        annotation_font=dict(color='#D29922', size=8))
+    fig.add_hline(y=p90, line_dash='dash', line_color='#F85149', line_width=1,
+        annotation_text=f'  P90: {p90:.2f} (stress)',
+        annotation_font=dict(color='#F85149', size=8))
     fig.update_layout(
-        title=dict(text='<b>Credit Spread vs VIX</b><sup>  Divergencia = warning</sup>',
-                   font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
+        title=dict(
+            text='<b>Credit Spread vs VIX</b><sup>  HYG/IEF yfinance · Divergencia credit/VIX = warning</sup>',
+            font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
         template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
         height=280, margin=dict(l=50, r=60, t=55, b=40),
-        xaxis=dict(gridcolor='#21262D', tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
-        yaxis=dict(title='Credit Spread', gridcolor='#21262D', tickfont=dict(size=9, color='#8B949E')),
+        xaxis=dict(gridcolor='#21262D',
+                   tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
+        yaxis=dict(title='Credit Spread (20d momentum)',
+                   gridcolor='#21262D', tickfont=dict(size=9, color='#8B949E')),
         yaxis2=dict(title='VIX', overlaying='y', side='right',
                     tickfont=dict(size=9, color='#F85149'), showgrid=False),
         legend=dict(orientation='h', y=1.02, bgcolor='rgba(0,0,0,0)',
                     font=dict(size=9, color='#8B949E', family='JetBrains Mono')),
         hovermode='x unified')
     return fig
-
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # MONITOR OPERATIVO — DATA LAYER (parquet local del repo)
@@ -1630,11 +2156,12 @@ def fp(v):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # TABS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-tab1, tab2, tab_edge, tab_skew, tab_cot, tab3, tab4 = st.tabs([
+tab1, tab2, tab_edge, tab_skew, tab_gex, tab_cot, tab3, tab4 = st.tabs([
     "📈  Term Structure",
     "🎯  Monitor Operativo",
     "🔬  Edge Analytics",
     "📐  Vol Skew & Surface",
+    "⚡  GEX",
     "📋  COT · Futuros VIX",
     "💡  Recomendaciones",
     "ℹ️  Help",
@@ -1971,30 +2498,76 @@ with tab_edge:
                         f'<div class="mv" style="color:{c}">{val}</div>'
                         f'<div style="font-size:0.6rem;color:var(--dim)">{sub}</div></div>')
 
-            vrp_val = last_e.get('VRP', np.nan)
-            vrp_pct = edge.get('vrp_percentile', '?')
+            # ── Métricas con HAR-VRP cuando disponible ──────────────
+            vrp_har  = last_e.get('VRP_HAR', np.nan)
+            har_fc   = last_e.get('HAR_Forecast', np.nan)
+            vrp_trad = last_e.get('VRP', np.nan)
+            vrp_val  = vrp_har if pd.notna(vrp_har) else vrp_trad
+            vrp_pct  = edge.get('vrp_percentile', '?')
             rv20_val = last_e.get('RV20', np.nan)
-            ry_val = last_e.get('Roll_Yield', np.nan)
-            vvix_r = last_e.get('VVIX_VIX', np.nan)
+            ry_val   = last_e.get('Roll_Yield', np.nan)
             skew_val = last_e.get('SKEW', np.nan)
+            # VVIX: preferir live, caer a ratio calculado
+            vvix_live = last_e.get('VVIX_Live', np.nan)
+            vvix_r    = last_e.get('VVIX_VIX', np.nan)
+            vvix_disp = vvix_r if pd.notna(vvix_r) else (
+                vvix_live / last_e['VIX_Close'] if pd.notna(vvix_live) and last_e['VIX_Close'] > 0 else np.nan
+            )
 
-            vrp_str = f"{vrp_val:+.1f}" if pd.notna(vrp_val) else "N/A"
-            vrp_clr = "up" if pd.notna(vrp_val) and vrp_val > 2 else "dn" if pd.notna(vrp_val) and vrp_val < 0 else "nt"
-            ry_str = f"{ry_val:+.1f}%" if pd.notna(ry_val) else "N/A"
-            ry_clr = "up" if pd.notna(ry_val) and ry_val > 0 else "dn" if pd.notna(ry_val) and ry_val < 0 else "nt"
-            vvix_str = f"{vvix_r:.2f}" if pd.notna(vvix_r) else "N/A"
-            vvix_clr = "dn" if pd.notna(vvix_r) and vvix_r > 6 else "up" if pd.notna(vvix_r) and vvix_r < 5 else "nt"
+            use_har = pd.notna(vrp_har) and pd.notna(har_fc)
+            vrp_label = "VRP·HAR" if use_har else "VRP·RV20"
+            vrp_sub   = (f"P{vrp_pct} · VIX:{last_e['VIX_Close']:.0f} vs E[RV]:{har_fc:.0f}"
+                         if use_har and pd.notna(har_fc)
+                         else f"P{vrp_pct} hist" if vrp_pct != '?' else "")
+
+            vrp_str  = f"{vrp_val:+.1f}" if pd.notna(vrp_val) else "N/A"
+            vrp_clr  = "up" if pd.notna(vrp_val) and vrp_val > 2 else "dn" if pd.notna(vrp_val) and vrp_val < 0 else "nt"
+            har_str  = f"{har_fc:.1f}" if pd.notna(har_fc) else "N/A"
+            ry_str   = f"{ry_val:+.1f}%" if pd.notna(ry_val) else "N/A"
+            ry_clr   = "up" if pd.notna(ry_val) and ry_val > 0 else "dn" if pd.notna(ry_val) and ry_val < 0 else "nt"
+            vvix_str = f"{vvix_disp:.2f}" if pd.notna(vvix_disp) else "N/A"
+            vvix_clr = "dn" if pd.notna(vvix_disp) and vvix_disp > 6 else "up" if pd.notna(vvix_disp) and vvix_disp < 5 else "nt"
             skew_str = f"{skew_val:.0f}" if pd.notna(skew_val) else "N/A"
             skew_clr = "dn" if pd.notna(skew_val) and skew_val > 150 else "up" if pd.notna(skew_val) and skew_val < 130 else "nt"
 
             st.markdown(f"""<div class="mrow">
-                {ecard("VRP (IV-RV)", vrp_str, f"P{vrp_pct} hist" if vrp_pct != '?' else "", vrp_clr)}
-                {ecard("RV20 (SPX)", f"{rv20_val:.1f}" if pd.notna(rv20_val) else "N/A", "Realized Vol 20d", "nt")}
+                {ecard(vrp_label, vrp_str, vrp_sub, vrp_clr)}
+                {ecard("HAR Forecast", har_str, "E[RV futura 22d]", "nt")}
+                {ecard("RV20 (trailing)", f"{rv20_val:.1f}" if pd.notna(rv20_val) else "N/A", "Pasado (ref)", "nt")}
                 {ecard("Roll Yield", ry_str, "Carry anualizado", ry_clr)}
-                {ecard("VVIX/VIX", vvix_str, "> 6 = peligro", vvix_clr)}
-                {ecard("SKEW", skew_str, "> 150 = extremo", skew_clr)}
-                {ecard("VIX", f"{last_e['VIX_Close']:.1f}", f"RV20: {rv20_val:.1f}" if pd.notna(rv20_val) else "", "nt")}
+                {ecard("VVIX/VIX", vvix_str, "live yfinance · >6=peligro", vvix_clr)}
+                {ecard("SKEW", skew_str, "live yfinance · >150=extremo", skew_clr)}
+                {ecard("VIX", f"{last_e['VIX_Close']:.1f}", "spot", "nt")}
             </div>""", unsafe_allow_html=True)
+
+            # ── Expander: HAR model diagnostics ─────────────────────
+            har_beta = edge.get('har_beta', {})
+            if har_beta or use_har:
+                with st.expander("🧮 Modelo HAR-RV — Detalles y coeficientes", expanded=False):
+                    st.markdown("""
+**¿Qué es HAR-RV?** (Corsi 2009 — *A Simple Approximate Long-Memory Model of Realized Volatility*)
+
+El VIX mide volatilidad **implícita** de los próximos 30 días. Compararlo con RV20 trailing es incorrecto porque mezcla horizontes temporales distintos.
+
+El modelo HAR-RV estima directamente `E[RV_{t, t+22}]` — la **volatilidad esperada** para los próximos 22 días hábiles:
+
+```
+E[RV_futura] = β₀ + β₁·RV_diaria + β₂·RV_semanal(5d) + β₃·RV_mensual(22d)
+```
+
+**¿Por qué funciona?**
+- Captura la *heterogeneidad* de los agentes: day traders (β₁), gestores de semana (β₂), institucionales de mes (β₃)
+- La volatilidad tiene *memoria larga* — las tres frecuencias juntas la capturan mejor que cualquiera sola
+- Outperforms GARCH en forecasting fuera de muestra (Andersen, Bollerslev, Diebold 2003)
+
+**VRP correcto:** `VIX_t - HAR_forecast_t`
+- Positivo → el mercado sobreestima la vol futura → **puedes vender vol con descuento**
+- Negativo → el mercado subestima la vol → **la estrategia inverse vol está en zona de riesgo**
+                    """)
+                    if har_beta:
+                        cols_b = st.columns(4)
+                        for i, (k, v) in enumerate(har_beta.items()):
+                            cols_b[i].metric(k, f"{v:.3f}")
 
             # Calendario de eventos
             upcoming = edge.get('upcoming_events', [])
@@ -2016,7 +2589,7 @@ with tab_edge:
             # Edge Verdict
             warnings_e = []
             if pd.notna(vrp_val) and vrp_val < 0:
-                warnings_e.append("VRP negativo — estas pagando por estar posicionado")
+                warnings_e.append(f"{'VRP·HAR' if use_har else 'VRP'} negativo ({vrp_val:+.1f} pts) — estas pagando por estar posicionado")
             if pd.notna(vvix_r) and vvix_r > 6:
                 warnings_e.append("VVIX/VIX > 6 — dealers anticipan spike")
             if pd.notna(ry_val) and ry_val < 0:
@@ -2088,8 +2661,8 @@ with tab_edge:
                 except Exception as e:
                     st.error(f"Error Credit: {e}")
 
-            st.caption(f"Edge Analytics · Ventana: 1 ano · "
-                       f"Fuentes: Master Parquet + Yahoo Finance (SKEW, HYG, IEF)")
+            har_src = 'HAR-RV (Corsi 2009)' if use_har else 'RV20 trailing'
+            st.caption(f"Edge Analytics · VRP: {har_src} · VVIX/SKEW/Credit: ^VVIX ^SKEW HYG IEF (yfinance live) · Parquet: SPY/VIX histórico")
 
 
 # ━━━━━━━━━━━━━━━━━ TAB: VOL SKEW & SURFACE ━━━━━━━━━━━━━━━━━
@@ -2098,13 +2671,13 @@ with tab_skew:
     # ── Controles ─────────────────────────────────────────────
     col_c1, col_c2, col_c3, col_c4 = st.columns([1,1,1,1])
     with col_c1:
-        skew_ticker = st.text_input(
-            "Subyacente (ticker)", value="SPY",
-            help="Cualquier ticker de opciones: SPY, QQQ, AAPL, TSLA, IWM, GLD, TLT…",
-        ).strip().upper()
+        skew_ticker = st.selectbox(
+            "Subyacente", ["SPY","QQQ","IWM","GLD","TLT"], index=0,
+            help="SPY = mayor liquidez de opciones",
+        )
     with col_c2:
-        n_exps = st.slider("Nº Vencimientos", 2, 12, 6,
-                           help="Más vencimientos = superficie más completa pero más lento (~1s c/u)")
+        n_exps = st.slider("Nº Vencimientos", 2, 6, 4,
+                           help="Cada vencimiento tarda ~0.6-1.5s")
     with col_c3:
         skew_rfr = st.number_input("Risk-Free Rate (r)", 0.0, 0.15,
                                    value=0.043, step=0.001, format="%.3f",
@@ -2268,65 +2841,215 @@ with tab_skew:
                 "Puts": len(puts_t), "Calls": len(calls_t),
             })
         if rows_tbl:
-            st.dataframe(pd.DataFrame(rows_tbl), width="stretch", hide_index=True)
-
-    # ── High-IV Scanner: mejores strikes para vender primas ──
-    with st.expander("🎯 Scanner: Strikes con Mayor IV (para venta de primas)", expanded=False):
-        st.markdown("""<div style="font-family:'JetBrains Mono';font-size:0.72rem;color:#8B949E;margin-bottom:0.5rem">
-        Opciones con IV más alta por vencimiento — candidatas para vender primas (put spreads, iron condors).
-        Ordenadas por IV descendente. OI alto = más liquidez para ejecutar.
-        </div>""", unsafe_allow_html=True)
-
-        scanner_exp = st.selectbox("Vencimiento", sorted(opt_chains.keys(),
-            key=lambda x: opt_chains[x]["dte"]),
-            format_func=lambda x: f"{x} ({opt_chains[x]['dte']}d)",
-            key="scanner_exp")
-
-        if scanner_exp and scanner_exp in opt_chains:
-            s_data = opt_chains[scanner_exp]
-            s_dte = s_data["dte"]
-
-            # Combinar puts y calls
-            s_puts = s_data["puts"].copy()
-            s_puts["type"] = "PUT"
-            s_calls = s_data["calls"].copy()
-            s_calls["type"] = "CALL"
-            s_all = pd.concat([s_puts, s_calls], ignore_index=True)
-
-            if "iv" in s_all.columns and len(s_all) > 0:
-                s_all["iv_pct"] = s_all["iv"] * 100
-                s_all["dist_spot"] = ((s_all["strike"] / opt_spot) - 1) * 100
-                s_all = s_all.sort_values("iv_pct", ascending=False)
-
-                # Top 20
-                top_iv = s_all.head(20)[["type", "strike", "iv_pct", "dist_spot",
-                                          "midPrice", "bid", "ask", "openInterest", "volume"]].copy()
-                top_iv.columns = ["Tipo", "Strike", "IV (BS) %", "Dist Spot %",
-                                  "Mid $", "Bid", "Ask", "OI", "Vol"]
-                for c in ["IV (BS) %", "Dist Spot %"]:
-                    top_iv[c] = top_iv[c].round(2)
-                for c in ["Mid $", "Bid", "Ask"]:
-                    top_iv[c] = top_iv[c].round(2)
-                top_iv["OI"] = top_iv["OI"].astype(int)
-                top_iv["Vol"] = top_iv["Vol"].astype(int)
-
-                st.dataframe(top_iv, width="stretch", hide_index=True)
-
-                # Resumen
-                avg_put_iv = s_puts["iv"].mean() * 100 if len(s_puts) > 0 else 0
-                avg_call_iv = s_calls["iv"].mean() * 100 if len(s_calls) > 0 else 0
-                max_iv_row = s_all.iloc[0]
-                st.markdown(f"""<div style="font-family:'JetBrains Mono';font-size:0.75rem;color:#C9D1D9;margin-top:0.4rem">
-                    IV promedio puts: <b style="color:#F85149">{avg_put_iv:.1f}%</b> ·
-                    IV promedio calls: <b style="color:#3FB950">{avg_call_iv:.1f}%</b> ·
-                    Mayor IV: <b style="color:#D29922">{max_iv_row['type']} K={max_iv_row['strike']:.0f} → {max_iv_row['iv_pct']:.1f}%</b>
-                </div>""", unsafe_allow_html=True)
-            else:
-                st.info("No hay datos de IV para este vencimiento.")
+            st.dataframe(pd.DataFrame(rows_tbl), use_container_width=True, hide_index=True)
 
     st.caption(
         f"IV calculada con Black-Scholes (Brent) · r={skew_rfr:.1%} · q={skew_div:.1%} · "
         f"Spot {skew_ticker}: {spot_disp} · {now_cdmx().strftime('%H:%M:%S')} CDMX"
+    )
+
+
+# ━━━━━━━━━━━━━━━━━ TAB: GEX — GAMMA EXPOSURE ━━━━━━━━━━━━━━━
+with tab_gex:
+
+    st.markdown("""
+    <div style="font-family:'JetBrains Mono',monospace;font-size:0.72rem;color:#8B949E;
+                padding:0.3rem 0 0.7rem;">
+    <b>GEX (Gamma Exposure)</b> mide el gamma neto de los dealers del mercado por strike.
+    Cuando GEX es <span style="color:#3FB950">positivo</span>: dealers compran dips y venden rallies → mercado anclado al strike.
+    Cuando GEX es <span style="color:#F85149">negativo</span>: dealers venden dips y compran rallies → movimientos se amplifican.
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Controles ─────────────────────────────────────────────
+    col_g1, col_g2, col_g3, col_g4 = st.columns([1, 1, 1, 1])
+    with col_g1:
+        gex_ticker = st.selectbox(
+            "Subyacente", ["SPY", "QQQ", "IWM", "GLD", "TLT"],
+            index=0, key="gex_ticker_sel",
+            help="SPY tiene el mayor OI de opciones = GEX más fiable",
+        )
+    with col_g2:
+        gex_n_exp = st.slider("Vencimientos a incluir", 1, 6, 3,
+                              help="Más vencimientos = GEX más completo pero más lento",
+                              key="gex_n_exp")
+    with col_g3:
+        gex_rfr = st.number_input("Risk-Free Rate (r)", 0.0, 0.15, 0.043,
+                                   step=0.001, format="%.3f", key="gex_rfr")
+    with col_g4:
+        gex_div = st.number_input("Dividend Yield (q)", 0.0, 0.10, 0.013,
+                                   step=0.001, format="%.3f", key="gex_div")
+
+    col_g5, col_g6 = st.columns([2, 1])
+    with col_g5:
+        gex_range = st.slider("Rango de strikes mostrado (±% del spot)", 5, 20, 12,
+                              help="Porcentaje del spot hacia arriba y abajo del strike central")
+    with col_g6:
+        if st.button("🔄 Actualizar GEX", key="btn_refresh_gex"):
+            fetch_options_chains.clear()
+            st.rerun()
+
+    # ── Datos: reusar cache de opciones si el ticker/n_exp coincide ──────
+    with st.spinner(f"📡 Cargando opciones {gex_ticker} ({gex_n_exp} vencimientos)…"):
+        gex_chains_raw, gex_spot = fetch_options_chains(gex_ticker, n_exp=gex_n_exp)
+
+    if not gex_chains_raw or not gex_spot:
+        st.error(f"❌ No se pudieron cargar opciones para **{gex_ticker}**.")
+        st.info("Espera 3-5 min · baja a 1-2 vencimientos · o intenta en horario de mercado.")
+        st.stop()
+
+    # Calcular IV BS (necesaria para gamma precisa)
+    with st.spinner("⚙️ Calculando Gamma (Black-Scholes)…"):
+        gex_chains_bs = compute_bs_iv_for_chains(
+            gex_chains_raw, gex_spot, r=gex_rfr, q=gex_div
+        )
+        # Si BS falla, usar chains raw con impliedVolatility de yfinance
+        gex_chains_use = gex_chains_bs if gex_chains_bs else gex_chains_raw
+
+    # ── Calcular GEX profile ──────────────────────────────────
+    gex_df = compute_gex_profile(
+        gex_chains_use, gex_spot, r=gex_rfr, q=gex_div
+    )
+    gex_summary = compute_gex_summary(gex_df, gex_spot)
+
+    if gex_df.empty or not gex_summary:
+        st.warning("⚠️ No hay suficientes datos de opciones para calcular el GEX.")
+        st.stop()
+
+    # ── Métricas ─────────────────────────────────────────────
+    total_g   = gex_summary.get("total_gex", 0)
+    flip_s    = gex_summary.get("flip_strike")
+    call_w    = gex_summary.get("call_wall")
+    put_w     = gex_summary.get("put_wall")
+    pct_pos   = gex_summary.get("pct_pos_otm")
+    regime    = gex_summary.get("regime", "?")
+    reg_clr   = "var(--g)" if regime == "POSITIVE" else "var(--r)"
+
+    flip_dist = f"{(flip_s/gex_spot - 1)*100:+.1f}%" if flip_s else "N/A"
+    cw_dist   = f"{(call_w/gex_spot - 1)*100:+.1f}%" if call_w else "N/A"
+    pw_dist   = f"{(put_w/gex_spot - 1)*100:+.1f}%" if put_w else "N/A"
+
+    st.markdown(f"""
+    <div class="mrow">
+        <div class="mpill" style="min-width:160px">
+            <div class="ml">Régimen GEX</div>
+            <div class="mv" style="color:{reg_clr}">{regime}</div>
+        </div>
+        <div class="mpill">
+            <div class="ml">Net GEX Total</div>
+            <div class="mv {'up' if total_g>=0 else 'dn'}">${total_g:+.1f}M</div>
+        </div>
+        <div class="mpill">
+            <div class="ml">{gex_ticker} Spot</div>
+            <div class="mv nt">${gex_spot:.2f}</div>
+        </div>
+        <div class="mpill">
+            <div class="ml">Gamma Flip</div>
+            <div class="mv" style="color:var(--y)">${f"{flip_s:.0f}" if flip_s else "—"} <span style="font-size:0.75rem;color:var(--dim)">({flip_dist})</span></div>
+        </div>
+        <div class="mpill">
+            <div class="ml">Call Wall</div>
+            <div class="mv" style="color:#BC8CFF">${f"{call_w:.0f}" if call_w else "—"} <span style="font-size:0.75rem;color:var(--dim)">({cw_dist})</span></div>
+        </div>
+        <div class="mpill">
+            <div class="ml">Put Wall</div>
+            <div class="mv" style="color:#39D2C0">${f"{put_w:.0f}" if put_w else "—"} <span style="font-size:0.75rem;color:var(--dim)">({pw_dist})</span></div>
+        </div>
+        <div class="mpill">
+            <div class="ml">%OTM con GEX+</div>
+            <div class="mv nt">{f"{pct_pos:.0f}%" if pct_pos is not None else "—"}</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Interpretación ────────────────────────────────────────
+    with st.expander("📊 Interpretación GEX", expanded=True):
+        if regime == "POSITIVE":
+            st.markdown(
+                f"✅ **Régimen POSITIVO** — Los dealers tienen gamma larga neta. "
+                f"Cuando el mercado cae, los dealers **compran** para delta-hedgear → actúa como soporte. "
+                f"Cuando el mercado sube, los dealers **venden** → actúa como resistencia. "
+                f"Resultado: **volatilidad comprimida**, el mercado tiende a mantenerse anclado cerca del gamma flip (${flip_s:.0f} aprox.)."
+                if flip_s else
+                f"✅ **Régimen POSITIVO** — Los dealers tienen gamma larga neta → mercado estabilizador."
+            )
+        else:
+            st.markdown(
+                f"⚠️ **Régimen NEGATIVO** — Los dealers tienen gamma corta neta. "
+                f"Cuando el mercado cae, los dealers **también venden** para hedgear → los movimientos se **amplifican**. "
+                f"El mercado puede tener gaps y movimientos bruscos. "
+                f"{'El Gamma Flip está en $' + str(int(flip_s)) + ' — recuperar ese nivel sería la señal de estabilización.' if flip_s else ''}"
+            )
+        st.markdown("""
+**Niveles clave:**
+- 🟣 **Call Wall**: mayor concentración de gamma de calls — los dealers venden agresivamente aquí (techo)
+- 🩵 **Put Wall**: mayor concentración de gamma de puts — los dealers compran agresivamente aquí (soporte)
+- 🟡 **Gamma Flip**: punto donde el régimen cambia de positivo a negativo
+        """)
+
+    st.markdown("<div style='border-top:1px solid #30363D;margin:0.5rem 0'></div>",
+                unsafe_allow_html=True)
+
+    # ── GEX Profile + GEX por vencimiento ────────────────────
+    try:
+        fig_gex = build_gex_profile_chart(
+            gex_df, gex_spot, gex_summary,
+            ticker=gex_ticker,
+            strike_range_pct=gex_range / 100,
+        )
+        if fig_gex.data:
+            st.plotly_chart(fig_gex, width="stretch",
+                            config=dict(displayModeBar=True,
+                                        modeBarButtonsToRemove=["lasso2d", "select2d"]))
+        else:
+            st.info("No hay datos GEX en el rango de strikes seleccionado.")
+    except Exception as e:
+        st.error(f"Error GEX profile: {e}")
+
+    col_gx1, col_gx2 = st.columns([1, 1])
+    with col_gx1:
+        try:
+            fig_gex_exp = build_gex_by_expiry_chart(
+                gex_chains_use, gex_spot, r=gex_rfr, q=gex_div
+            )
+            if fig_gex_exp.data:
+                st.plotly_chart(fig_gex_exp, width="stretch",
+                                config=dict(displayModeBar=False))
+        except Exception as e:
+            st.error(f"Error GEX por vencimiento: {e}")
+
+    with col_gx2:
+        # Mini-tabla: top 10 strikes por |GEX|
+        lo_rng = gex_spot * (1 - gex_range / 100)
+        hi_rng = gex_spot * (1 + gex_range / 100)
+        top_strikes = (
+            gex_df[gex_df["strike"].between(lo_rng, hi_rng)]
+            .assign(abs_gex=lambda x: x["net_gex"].abs())
+            .nlargest(12, "abs_gex")
+            .sort_values("strike")[["strike", "calls_gex", "puts_gex", "net_gex"]]
+            .rename(columns={
+                "strike": "Strike", "calls_gex": "GEX Calls ($M)",
+                "puts_gex": "GEX Puts ($M)", "net_gex": "Net GEX ($M)",
+            })
+        )
+        if not top_strikes.empty:
+            st.markdown("**Top strikes por |GEX| en rango**")
+            st.dataframe(
+                top_strikes.style.format({
+                    "Strike": "${:.0f}",
+                    "GEX Calls ($M)": "${:.2f}M",
+                    "GEX Puts ($M)":  "${:.2f}M",
+                    "Net GEX ($M)":   "${:+.2f}M",
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    st.caption(
+        f"GEX = OI × Gamma_BS × S² × 100 × 1% · "
+        f"Fuente: opciones {gex_ticker} vía Yahoo Finance · "
+        f"r={gex_rfr:.1%} · q={gex_div:.1%} · "
+        f"{now_cdmx().strftime('%H:%M:%S')} CDMX"
     )
 
 
@@ -2485,7 +3208,7 @@ with tab_cot:
                 if c in cot_df.columns]
             st.dataframe(
                 cot_df[show_cols].tail(cot_weeks).sort_values("date", ascending=False),
-                width="stretch", hide_index=True,
+                use_container_width=True, hide_index=True,
             )
 
         st.caption(
