@@ -385,19 +385,46 @@ def fetch_options_chains(ticker: str = "SPY", n_exp: int = 4) -> tuple:
     log = logging.getLogger("vix_controller")
 
     def _clean(df_raw, spot_px):
+        """
+        Filtros de calidad estrictos para cadenas de opciones.
+
+        REGLA FUNDAMENTAL: solo aceptar opciones con bid > 0 AND ask > 0.
+        Usar lastPrice como fallback es INCORRECTO — puede ser una
+        transacción de hace semanas/meses en un strike sin mercado activo.
+        Un bid=0/ask=0 significa que el market-maker NO está dispuesto a
+        cotizar ese strike → precio no confiable → IV no confiable.
+
+        Filtros aplicados:
+        1. bid > 0 AND ask > 0    — mercado activo
+        2. moneyness ∈ [0.70, 1.30] — ±30% del spot
+        3. spread < 50% del mid    — liquidez mínima
+        4. openInterest ≥ 10       — algo de profundidad
+        5. midPrice > 0.05         — precio mínimo válido (evita peniques)
+        """
         df_c = df_raw.copy()
         for col in ["bid","ask","lastPrice","openInterest","volume","strike"]:
             df_c[col] = pd.to_numeric(df_c.get(col, 0), errors="coerce").fillna(0)
-        df_c = df_c[df_c["openInterest"] > 0]
+
+        # 1. Requiere bid Y ask positivos — sin esto, el precio no es real
+        df_c = df_c[(df_c["bid"] > 0) & (df_c["ask"] > 0)]
         df_c = df_c[df_c["strike"] > 0]
-        df_c["midPrice"] = np.where(
-            (df_c["bid"] > 0) & (df_c["ask"] > 0),
-            0.5*(df_c["bid"] + df_c["ask"]),
-            df_c["lastPrice"]
-        )
-        df_c = df_c[df_c["midPrice"] > 0]
-        df_c = df_c.dropna(subset=["strike","midPrice"])
+
+        # 2. midPrice únicamente con bid/ask (no lastPrice)
+        df_c["midPrice"] = 0.5 * (df_c["bid"] + df_c["ask"])
+
+        # 3. Moneyness ±30% — strikes fuera de este rango son illíquidos
         df_c["moneyness"] = df_c["strike"] / spot_px
+        df_c = df_c[df_c["moneyness"].between(0.70, 1.30)]
+
+        # 4. Spread < 50% del mid — spread mayor indica precio basura
+        spread_pct = (df_c["ask"] - df_c["bid"]) / df_c["midPrice"]
+        df_c = df_c[spread_pct < 0.50]
+
+        # 5. OI mínimo y precio mínimo
+        df_c = df_c[df_c["openInterest"] >= 10]
+        df_c = df_c[df_c["midPrice"] >= 0.05]
+
+        df_c = df_c.dropna(subset=["strike","midPrice"])
         return df_c.sort_values("strike").reset_index(drop=True)
 
     sess = _get_cffi_session()
@@ -516,10 +543,11 @@ def fetch_options_chains(ticker: str = "SPY", n_exp: int = 4) -> tuple:
 
 def compute_bs_iv_for_chains(chains: dict, spot: float, r: float, q: float) -> dict:
     """
-    Aplica BS IV (Brent) a cada opción de cada chain.
-    Agrega columna 'iv' (float, annualizado) y filtra NaN.
-    r = risk-free rate anualizado
-    q = dividend yield continuo
+    Calcula IV Black-Scholes (Brent) para cada opción de cada chain.
+    Aplica filtros adicionales de moneyness y IV razonable.
+
+    Rango IV aceptado: 1% - 300%
+    Strikes fuera de ±30% del spot se descartan (refuerza _clean).
     """
     result = {}
     for exp_str, data in chains.items():
@@ -529,12 +557,17 @@ def compute_bs_iv_for_chains(chains: dict, spot: float, r: float, q: float) -> d
             continue
         for side, opt_type in [("calls","C"), ("puts","P")]:
             df = data[side].copy()
+            # Redundant safety: moneyness guard in case data came through yfinance fallback
+            df = df[df["moneyness"].between(0.70, 1.30)]
+            if df.empty:
+                continue
             df["iv"] = df.apply(
                 lambda row: _bs_iv(spot, row["strike"], r, T,
                                    row["midPrice"], opt_type, q),
                 axis=1
             )
-            df = df[df["iv"].notna() & (df["iv"] > 0.005) & (df["iv"] < 5.0)]
+            # IV range: 1% to 300% — anything outside is a data artifact
+            df = df[df["iv"].notna() & (df["iv"] >= 0.01) & (df["iv"] <= 3.0)]
             data[side] = df.reset_index(drop=True)
         if len(data["calls"]) >= 3 and len(data["puts"]) >= 3:
             result[exp_str] = data
@@ -1268,8 +1301,8 @@ def forecast_vol_surface(chains: dict, spot: float,
     for exp_str, data in chains.items():
         dte = data["dte"]; T = dte / 365.0
         if T <= 0: continue
-        puts_f  = data["puts"][data["puts"]["moneyness"].between(0.75, 1.02)]
-        calls_f = data["calls"][data["calls"]["moneyness"].between(0.98, 1.25)]
+        puts_f  = data["puts"][data["puts"]["moneyness"].between(0.80, 1.02)]
+        calls_f = data["calls"][data["calls"]["moneyness"].between(0.98, 1.20)]
         combo   = pd.concat([puts_f, calls_f]).drop_duplicates("strike").sort_values("strike")
         iv_col  = "iv" if "iv" in combo.columns else "impliedVolatility"
         combo   = combo[combo[iv_col].notna() & (combo[iv_col] > 0.01)]
@@ -1318,13 +1351,14 @@ def forecast_vol_surface(chains: dict, spot: float,
             df = data[side].copy()
             if df.empty: continue
             iv_col = "iv" if "iv" in df.columns else "impliedVolatility"
-            df = df[df[iv_col].notna() & (df["strike"].between(spot*0.78, spot*1.22))]
+            df = df[df[iv_col].notna() & (df["strike"].between(spot*0.82, spot*1.18))]
             if df.empty: continue
 
             for _, row in df.iterrows():
                 K   = row["strike"]; iv_c = float(row.get(iv_col, 0) or 0)
                 oi  = row["openInterest"]; mid = row.get("midPrice", 0)
-                if iv_c <= 0 or mid <= 0: continue
+                if K <= 0 or iv_c <= 0 or mid <= 0: continue
+                if not (0.82 <= K/spot <= 1.18): continue  # ±18% max
 
                 k_  = np.log(K / (F * np.exp((r-q)*T)))
                 disc_ = np.maximum((k_ - fit["m"])**2 + fit["sigma"]**2, 1e-12)
@@ -3690,9 +3724,11 @@ with tab_skew:
 
     col_c5, col_c6, col_c7, col_c8 = st.columns([1,1,1,1])
     with col_c5:
-        mon_lo = st.slider("Strike mín (%spot)", 70, 90, 80) / 100
-    with col_c6:
-        mon_hi = st.slider("Strike máx (%spot)", 110, 140, 125) / 100
+        mon_lo = st.slider("Strike mín (%spot)", 75, 95, 85,
+                           help="Solo strikes con bid+ask activos — defecto 85% filtra iqlíquidos") / 100
+
+        mon_hi = st.slider("Strike máx (%spot)", 105, 130, 115,
+                           help="Defecto 115% — más allá hay bid=0 en la mayoría de chains") / 100
     with col_c7:
         y_axis_mode = st.selectbox("Eje Y", ["% vs Spot", "Log-moneyness ln(K/S)"],
                                    help="Log-moneyness es la convención académica de BS")
