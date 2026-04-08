@@ -2798,7 +2798,7 @@ E[RV_futura] = β₀ + β₁·RV_diaria + β₂·RV_semanal(5d) + β₃·RV_mens
 - Negativo → el mercado subestima la vol → **la estrategia inverse vol está en zona de riesgo**
                     """)
                     if har_beta:
-                        cols_b = st.columns(4)
+                        cols_b = st.columns(len(har_beta))
                         for i, (k, v) in enumerate(har_beta.items()):
                             cols_b[i].metric(k, f"{v:.3f}")
 
