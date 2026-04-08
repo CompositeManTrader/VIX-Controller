@@ -353,19 +353,34 @@ def _bs_iv(S, X, r, T, price, option_type, q, tol=1e-6):
 
 # ─── Fetch raw options (sin IV de yfinance) ─────────────────────────────────
 
-def _yahoo_options_session():
+# ── Yahoo Finance API endpoints (rotación anti-rate-limit) ───────────────
+_YF_ENDPOINTS = [
+    "https://query1.finance.yahoo.com/v8/finance/options/{ticker}",
+    "https://query2.finance.yahoo.com/v8/finance/options/{ticker}",
+]
+
+@st.cache_resource
+def _get_cffi_session():
+    """Sesión curl_cffi compartida (cache_resource = una sola instancia por deployment)."""
     try:
         from curl_cffi import requests as cffi_req
-        return cffi_req.Session(impersonate="chrome120")
+        s = cffi_req.Session(impersonate="chrome124")
+        return s
     except ImportError:
         return None
 
-@st.cache_data(ttl=900)
+def _yahoo_options_session():
+    return _get_cffi_session()
+
+@st.cache_data(ttl=1200)   # 20 min — da tiempo para que rate-limit expire
 def fetch_options_chains(ticker: str = "SPY", n_exp: int = 4) -> tuple:
     """
-    Descarga opciones y devuelve precios RAW (bid, ask, lastPrice).
-    IV se calcula después con BS dado que yfinance's IV es poco fiable.
-    Estrategia: curl_cffi → Yahoo v8 API directo → fallback yfinance.
+    Descarga opciones con triple estrategia anti-rate-limit:
+    1. curl_cffi con impersonación Chrome124 (TLS fingerprint real)
+       - Rota entre query1 y query2 en cada chain
+       - Delay adaptativo: duplica si obtiene 429
+    2. Fallback yfinance con backoff exponencial
+    3. TTL=20 min para no re-golpear tras rate-limit
     """
     log = logging.getLogger("vix_controller")
 
@@ -375,7 +390,6 @@ def fetch_options_chains(ticker: str = "SPY", n_exp: int = 4) -> tuple:
             df_c[col] = pd.to_numeric(df_c.get(col, 0), errors="coerce").fillna(0)
         df_c = df_c[df_c["openInterest"] > 0]
         df_c = df_c[df_c["strike"] > 0]
-        # midPrice: (bid+ask)/2 si ambos disponibles, else lastPrice
         df_c["midPrice"] = np.where(
             (df_c["bid"] > 0) & (df_c["ask"] > 0),
             0.5*(df_c["bid"] + df_c["ask"]),
@@ -386,62 +400,85 @@ def fetch_options_chains(ticker: str = "SPY", n_exp: int = 4) -> tuple:
         df_c["moneyness"] = df_c["strike"] / spot_px
         return df_c.sort_values("strike").reset_index(drop=True)
 
-    sess = _yahoo_options_session()
+    sess = _get_cffi_session()
     if sess is not None:
-        try:
-            log.info(f"Options {ticker}: curl_cffi Chrome impersonation")
-            base = f"https://query1.finance.yahoo.com/v8/finance/options/{ticker}"
-            hdrs = {"Accept":"application/json","Referer":"https://finance.yahoo.com/",
-                    "Accept-Language":"en-US,en;q=0.9"}
-            r0   = sess.get(base, headers=hdrs, timeout=15)
-            r0.raise_for_status()
-            root = r0.json()["optionChain"]["result"][0]
-            spot = float(root["quote"].get("regularMarketPrice", 0))
-            if not spot: raise ValueError("spot=0")
-            timestamps = root.get("expirationDates", [])
-            today  = date.today()
-            chains = {}
-            sel = sorted(
-                [(ts, datetime.fromtimestamp(ts).date().strftime("%Y-%m-%d"),
-                  (datetime.fromtimestamp(ts).date() - today).days)
-                 for ts in timestamps
-                 if (datetime.fromtimestamp(ts).date() - today).days >= 7],
-                key=lambda x: x[2])[:n_exp]
-            for ts, exp_str, dte in sel:
-                time.sleep(0.6)
-                try:
-                    rx = sess.get(f"{base}?date={ts}", headers=hdrs, timeout=15)
-                    rx.raise_for_status()
-                    opts = rx.json()["optionChain"]["result"][0]["options"][0]
-                    c_df = _clean(pd.DataFrame(opts.get("calls",[])), spot)
-                    p_df = _clean(pd.DataFrame(opts.get("puts", [])), spot)
-                    if len(c_df) < 3 or len(p_df) < 3: continue
-                    chains[exp_str] = {"calls":c_df,"puts":p_df,"dte":dte}
-                except Exception as ex:
-                    log.warning(f"curl_cffi chain {ticker} {exp_str}: {ex}")
-            if chains:
-                log.info(f"curl_cffi OK {ticker}: {len(chains)} chains · spot={spot:.2f}")
-                return chains, spot
-            log.warning(f"curl_cffi: no chains for {ticker} — fallback yfinance")
-        except Exception as e:
-            log.warning(f"curl_cffi failed {ticker}: {e} — fallback yfinance")
+        hdrs = {
+            "Accept": "application/json,text/html,*/*;q=0.9",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Referer": "https://finance.yahoo.com/",
+            "Origin":  "https://finance.yahoo.com",
+        }
+        delay = 0.8   # delay inicial entre chains; se dobla si hay 429
+
+        for ep_idx, ep_tmpl in enumerate(_YF_ENDPOINTS):
+            base = ep_tmpl.format(ticker=ticker)
+            try:
+                log.info(f"Options {ticker}: curl_cffi → {['query1','query2'][ep_idx]}")
+                r0 = sess.get(base, headers=hdrs, timeout=20)
+                if r0.status_code == 429:
+                    log.warning(f"429 en {base} — probando siguiente endpoint")
+                    time.sleep(3)
+                    continue
+                r0.raise_for_status()
+                root  = r0.json()["optionChain"]["result"][0]
+                spot  = float(root["quote"].get("regularMarketPrice", 0))
+                if not spot: raise ValueError("spot=0")
+                timestamps = root.get("expirationDates", [])
+                today  = date.today()
+                sel = sorted(
+                    [(ts, datetime.fromtimestamp(ts).date().strftime("%Y-%m-%d"),
+                      (datetime.fromtimestamp(ts).date() - today).days)
+                     for ts in timestamps
+                     if (datetime.fromtimestamp(ts).date() - today).days >= 7],
+                    key=lambda x: x[2])[:n_exp]
+                chains = {}
+                for i, (ts, exp_str, dte) in enumerate(sel):
+                    time.sleep(delay)
+                    # Rotar endpoints por chain
+                    chain_ep = _YF_ENDPOINTS[i % len(_YF_ENDPOINTS)].format(ticker=ticker)
+                    try:
+                        rx = sess.get(f"{chain_ep}?date={ts}", headers=hdrs, timeout=20)
+                        if rx.status_code == 429:
+                            delay = min(delay * 2, 5.0)
+                            log.warning(f"429 en chain {exp_str} — delay→{delay:.1f}s")
+                            time.sleep(delay)
+                            rx = sess.get(f"{chain_ep}?date={ts}", headers=hdrs, timeout=20)
+                        rx.raise_for_status()
+                        opts = rx.json()["optionChain"]["result"][0]["options"][0]
+                        c_df = _clean(pd.DataFrame(opts.get("calls",[])), spot)
+                        p_df = _clean(pd.DataFrame(opts.get("puts", [])), spot)
+                        if len(c_df) < 3 or len(p_df) < 3: continue
+                        chains[exp_str] = {"calls":c_df,"puts":p_df,"dte":dte}
+                        delay = max(delay * 0.85, 0.8)  # reduce delay si va bien
+                    except Exception as ex:
+                        log.warning(f"curl_cffi chain {ticker} {exp_str}: {ex}")
+                if chains:
+                    log.info(f"curl_cffi OK {ticker}: {len(chains)} chains · spot={spot:.2f}")
+                    return chains, spot
+            except Exception as e:
+                log.warning(f"curl_cffi endpoint {ep_idx} failed: {e}")
+                time.sleep(2)
+                continue
 
     # ── Fallback: yfinance con backoff ─────────────────────────────────────
     log.info(f"Options {ticker}: yfinance fallback")
     try:
         t = yf.Ticker(ticker)
-        def _bo(fn, label, n=4):
+        def _bo(fn, label, n=5):
             for i in range(n):
                 try: return fn()
                 except Exception as ex:
                     if any(k in str(ex).lower() for k in
                            ["rate limit","too many","429","throttle"]) and i < n-1:
-                        w = 2**(i+1); log.warning(f"{label} RL→{w}s"); time.sleep(w)
+                        w = 2**(i+1)
+                        log.warning(f"{label} RL→wait {w}s")
+                        time.sleep(w)
                     else: raise
             return None
         exps = _bo(lambda: t.options, f"{ticker}.options")
         if not exps: return {}, None
-        time.sleep(0.8)
+        time.sleep(1.0)
         hist = _bo(lambda: t.history(period="2d"), f"{ticker}.hist")
         spot = float(hist["Close"].iloc[-1]) if hist is not None and not hist.empty else None
         if not spot: return {}, None
@@ -451,12 +488,12 @@ def fetch_options_chains(ticker: str = "SPY", n_exp: int = 4) -> tuple:
              for e in exps
              if (datetime.strptime(e,"%Y-%m-%d").date()-today).days >= 7],
             key=lambda x: x[1])[:n_exp]
-        time.sleep(1.0)
+        time.sleep(1.2)
         chains = {}; streak = 0
         for exp_str, dte in valid:
-            if streak >= 2: time.sleep(12); streak = 0
+            if streak >= 2: time.sleep(15); streak = 0
             try:
-                ch = _bo(lambda e=exp_str: t.option_chain(e), f"{ticker}.chain.{exp_str}")
+                ch = _bo(lambda e=exp_str: t.option_chain(e), f"{ticker}.chain")
                 if ch is None: continue
                 streak = 0
                 chains[exp_str] = {
@@ -464,7 +501,7 @@ def fetch_options_chains(ticker: str = "SPY", n_exp: int = 4) -> tuple:
                     "puts":  _clean(ch.puts,  spot),
                     "dte":   dte,
                 }
-                time.sleep(1.5)
+                time.sleep(1.8)
             except Exception as ex:
                 if any(k in str(ex).lower() for k in ["rate limit","too many","429"]):
                     streak += 1
@@ -802,6 +839,680 @@ def build_gex_by_expiry_chart(chains: dict, spot: float,
 
 
 # ─── Métricas de skew (usa columna 'iv' BS) ────────────────────────────────
+def build_gex_delta_exposure_chart(chains: dict, spot: float,
+                                    r: float = 0.043, q: float = 0.013,
+                                    strike_range_pct: float = 0.15) -> go.Figure:
+    """
+    DEX (Delta Exposure): muestra el delta neto de dealers por strike.
+    Donde DEX cruza cero = nivel de máximo dolor (max pain).
+    Complementa GEX para entender hacia dónde se mueve el precio.
+    """
+    fig = go.Figure()
+    if not chains or not spot:
+        return fig
+
+    lo = spot * (1 - strike_range_pct)
+    hi = spot * (1 + strike_range_pct)
+    rows = []
+
+    for exp_str, data in chains.items():
+        dte = data["dte"]; T = dte / 365.0
+        if T <= 0: continue
+        for side, sign, opt_type in [("calls", -1, "C"), ("puts", +1, "P")]:
+            df = data[side].copy()
+            if df.empty: continue
+            iv_col = "iv" if "iv" in df.columns else "impliedVolatility"
+            df = df[df.get(iv_col, pd.Series([np.nan]*len(df))).notna()]
+            df = df[df["strike"].between(lo, hi)]
+            if df.empty: continue
+
+            for _, row in df.iterrows():
+                iv = float(row.get(iv_col, 0) or 0)
+                if iv <= 0: continue
+                K = row["strike"]; oi = row["openInterest"]
+                d1 = (np.log(spot/K) + (r - q + 0.5*iv**2)*T) / (iv*np.sqrt(T)) if T > 0 and iv > 0 else 0
+                from scipy.stats import norm as _norm
+                delta = np.exp(-q*T) * _norm.cdf(d1) if opt_type == "C" else -np.exp(-q*T)*_norm.cdf(-d1)
+                # Dealer delta: short calls = -delta, long puts = +delta (approx)
+                rows.append({"strike": K, "delta_usd": sign * oi * delta * spot * 100 / 1e6})
+
+    if not rows:
+        return fig
+
+    df_d = pd.DataFrame(rows).groupby("strike")["delta_usd"].sum().reset_index()
+    colors_d = ["#3FB950" if v >= 0 else "#F85149" for v in df_d["delta_usd"]]
+
+    fig.add_trace(go.Bar(
+        x=df_d["strike"], y=df_d["delta_usd"],
+        marker_color=colors_d, opacity=0.75, name="Delta Exposure",
+        hovertemplate="Strike: $%{x:.0f}<br>DEX: $%{y:.2f}M<extra></extra>"))
+
+    fig.add_vline(x=spot, line_dash="solid", line_color="#F0F6FC", line_width=2,
+                  annotation_text=f"  Spot ${spot:.0f}",
+                  annotation_font=dict(size=9, color="#F0F6FC"))
+    fig.add_hline(y=0, line_dash="dash", line_color="#484F58", line_width=1.5)
+
+    # Max pain: strike con mayor dolor para holders de opciones
+    combined_all = pd.concat([
+        data["calls"].assign(type="C") for data in chains.values()
+    ] + [data["puts"].assign(type="P") for data in chains.values()])
+    if not combined_all.empty:
+        strikes_all = sorted(combined_all["strike"].unique())
+        pain = []
+        for s in strikes_all:
+            calls_loss = combined_all[(combined_all["type"]=="C") & (combined_all["strike"] <= s)].apply(
+                lambda r: (s - r["strike"]) * r["openInterest"] * 100, axis=1).sum()
+            puts_loss  = combined_all[(combined_all["type"]=="P") & (combined_all["strike"] >= s)].apply(
+                lambda r: (r["strike"] - s) * r["openInterest"] * 100, axis=1).sum()
+            pain.append({"strike": s, "pain": calls_loss + puts_loss})
+        if pain:
+            df_pain = pd.DataFrame(pain)
+            mp = float(df_pain.loc[df_pain["pain"].idxmin(), "strike"])
+            fig.add_vline(x=mp, line_dash="dot", line_color="#D29922", line_width=2,
+                          annotation_text=f"  Max Pain ${mp:.0f}",
+                          annotation_font=dict(size=9, color="#D29922", family="JetBrains Mono"))
+
+    fig.update_layout(
+        title=dict(text="<b>Delta Exposure (DEX)</b><sup>  Presión de hedging por strike · Max Pain marcado</sup>",
+                   font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5),
+        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+        height=320, margin=dict(l=55, r=30, t=60, b=50),
+        xaxis=dict(title="Strike ($)", gridcolor="#21262D",
+                   tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono"), tickprefix="$"),
+        yaxis=dict(title="DEX ($M)", gridcolor="#21262D",
+                   tickfont=dict(size=9, color="#8B949E"), ticksuffix="M",
+                   zeroline=True, zerolinecolor="#484F58", zerolinewidth=2),
+        showlegend=False, hovermode="x unified", bargap=0.1)
+    return fig
+
+
+def build_gex_vanna_charm_chart(chains: dict, spot: float,
+                                 r: float = 0.043, q: float = 0.013,
+                                 strike_range_pct: float = 0.15) -> go.Figure:
+    """
+    Vanna + Charm por strike.
+    Vanna = ∂Delta/∂Vol = ∂Gamma/∂Spot (efecto de cambio de IV sobre delta)
+    Charm = ∂Delta/∂t  (decaimiento del delta con el tiempo, importante en expiry weeks)
+    Ambos generan flujos de hedging autónomos — críticos para predecir pinning en expiración.
+    """
+    from scipy.stats import norm as _norm
+    fig = go.Figure()
+    if not chains or not spot:
+        return fig
+
+    lo = spot * (1 - strike_range_pct)
+    hi = spot * (1 + strike_range_pct)
+    vanna_rows, charm_rows = [], []
+
+    for data in chains.values():
+        dte = data["dte"]; T = dte / 365.0
+        if T <= 0: continue
+        for side, sign in [("calls", -1), ("puts", +1)]:
+            df = data[side].copy()
+            if df.empty: continue
+            iv_col = "iv" if "iv" in df.columns else "impliedVolatility"
+            df = df[df["strike"].between(lo, hi)].copy()
+            if df.empty: continue
+            for _, row in df.iterrows():
+                iv = float(row.get(iv_col, 0) or 0)
+                K = row["strike"]; oi = row["openInterest"]
+                if iv <= 0 or T <= 0: continue
+                d1 = (np.log(spot/K) + (r - q + 0.5*iv**2)*T) / (iv*np.sqrt(T))
+                d2 = d1 - iv*np.sqrt(T)
+                pdf_d1 = _norm.pdf(d1)
+                # Vanna: dDelta/dVol per $1M notional
+                vanna = np.exp(-q*T) * pdf_d1 * d2 / iv if iv > 0 else 0
+                # Charm: dDelta/dt
+                charm = np.exp(-q*T) * pdf_d1 * (
+                    2*(r-q)*T - d2*iv*np.sqrt(T)) / (2*T*iv*np.sqrt(T)) if T > 0 else 0
+                vanna_rows.append({"strike": K, "val": sign * oi * vanna * spot * 100 / 1e6})
+                charm_rows.append({"strike": K, "val": sign * oi * charm * 100 / 1e3})
+
+    if not vanna_rows:
+        return fig
+
+    df_v = pd.DataFrame(vanna_rows).groupby("strike")["val"].sum().reset_index()
+    df_c = pd.DataFrame(charm_rows).groupby("strike")["val"].sum().reset_index()
+
+    fig.add_trace(go.Bar(
+        x=df_v["strike"], y=df_v["val"],
+        name="Vanna ($M/vol pt)",
+        marker_color="#58A6FF", opacity=0.7,
+        hovertemplate="Strike: $%{x:.0f}<br>Vanna: %{y:.3f}M<extra></extra>"))
+
+    fig.add_trace(go.Scatter(
+        x=df_c["strike"], y=df_c["val"],
+        name="Charm (×1000)", yaxis="y2",
+        line=dict(color="#BC8CFF", width=2),
+        hovertemplate="Strike: $%{x:.0f}<br>Charm: %{y:.3f}<extra></extra>"))
+
+    fig.add_vline(x=spot, line_dash="dash", line_color="#F0F6FC", line_width=1.5,
+                  annotation_text=f"  Spot ${spot:.0f}",
+                  annotation_font=dict(size=9, color="#F0F6FC"))
+    fig.add_hline(y=0, line_dash="dot", line_color="#484F58", line_width=1)
+
+    fig.update_layout(
+        title=dict(text="<b>Vanna & Charm</b><sup>  Flujos de hedging por cambio de vol (Vanna) y tiempo (Charm)</sup>",
+                   font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5),
+        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+        height=320, margin=dict(l=55, r=60, t=60, b=50),
+        xaxis=dict(title="Strike ($)", gridcolor="#21262D",
+                   tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono"), tickprefix="$"),
+        yaxis=dict(title="Vanna ($M)", gridcolor="#21262D",
+                   tickfont=dict(size=9, color="#58A6FF")),
+        yaxis2=dict(title="Charm (×1000)", overlaying="y", side="right",
+                    tickfont=dict(size=9, color="#BC8CFF"), showgrid=False),
+        legend=dict(orientation="h", y=1.02, bgcolor="rgba(0,0,0,0)",
+                    font=dict(size=9, color="#C9D1D9", family="JetBrains Mono")),
+        hovermode="x unified", bargap=0.1)
+    return fig
+
+
+def build_gex_cumulative_chart(gex_df: pd.DataFrame, spot: float,
+                                strike_range_pct: float = 0.15) -> go.Figure:
+    """
+    GEX acumulado: suma corrida de GEX desde strikes bajos a altos.
+    El cruce por cero = Gamma Flip confirmado visualmente.
+    La pendiente muestra la "fuerza" del régimen.
+    """
+    fig = go.Figure()
+    if gex_df.empty or spot <= 0:
+        return fig
+
+    lo = spot * (1 - strike_range_pct)
+    hi = spot * (1 + strike_range_pct)
+    df = gex_df[gex_df["strike"].between(lo, hi)].sort_values("strike").copy()
+    if df.empty:
+        return fig
+
+    df["gex_cumsum"] = df["net_gex"].cumsum()
+    zero_crossings = df[df["gex_cumsum"] * df["gex_cumsum"].shift(1) < 0]
+    colors_area = ["rgba(63,185,80,0.15)" if v >= 0 else "rgba(248,81,73,0.15)"
+                   for v in df["gex_cumsum"]]
+
+    fig.add_trace(go.Scatter(
+        x=df["strike"], y=df["gex_cumsum"],
+        name="GEX Acumulado",
+        line=dict(color="#39D2C0", width=2.5),
+        fill="tozeroy", fillcolor="rgba(57,210,192,0.1)",
+        hovertemplate="Strike: $%{x:.0f}<br>GEX Acum: $%{y:.2f}M<extra></extra>"))
+
+    fig.add_vline(x=spot, line_dash="solid", line_color="#F0F6FC", line_width=2,
+                  annotation_text=f"  Spot ${spot:.0f}",
+                  annotation_font=dict(size=9, color="#F0F6FC"))
+    fig.add_hline(y=0, line_dash="dash", line_color="#D29922", line_width=2,
+                  annotation_text="  Gamma Flip Zone",
+                  annotation_font=dict(size=9, color="#D29922"))
+
+    for _, row in zero_crossings.iterrows():
+        fig.add_vline(x=row["strike"], line_dash="dot", line_color="#D29922",
+                      line_width=1.5)
+
+    flip_pct = (zero_crossings["strike"].iloc[0] / spot - 1)*100 if not zero_crossings.empty else None
+    subtitle = f"Flip en ${zero_crossings['strike'].iloc[0]:.0f} ({flip_pct:+.1f}% del spot)" if flip_pct else "Sin flip visible en rango"
+
+    fig.update_layout(
+        title=dict(text=f"<b>GEX Acumulado</b><sup>  {subtitle}</sup>",
+                   font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5),
+        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+        height=300, margin=dict(l=55, r=30, t=60, b=50),
+        xaxis=dict(title="Strike ($)", gridcolor="#21262D",
+                   tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono"), tickprefix="$"),
+        yaxis=dict(title="GEX Acum ($M)", gridcolor="#21262D",
+                   tickfont=dict(size=9, color="#8B949E"), ticksuffix="M",
+                   zeroline=True, zerolinecolor="#D29922", zerolinewidth=2),
+        showlegend=False, hovermode="x unified")
+    return fig
+
+
+def build_gex_expected_move_chart(gex_df: pd.DataFrame, chains: dict, spot: float,
+                                   strike_range_pct: float = 0.15) -> go.Figure:
+    """
+    Expected Move implícito: usa la IV ATM del vencimiento más próximo
+    para calcular el rango esperado ±1σ y ±2σ.
+    Superpone niveles GEX clave para ver si los muros actúan como límites del rango.
+    """
+    from scipy.stats import norm as _norm
+    fig = go.Figure()
+    if gex_df.empty or not chains or spot <= 0:
+        return fig
+
+    lo = spot * (1 - strike_range_pct)
+    hi = spot * (1 + strike_range_pct)
+    df = gex_df[gex_df["strike"].between(lo, hi)].sort_values("strike").copy()
+    if df.empty:
+        return fig
+
+    # GEX profile
+    colors_gex = ["#3FB950" if v >= 0 else "#F85149" for v in df["net_gex"]]
+    fig.add_trace(go.Bar(
+        x=df["strike"], y=df["net_gex"].abs(),
+        marker_color=colors_gex, opacity=0.4, name="|GEX|",
+        hovertemplate="Strike: $%{x:.0f}<br>|GEX|: $%{y:.2f}M<extra></extra>"))
+
+    # ATM IV del front month
+    front_exp = sorted(chains.keys(), key=lambda x: chains[x]["dte"])[0]
+    front_data = chains[front_exp]
+    dte_f = front_data["dte"]
+    T_f   = dte_f / 365.0
+    iv_col = "iv" if "iv" in front_data["calls"].columns else "impliedVolatility"
+    atm_c = front_data["calls"][front_data["calls"]["moneyness"].between(0.97, 1.03)]
+    atm_p = front_data["puts"][front_data["puts"]["moneyness"].between(0.97, 1.03)]
+    atm_all = pd.concat([atm_c, atm_p])
+
+    if not atm_all.empty and iv_col in atm_all.columns and T_f > 0:
+        atm_iv = float(np.average(atm_all[iv_col].values,
+                                   weights=atm_all["openInterest"].values + 1))
+        # Expected move = spot × IV × √T
+        em1 = spot * atm_iv * np.sqrt(T_f)
+        em2 = em1 * 2
+
+        for em, lbl, clr, dash in [
+            (em1, f"±1σ ({dte_f}d exp)", "#D29922", "dash"),
+            (em2, f"±2σ ({dte_f}d exp)", "#F85149", "dot"),
+        ]:
+            for sign in [1, -1]:
+                fig.add_vline(
+                    x=spot + sign*em,
+                    line_dash=dash, line_color=clr, line_width=1.5,
+                    annotation_text=f"  {lbl}" if sign > 0 else None,
+                    annotation_font=dict(size=8, color=clr, family="JetBrains Mono"))
+
+        # Agrega texto del ATM IV
+        fig.add_annotation(
+            x=hi*0.99, y=df["net_gex"].abs().max()*0.9,
+            text=f"ATM IV: {atm_iv*100:.1f}%<br>±1σ: ±${em1:.1f}",
+            showarrow=False,
+            font=dict(size=9, color="#D29922", family="JetBrains Mono"),
+            align="right")
+
+    fig.add_vline(x=spot, line_dash="solid", line_color="#F0F6FC", line_width=2,
+                  annotation_text=f"  Spot ${spot:.0f}",
+                  annotation_font=dict(size=9, color="#F0F6FC"))
+
+    fig.update_layout(
+        title=dict(text="<b>Expected Move + GEX Levels</b>"
+                        "<sup>  Rango ±1σ/±2σ vs muros de gamma</sup>",
+                   font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5),
+        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+        height=320, margin=dict(l=55, r=30, t=60, b=50),
+        xaxis=dict(title="Strike ($)", gridcolor="#21262D",
+                   tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono"), tickprefix="$"),
+        yaxis=dict(title="|GEX| ($M)", gridcolor="#21262D",
+                   tickfont=dict(size=9, color="#8B949E"), ticksuffix="M"),
+        showlegend=False, hovermode="x unified", bargap=0.1)
+    return fig
+
+
+def fit_svi_slice(strikes: np.ndarray, ivs: np.ndarray, F: float,
+                  max_iter: int = 500) -> dict | None:
+    """
+    ═══════════════════════════════════════════════════════════════════
+    MODELO: SVI — Stochastic Volatility Inspired Parametrization
+    Ref: Gatheral (2004) "A parsimonious arbitrage-free implied volatility
+         parameterization with application to the valuation of volatility
+         derivatives." Merrill Lynch Global Quantitative Research.
+    ═══════════════════════════════════════════════════════════════════
+
+    ESPECIFICACIÓN (Raw SVI):
+      w(k) = a + b·[ρ·(k-m) + √((k-m)² + σ²)]
+
+    donde:
+      k   = log-moneyness = log(K/F)
+      w   = varianza total implícita = IV² × T
+      a   = nivel general de varianza (cte)
+      b   = pendiente/curvatura total (≥0)
+      ρ   = asimetría ∈ [-1, 1]  (ρ < 0 = put skew dominante)
+      m   = centro del smile (offset de ATM)
+      σ   = suavidad del smile (curvature at-the-money)
+
+    POR QUÉ SVI ES EL MEJOR MODELO PARA ESTE PROPÓSITO:
+    ────────────────────────────────────────────────────
+    1. ARBITRAGE-FREE: Satisface condiciones de no-arbitraje butterfly
+       por construcción (Durrleman 2005) cuando b·(1+|ρ|) ≤ 2.
+
+    2. POCAS PARÁMETROS: 5 parámetros capturan toda la forma del smile
+       (nivel, pendiente, curvatura, asimetría, centrado).
+
+    3. EXTRAPOLACIÓN CORRECTA: Alcista/bajista en las colas de forma
+       consistente con modelos estocásticos de vol (Heston, SABR).
+
+    4. ESTABILIDAD: Robusto ante sparse data — interpola y extrapola
+       de forma coherente donde yfinance tiene huecos de liquidez.
+
+    5. BENCHMARK INDUSTRIA: Estándar de facto en equity vol desks
+       (Bergomi 2016, "Stochastic Volatility Modeling").
+
+    RETORNA: dict con parámetros {a, b, rho, m, sigma} + fitted_iv o None.
+    """
+    if len(strikes) < 5 or len(ivs) < 5:
+        return None
+
+    log_mon = np.log(strikes / F)
+    T_proxy = 1.0   # varianza total ~ IV² (normalizamos por T en el caller)
+    w_obs   = ivs**2 * T_proxy
+
+    def svi_w(k, a, b, rho, m, sigma):
+        disc = np.maximum((k - m)**2 + sigma**2, 1e-12)
+        return a + b * (rho*(k - m) + np.sqrt(disc))
+
+    # Constraints: a>0, b>0, |rho|<1, sigma>0, b*(1+|rho|)<=2
+    from scipy.optimize import minimize
+
+    def loss(params):
+        a, b, rho, m, sigma = params
+        if b <= 0 or sigma <= 0 or abs(rho) >= 1:
+            return 1e10
+        if b * (1 + abs(rho)) > 2:
+            return 1e10
+        w_fit = svi_w(log_mon, a, b, rho, m, sigma)
+        if np.any(w_fit < 0):
+            return 1e10
+        return float(np.sum((w_obs - w_fit)**2))
+
+    # Initial guess: ATM level, moderate skew
+    a0    = float(np.median(w_obs)) * 0.8
+    b0    = 0.1
+    rho0  = -0.3
+    m0    = 0.0
+    sig0  = 0.1
+
+    try:
+        res = minimize(loss, [a0, b0, rho0, m0, sig0],
+                       method="Nelder-Mead",
+                       options={"maxiter": max_iter, "xatol": 1e-6, "fatol": 1e-8})
+        if not res.success and res.fun > 0.1:
+            return None
+        a, b, rho, m, sigma = res.x
+        if b <= 0 or sigma <= 0 or abs(rho) >= 0.99:
+            return None
+
+        # Fitted IVs
+        w_fit = svi_w(log_mon, a, b, rho, m, sigma)
+        iv_fit = np.sqrt(np.maximum(w_fit / T_proxy, 0))
+
+        return {
+            "a": float(a), "b": float(b), "rho": float(rho),
+            "m": float(m), "sigma": float(sigma),
+            "iv_fit": iv_fit,
+            "log_mon": log_mon,
+            "r2": float(1 - np.sum((w_obs - w_fit)**2) / np.sum((w_obs - w_obs.mean())**2)),
+        }
+    except Exception:
+        return None
+
+
+def forecast_vol_surface(chains: dict, spot: float,
+                          r: float = 0.043, q: float = 0.013,
+                          iv_change_pct: float = -0.15,
+                          n_grid: int = 50) -> dict:
+    """
+    Forecasta la superficie de vol para mañana usando SVI fitted per slice.
+    Metodología:
+      1. Fittear SVI al smile actual por cada vencimiento
+      2. Modelar el cambio esperado de vol: IV_t+1 ≈ IV_t × (1 + Δ)
+         donde Δ es el escenario de cambio (default: -15%, mean-reversion).
+      3. Usar HAR-RV forecast para ajustar el nivel ATM esperado.
+      4. Identificar opciones con mayor theta positiva esperada
+         (opciones donde IV_actual >> IV_forecasted = prima vendible).
+
+    RETORNA:
+      - svi_fits: {exp_str: SVI params + fitted smile}
+      - forecast_chains: IV forecasted surface
+      - sell_candidates: top opciones con P&L esperado positivo
+    """
+    log = logging.getLogger("vix_controller")
+    F = spot * np.exp((r - q) * 30/365)   # forward ~30d
+
+    svi_fits = {}
+    for exp_str, data in chains.items():
+        dte = data["dte"]; T = dte / 365.0
+        if T <= 0: continue
+        puts_f  = data["puts"][data["puts"]["moneyness"].between(0.75, 1.02)]
+        calls_f = data["calls"][data["calls"]["moneyness"].between(0.98, 1.25)]
+        combo   = pd.concat([puts_f, calls_f]).drop_duplicates("strike").sort_values("strike")
+        iv_col  = "iv" if "iv" in combo.columns else "impliedVolatility"
+        combo   = combo[combo[iv_col].notna() & (combo[iv_col] > 0.01)]
+        if len(combo) < 5: continue
+
+        fit = fit_svi_slice(combo["strike"].values, combo[iv_col].values,
+                            F * np.exp((r-q)*T))
+        if fit:
+            svi_fits[exp_str] = {**fit, "dte": dte, "combo": combo}
+            log.info(f"SVI {exp_str}: R²={fit['r2']:.3f} ρ={fit['rho']:.3f} b={fit['b']:.3f}")
+
+    if not svi_fits:
+        return {}
+
+    # Grid de moneyness para superficie
+    k_grid = np.linspace(-0.25, 0.20, n_grid)
+
+    # Forecast: aplica cambio de vol + mean-reversion ATM
+    forecast_data = {}
+    for exp_str, fit in svi_fits.items():
+        a, b, rho, m, sigma = fit["a"], fit["b"], fit["rho"], fit["m"], fit["sigma"]
+        dte = fit["dte"]; T = dte / 365.0
+        # IV forecasted smile en el grid
+        disc    = np.maximum((k_grid - m)**2 + sigma**2, 1e-12)
+        w_fc    = a*(1+iv_change_pct) + b * (rho*(k_grid-m) + np.sqrt(disc))
+        iv_fc   = np.sqrt(np.maximum(w_fc, 0))
+        # IV actual en el mismo grid
+        w_cur   = a + b * (rho*(k_grid-m) + np.sqrt(disc))
+        iv_cur  = np.sqrt(np.maximum(w_cur, 0))
+
+        forecast_data[exp_str] = {
+            "k_grid":  k_grid,
+            "iv_cur":  iv_cur,
+            "iv_fc":   iv_fc,
+            "iv_drop": iv_cur - iv_fc,   # IV que "se derrite"
+            "dte":     dte,
+        }
+
+    # Sell candidates: buscar strikes donde IV actual >> forecasted
+    sell_candidates = []
+    for exp_str, data in chains.items():
+        if exp_str not in svi_fits: continue
+        fit = svi_fits[exp_str]
+        dte = data["dte"]; T = dte / 365.0
+        for side in ["puts", "calls"]:
+            df = data[side].copy()
+            if df.empty: continue
+            iv_col = "iv" if "iv" in df.columns else "impliedVolatility"
+            df = df[df[iv_col].notna() & (df["strike"].between(spot*0.78, spot*1.22))]
+            if df.empty: continue
+
+            for _, row in df.iterrows():
+                K   = row["strike"]; iv_c = float(row.get(iv_col, 0) or 0)
+                oi  = row["openInterest"]; mid = row.get("midPrice", 0)
+                if iv_c <= 0 or mid <= 0: continue
+
+                k_  = np.log(K / (F * np.exp((r-q)*T)))
+                disc_ = np.maximum((k_ - fit["m"])**2 + fit["sigma"]**2, 1e-12)
+                w_fc  = fit["a"]*(1+iv_change_pct) + fit["b"]*(fit["rho"]*(k_-fit["m"]) + np.sqrt(disc_))
+                iv_fc = float(np.sqrt(max(w_fc, 0)))
+
+                iv_drop_abs = iv_c - iv_fc     # cuántos puntos de vol se derriten
+                if iv_drop_abs <= 0: continue
+
+                # Vega (sensitivity to IV): dV/dIV ≈ S*√T*N'(d1)
+                from scipy.stats import norm as _norm
+                d1 = (np.log(spot/K) + (r-q+0.5*iv_c**2)*T) / (iv_c*np.sqrt(T)) if T > 0 else 0
+                vega_per_contract = spot * np.sqrt(T) * _norm.pdf(d1) * 100
+
+                # P&L esperado por vender 1 contrato si IV cae iv_drop_abs
+                pnl_expected = vega_per_contract * iv_drop_abs
+                # Theta diaria
+                theta_daily = mid * 0.015 if T > 0 else 0   # aprox
+
+                moneyness_pct = (K/spot - 1)*100
+                sell_candidates.append({
+                    "Tipo":          side[:-1].upper(),
+                    "Exp":           exp_str,
+                    "DTE":           dte,
+                    "Strike":        round(K, 0),
+                    "Dist Spot %":   round(moneyness_pct, 1),
+                    "IV Actual %":   round(iv_c*100, 1),
+                    "IV Forecast %": round(iv_fc*100, 1),
+                    "IV Drop pts":   round(iv_drop_abs*100, 2),
+                    "Vega/ct ($)":   round(vega_per_contract, 1),
+                    "P&L Esp. ($)":  round(pnl_expected, 1),
+                    "Mid $":         round(mid, 2),
+                    "OI":            int(oi),
+                })
+
+    # Ordenar por P&L esperado descendente
+    sell_df = pd.DataFrame(sell_candidates)
+    if not sell_df.empty:
+        sell_df = sell_df.sort_values("P&L Esp. ($)", ascending=False).reset_index(drop=True)
+
+    return {
+        "svi_fits":      svi_fits,
+        "forecast_data": forecast_data,
+        "sell_df":       sell_df,
+        "iv_change_pct": iv_change_pct,
+        "F":             F,
+    }
+
+
+def build_svi_smile_chart(forecast_result: dict, exp_str: str,
+                           spot: float) -> go.Figure:
+    """Smile actual vs forecasted para un vencimiento específico."""
+    fig = go.Figure()
+    if not forecast_result or "forecast_data" not in forecast_result:
+        return fig
+
+    fc = forecast_result["forecast_data"].get(exp_str)
+    fit = forecast_result["svi_fits"].get(exp_str)
+    if fc is None or fit is None:
+        return fig
+
+    k_pct = fc["k_grid"] * 100
+    iv_change_pct = forecast_result.get("iv_change_pct", -0.15)
+    dte = fc["dte"]
+
+    # Puntos observados
+    combo = fit.get("combo", pd.DataFrame())
+    iv_col = "iv" if "iv" in combo.columns else "impliedVolatility"
+    if not combo.empty and iv_col in combo.columns:
+        obs_k   = np.log(combo["strike"].values / forecast_result["F"]) * 100
+        obs_iv  = combo[iv_col].values * 100
+        fig.add_trace(go.Scatter(
+            x=obs_k, y=obs_iv, mode="markers",
+            name="Observado",
+            marker=dict(color="#8B949E", size=6, opacity=0.7),
+            hovertemplate="k: %{x:.1f}%<br>IV obs: %{y:.1f}%<extra></extra>"))
+
+    # Fitted SVI actual
+    fig.add_trace(go.Scatter(
+        x=k_pct, y=fc["iv_cur"]*100, mode="lines",
+        name="SVI Actual",
+        line=dict(color="#58A6FF", width=2.5),
+        hovertemplate="k: %{x:.1f}%<br>IV SVI: %{y:.1f}%<extra></extra>"))
+
+    # SVI Forecasted
+    fig.add_trace(go.Scatter(
+        x=k_pct, y=fc["iv_fc"]*100, mode="lines",
+        name=f"SVI Forecast ({iv_change_pct:+.0%})",
+        line=dict(color="#3FB950", width=2.5, dash="dash"),
+        hovertemplate="k: %{x:.1f}%<br>IV forecast: %{y:.1f}%<extra></extra>"))
+
+    # Área de oportunidad (IV drop)
+    fig.add_trace(go.Scatter(
+        x=list(k_pct)+list(k_pct[::-1]),
+        y=list(fc["iv_cur"]*100)+list(fc["iv_fc"]*100)[::-1],
+        fill="toself", fillcolor="rgba(63,185,80,0.12)",
+        line=dict(width=0), name="IV Drop (oportunidad)", hoverinfo="skip"))
+
+    fig.add_vline(x=0, line_dash="dash", line_color="#8B949E", line_width=1.5,
+                  annotation_text="ATM", annotation_font=dict(size=9, color="#8B949E"))
+
+    fig.update_layout(
+        title=dict(
+            text=f"<b>SVI Smile — {exp_str} ({dte}d)</b>"
+                 f"<sup>  Azul=actual · Verde=forecast · zona=oportunidad de venta</sup>",
+            font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5),
+        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+        height=350, margin=dict(l=55, r=30, t=60, b=50),
+        xaxis=dict(title="Log-moneyness k (%)", gridcolor="#21262D",
+                   tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono"), ticksuffix="%",
+                   zeroline=True, zerolinecolor="#30363D"),
+        yaxis=dict(title="IV (%)", gridcolor="#21262D",
+                   tickfont=dict(size=9, color="#8B949E"), ticksuffix="%"),
+        legend=dict(orientation="h", y=1.02, bgcolor="rgba(0,0,0,0)",
+                    font=dict(size=9, color="#C9D1D9", family="JetBrains Mono")),
+        hovermode="x unified")
+    return fig
+
+
+def build_forecast_surface_chart(forecast_result: dict, spot: float,
+                                   view: str = "drop") -> go.Figure:
+    """
+    Superficie 3D del cambio de IV (drop) esperado.
+    view='drop': Z = IV_actual - IV_forecast (cuánto se derrite)
+    view='forecast': Z = IV_forecast (nivel esperado mañana)
+    """
+    fig = go.Figure()
+    if not forecast_result or "forecast_data" not in forecast_result:
+        return fig
+
+    fc_data = forecast_result["forecast_data"]
+    if not fc_data:
+        return fig
+
+    # Construir arrays para Surface
+    dtes = sorted([v["dte"] for v in fc_data.values()])
+    k_grid = list(fc_data.values())[0]["k_grid"] * 100
+
+    Z_rows = []
+    for exp_str in sorted(fc_data.keys(), key=lambda x: fc_data[x]["dte"]):
+        fd = fc_data[exp_str]
+        if view == "drop":
+            Z_rows.append(fd["iv_drop"] * 100)
+        else:
+            Z_rows.append(fd["iv_fc"] * 100)
+
+    if not Z_rows:
+        return fig
+
+    Z = np.array(Z_rows)
+
+    colorscale = ([[0.0,"#1565C0"],[0.3,"#3FB950"],[0.6,"#D29922"],[1.0,"#F85149"]]
+                  if view == "drop" else
+                  [[0.0,"#1a237e"],[0.3,"#0288D1"],[0.6,"#3FB950"],[0.8,"#D29922"],[1.0,"#F85149"]])
+
+    fig.add_trace(go.Surface(
+        x=k_grid, y=dtes, z=Z,
+        colorscale=colorscale,
+        colorbar=dict(title=dict(text="∆IV pts" if view=="drop" else "IV%",
+                                  font=dict(color="#8B949E", size=10)),
+                      tickfont=dict(color="#8B949E", size=9), len=0.6, thickness=12),
+        hovertemplate="k: %{x:.1f}%<br>DTE: %{y}d<br>" +
+                      ("IV Drop: %{z:.1f} pts<extra></extra>" if view=="drop"
+                       else "IV Forecast: %{z:.1f}%<extra></extra>"),
+        opacity=0.9))
+
+    title_map = {
+        "drop":     "Superficie de IV Drop Esperado (oportunidad de venta)",
+        "forecast": "Superficie IV Forecasted (mañana)",
+    }
+
+    fig.update_layout(
+        title=dict(text=f"<b>{title_map.get(view,'')}</b>",
+                   font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5),
+        scene=dict(
+            xaxis=dict(title="Log-moneyness (%)", gridcolor="#30363D",
+                       backgroundcolor="#0D1117", tickfont=dict(size=9, color="#8B949E")),
+            yaxis=dict(title="DTE (días)", gridcolor="#30363D",
+                       backgroundcolor="#0D1117", tickfont=dict(size=9, color="#8B949E")),
+            zaxis=dict(title="∆IV pts" if view=="drop" else "IV %",
+                       gridcolor="#30363D", backgroundcolor="#0D1117",
+                       tickfont=dict(size=9, color="#8B949E")),
+            bgcolor="#0D1117",
+            camera=dict(eye=dict(x=-1.5, y=-1.5, z=0.9))),
+        paper_bgcolor="#0D1117", height=500, margin=dict(l=0, r=0, t=50, b=0))
+    return fig
+
+
 def compute_skew_metrics(chains: dict, spot: float) -> dict:
     """
     Métricas de skew del primer vencimiento válido usando IV Black-Scholes.
@@ -3138,6 +3849,183 @@ with tab_skew:
         f"Spot {skew_ticker}: {spot_disp} · {now_cdmx().strftime('%H:%M:%S')} CDMX"
     )
 
+    # ════════════════════════════════════════════════════════
+    # SECCIÓN: VOL SURFACE FORECAST + SELLING RECOMMENDATIONS
+    # ════════════════════════════════════════════════════════
+    st.markdown("<div style='border-top:2px solid #F7931A;margin:0.8rem 0 0.4rem'></div>",
+                unsafe_allow_html=True)
+    st.markdown("## 🔮 Forecast de Superficie + Oportunidades de Venta de Vol")
+    st.markdown("""
+    <div style="font-family:'JetBrains Mono';font-size:0.72rem;color:#8B949E;margin-bottom:0.6rem">
+    <b>Modelo: SVI (Stochastic Volatility Inspired)</b> — Gatheral (2004) ·
+    Fitea el smile actual por vencimiento con 5 parámetros (a, b, ρ, m, σ) que satisfacen
+    condiciones de no-arbitraje. Luego proyecta el smile del día siguiente según un escenario
+    de cambio de IV y calcula el <b>P&L esperado por vender prima</b>.
+    </div>""", unsafe_allow_html=True)
+
+    col_fc1, col_fc2, col_fc3 = st.columns([1, 1, 1])
+    with col_fc1:
+        iv_scenario = st.slider(
+            "Escenario: cambio de IV (%)", -40, 10, -15,
+            help="-15% = mean-reversion típica de un día con VIX elevado · 0% = sin cambio")
+    with col_fc2:
+        fc_view = st.selectbox("Vista superficie", ["IV Drop (oportunidad)", "IV Forecasted"],
+                                help="Drop = cuánto se derrite la IV · Forecast = nivel esperado")
+    with col_fc3:
+        fc_exp_sel = st.selectbox(
+            "Vencimiento para smile chart",
+            sorted(opt_chains.keys(), key=lambda x: opt_chains[x]["dte"]),
+            format_func=lambda x: f"{x} ({opt_chains[x]['dte']}d)",
+            help="Vencimiento a mostrar en el chart de smile SVI")
+
+    with st.spinner("🔮 Fittando SVI y calculando forecast…"):
+        fc_result = forecast_vol_surface(
+            opt_chains, opt_spot,
+            r=skew_rfr, q=skew_div,
+            iv_change_pct=iv_scenario/100,
+        )
+
+    if not fc_result:
+        st.warning("⚠️ No se pudo fittar el modelo SVI. Se necesitan ≥5 strikes por vencimiento.")
+    else:
+        svi_fits = fc_result.get("svi_fits", {})
+        sell_df  = fc_result.get("sell_df", pd.DataFrame())
+
+        # ── SVI model params ─────────────────────────────────
+        with st.expander("📐 Parámetros SVI por vencimiento", expanded=False):
+            st.markdown("""
+**Guía de lectura:**
+- **ρ (rho)**: asimetría del smile. ρ < 0 = put skew dominante (normal en equity). Cuanto más negativo, más pronunciado el skew bajista.
+- **b**: pendiente/curvatura total. b alto = smile muy curvado (vol de cola elevada).
+- **a**: nivel base de varianza implícita.
+- **σ**: suavidad ATM. σ bajo = smile más pronunciado en el dinero.
+- **R²**: calidad del fit (>0.90 = excelente, >0.70 = usable).
+            """)
+            rows_svi = []
+            for exp, fit in sorted(svi_fits.items(), key=lambda x: x[1]["dte"]):
+                rows_svi.append({
+                    "Vencimiento": exp, "DTE": fit["dte"],
+                    "a": round(fit["a"],4), "b": round(fit["b"],4),
+                    "ρ (rho)": round(fit["rho"],3),
+                    "m": round(fit["m"],4), "σ": round(fit["sigma"],4),
+                    "R²": round(fit.get("r2",0),3),
+                })
+            if rows_svi:
+                st.dataframe(pd.DataFrame(rows_svi), use_container_width=True, hide_index=True)
+
+        # ── Smile chart: actual vs forecasted ────────────────
+        col_sm1, col_sm2 = st.columns([1.4, 1])
+        with col_sm1:
+            try:
+                fig_smile = build_svi_smile_chart(fc_result, fc_exp_sel, opt_spot)
+                if fig_smile.data:
+                    st.plotly_chart(fig_smile, width="stretch", config=dict(displayModeBar=False))
+            except Exception as e:
+                st.error(f"Error smile chart: {e}")
+        with col_sm2:
+            # Resumen del fit para el vencimiento seleccionado
+            fit_sel = svi_fits.get(fc_exp_sel, {})
+            if fit_sel:
+                rho_s = fit_sel.get("rho", 0)
+                b_s   = fit_sel.get("b",   0)
+                r2_s  = fit_sel.get("r2",  0)
+                skew_interp = (
+                    "🔴 Put skew muy pronunciado — alta demanda de protección" if rho_s < -0.4
+                    else "🟡 Put skew moderado — skew normal de equity" if rho_s < -0.2
+                    else "🟢 Smile casi simétrico — mercado tranquilo"
+                )
+                st.markdown(f"""
+                <div class="icard" style="margin-top:1.5rem">
+                    <div class="ic-title">📐 SVI {fc_exp_sel}</div>
+                    <div class="ic-row"><span class="ic-label">ρ (asimetría)</span>
+                        <span class="ic-val">{rho_s:.3f}</span></div>
+                    <div class="ic-row"><span class="ic-label">b (curvatura)</span>
+                        <span class="ic-val">{b_s:.4f}</span></div>
+                    <div class="ic-row"><span class="ic-label">R² del fit</span>
+                        <span class="ic-val" style="color:{'var(--g)' if r2_s>0.85 else 'var(--y)'}">{r2_s:.3f}</span></div>
+                    <div class="ic-row"><span class="ic-label">Escenario</span>
+                        <span class="ic-val">{iv_scenario:+.0f}% IV</span></div>
+                    <div class="ic-row" style="margin-top:0.4rem">
+                        <span style="font-size:0.78rem;color:var(--t)">{skew_interp}</span>
+                    </div>
+                </div>""", unsafe_allow_html=True)
+
+        # ── Superficie forecasted ─────────────────────────────
+        try:
+            fc_view_key = "drop" if "Drop" in fc_view else "forecast"
+            fig_fc_surf = build_forecast_surface_chart(fc_result, opt_spot, view=fc_view_key)
+            if fig_fc_surf.data:
+                st.plotly_chart(fig_fc_surf, width="stretch", config=dict(displayModeBar=True))
+        except Exception as e:
+            st.error(f"Error forecast surface: {e}")
+
+        # ── Selling recommendations ───────────────────────────
+        st.markdown("### 🎯 Opciones Candidatas para Vender Prima")
+        st.markdown(f"""
+        <div style="font-family:'JetBrains Mono';font-size:0.72rem;color:#8B949E;margin-bottom:0.5rem">
+        Ordenadas por <b>P&L esperado</b> si la IV cae <b>{iv_scenario:+.0f}%</b> hacia el nivel SVI forecasted.
+        P&L = Vega × ΔIV · Solo muestra opciones OTM dentro de ±22% del spot con OI > 0.
+        </div>""", unsafe_allow_html=True)
+
+        if not sell_df.empty:
+            # Top 20
+            top_sell = sell_df.head(20).copy()
+            # Color coding
+            def _style_sell(df):
+                styles = pd.DataFrame("", index=df.index, columns=df.columns)
+                for i in df.index:
+                    if df.loc[i,"Tipo"] == "PUT":
+                        styles.loc[i,"Tipo"] = "color: #39D2C0"
+                    else:
+                        styles.loc[i,"Tipo"] = "color: #BC8CFF"
+                    if df.loc[i,"P&L Esp. ($)"] > 50:
+                        styles.loc[i,"P&L Esp. ($)"] = "color: #3FB950; font-weight:bold"
+                    elif df.loc[i,"P&L Esp. ($)"] > 20:
+                        styles.loc[i,"P&L Esp. ($)"] = "color: #D29922"
+                return styles
+
+            st.dataframe(
+                top_sell.style.apply(_style_sell, axis=None).format({
+                    "Strike": "${:.0f}",
+                    "Dist Spot %": "{:+.1f}%",
+                    "IV Actual %": "{:.1f}%",
+                    "IV Forecast %": "{:.1f}%",
+                    "IV Drop pts": "{:.2f}",
+                    "Vega/ct ($)": "${:.0f}",
+                    "P&L Esp. ($)": "${:.0f}",
+                    "Mid $": "${:.2f}",
+                }),
+                use_container_width=True, hide_index=True
+            )
+
+            # ── Best trade summary ────────────────────────────
+            best = sell_df.iloc[0]
+            st.markdown(f"""
+            <div style="background:var(--gbg);border:1px solid var(--g);border-radius:6px;
+                        padding:0.7rem 1rem;margin-top:0.5rem">
+                <div style="font-family:Inter;font-weight:800;font-size:1rem;color:var(--g)">
+                    🎯 MEJOR CANDIDATO</div>
+                <div style="font-family:'JetBrains Mono';font-size:0.8rem;color:#C9D1D9;margin-top:0.3rem">
+                    <b>Vender {best['Tipo']} K=${best['Strike']:.0f} exp {best['Exp']} ({best['DTE']}d)</b>
+                    · Dist spot: {best['Dist Spot %']:+.1f}%<br>
+                    IV actual: {best['IV Actual %']:.1f}% → IV forecast: {best['IV Forecast %']:.1f}%
+                    → Drop esperado: <b>{best['IV Drop pts']:.2f} pts</b><br>
+                    Mid: ${best['Mid $']:.2f} · OI: {best['OI']:,} · Vega/ct: ${best['Vega/ct ($)']:.0f}
+                    · <b>P&L esperado: ${best['P&L Esp. ($)']:.0f}/contrato</b>
+                </div>
+                <div style="font-family:'JetBrains Mono';font-size:0.65rem;color:#8B949E;margin-top:0.3rem">
+                ⚠️ Solo análisis educativo. No es recomendación financiera.
+                El P&L esperado asume que la IV cae exactamente {iv_scenario:+.0f}% — nada garantizado.
+                </div>
+            </div>""", unsafe_allow_html=True)
+        else:
+            st.info("No se encontraron candidatos con P&L positivo bajo el escenario seleccionado.")
+
+    st.caption(
+        f"SVI: Gatheral (2004) · No-arbitrage butterfly condition: b(1+|ρ|)≤2 · "
+        f"Vega = S·√T·N'(d₁)·100 · Opciones con OI>0 en ±22% del spot"
+    )
+
 
 # ━━━━━━━━━━━━━━━━━ TAB: GEX — GAMMA EXPOSURE ━━━━━━━━━━━━━━━
 with tab_gex:
@@ -3280,66 +4168,91 @@ with tab_gex:
     st.markdown("<div style='border-top:1px solid #30363D;margin:0.5rem 0'></div>",
                 unsafe_allow_html=True)
 
-    # ── GEX Profile + GEX por vencimiento ────────────────────
+    # ── Chart 1: GEX Profile (principal) ────────────────────
     try:
-        fig_gex = build_gex_profile_chart(
-            gex_df, gex_spot, gex_summary,
-            ticker=gex_ticker,
-            strike_range_pct=gex_range / 100,
-        )
+        fig_gex = build_gex_profile_chart(gex_df, gex_spot, gex_summary,
+                                           ticker=gex_ticker,
+                                           strike_range_pct=gex_range/100)
         if fig_gex.data:
             st.plotly_chart(fig_gex, width="stretch",
                             config=dict(displayModeBar=True,
-                                        modeBarButtonsToRemove=["lasso2d", "select2d"]))
-        else:
-            st.info("No hay datos GEX en el rango de strikes seleccionado.")
+                                        modeBarButtonsToRemove=["lasso2d","select2d"]))
     except Exception as e:
         st.error(f"Error GEX profile: {e}")
 
-    col_gx1, col_gx2 = st.columns([1, 1])
-    with col_gx1:
+    # ── Chart 2: Expected Move + GEX levels ──────────────────
+    try:
+        fig_em = build_gex_expected_move_chart(gex_df, gex_chains_use, gex_spot,
+                                                strike_range_pct=gex_range/100)
+        if fig_em.data:
+            st.plotly_chart(fig_em, width="stretch", config=dict(displayModeBar=False))
+    except Exception as e:
+        st.error(f"Error Expected Move: {e}")
+
+    # ── Charts 3 & 4: DEX + Cumulative GEX ──────────────────
+    col_dex, col_cum = st.columns(2)
+    with col_dex:
         try:
-            fig_gex_exp = build_gex_by_expiry_chart(
-                gex_chains_use, gex_spot, r=gex_rfr, q=gex_div
-            )
+            fig_dex = build_gex_delta_exposure_chart(gex_chains_use, gex_spot,
+                                                      r=gex_rfr, q=gex_div,
+                                                      strike_range_pct=gex_range/100)
+            if fig_dex.data:
+                st.plotly_chart(fig_dex, width="stretch", config=dict(displayModeBar=False))
+        except Exception as e:
+            st.error(f"Error DEX: {e}")
+    with col_cum:
+        try:
+            fig_cum = build_gex_cumulative_chart(gex_df, gex_spot,
+                                                  strike_range_pct=gex_range/100)
+            if fig_cum.data:
+                st.plotly_chart(fig_cum, width="stretch", config=dict(displayModeBar=False))
+        except Exception as e:
+            st.error(f"Error GEX Acumulado: {e}")
+
+    # ── Charts 5 & 6: Vanna/Charm + GEX por vencimiento ─────
+    col_vc, col_exp = st.columns(2)
+    with col_vc:
+        try:
+            fig_vc = build_gex_vanna_charm_chart(gex_chains_use, gex_spot,
+                                                   r=gex_rfr, q=gex_div,
+                                                   strike_range_pct=gex_range/100)
+            if fig_vc.data:
+                st.plotly_chart(fig_vc, width="stretch", config=dict(displayModeBar=False))
+        except Exception as e:
+            st.error(f"Error Vanna/Charm: {e}")
+    with col_exp:
+        try:
+            fig_gex_exp = build_gex_by_expiry_chart(gex_chains_use, gex_spot,
+                                                     r=gex_rfr, q=gex_div)
             if fig_gex_exp.data:
-                st.plotly_chart(fig_gex_exp, width="stretch",
-                                config=dict(displayModeBar=False))
+                st.plotly_chart(fig_gex_exp, width="stretch", config=dict(displayModeBar=False))
         except Exception as e:
             st.error(f"Error GEX por vencimiento: {e}")
 
-    with col_gx2:
-        # Mini-tabla: top 10 strikes por |GEX|
-        lo_rng = gex_spot * (1 - gex_range / 100)
-        hi_rng = gex_spot * (1 + gex_range / 100)
+    # ── Tabla de strikes clave ────────────────────────────────
+    with st.expander("📋 Top strikes por |GEX|"):
+        lo_rng = gex_spot * (1 - gex_range/100)
+        hi_rng = gex_spot * (1 + gex_range/100)
         top_strikes = (
             gex_df[gex_df["strike"].between(lo_rng, hi_rng)]
             .assign(abs_gex=lambda x: x["net_gex"].abs())
-            .nlargest(12, "abs_gex")
-            .sort_values("strike")[["strike", "calls_gex", "puts_gex", "net_gex"]]
-            .rename(columns={
-                "strike": "Strike", "calls_gex": "GEX Calls ($M)",
-                "puts_gex": "GEX Puts ($M)", "net_gex": "Net GEX ($M)",
-            })
+            .nlargest(15, "abs_gex")
+            .sort_values("strike")
+            [["strike","calls_gex","puts_gex","net_gex"]]
+            .rename(columns={"strike":"Strike","calls_gex":"GEX Calls ($M)",
+                              "puts_gex":"GEX Puts ($M)","net_gex":"Net GEX ($M)"})
         )
         if not top_strikes.empty:
-            st.markdown("**Top strikes por |GEX| en rango**")
-            st.dataframe(
-                top_strikes.style.format({
-                    "Strike": "${:.0f}",
-                    "GEX Calls ($M)": "${:.2f}M",
-                    "GEX Puts ($M)":  "${:.2f}M",
-                    "Net GEX ($M)":   "${:+.2f}M",
-                }),
-                use_container_width=True,
-                hide_index=True,
-            )
+            st.dataframe(top_strikes.style.format({
+                "Strike":"${:.0f}","GEX Calls ($M)":"${:.2f}M",
+                "GEX Puts ($M)":"${:.2f}M","Net GEX ($M)":"${:+.2f}M"}),
+                use_container_width=True, hide_index=True)
 
     st.caption(
-        f"GEX = OI × Gamma_BS × S² × 100 × 1% · "
-        f"Fuente: opciones {gex_ticker} vía Yahoo Finance · "
-        f"r={gex_rfr:.1%} · q={gex_div:.1%} · "
-        f"{now_cdmx().strftime('%H:%M:%S')} CDMX"
+        f"GEX/DEX = OI × Greeks_BS × S² × 100 · "
+        f"Vanna = ∂Δ/∂σ · Charm = ∂Δ/∂t · "
+        f"Max Pain = mínima pérdida agregada de holders · "
+        f"r={gex_rfr:.1%} q={gex_div:.1%} · {now_cdmx().strftime('%H:%M:%S')} CDMX"
     )
 
 
