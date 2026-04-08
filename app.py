@@ -1475,29 +1475,38 @@ def compute_edge_analytics(df, edge_extra):
         bt['Roll_Yield'] = np.where(valid, (m1 - spot) / m1 * (365 / dte) * 100, np.nan)
 
     # ── VVIX live desde yfinance ────────────────────────────────────
+    # Nota: bt puede ya tener VVIX_Live de fetch_live_spy_vix → no re-join
     if 'VVIX' in edge_extra and not edge_extra['VVIX'].empty:
         vvix_s = edge_extra['VVIX'][['Close']].rename(columns={'Close': 'VVIX_Live'})
-        bt = bt.join(vvix_s, how='left')
-        if 'VVIX_Live' in bt.columns:
-            bt['VVIX_VIX'] = np.where(
-                (bt['VIX_Close'] > 0) & bt['VVIX_Live'].notna(),
-                bt['VVIX_Live'] / bt['VIX_Close'], np.nan
-            )
+        if 'VVIX_Live' not in bt.columns:
+            bt = bt.join(vvix_s, how='left')
+        else:
+            # Actualizar NaN del parquet con datos del edge_extra (más completos en historia)
+            bt['VVIX_Live'] = bt['VVIX_Live'].fillna(vvix_s['VVIX_Live'])
+        bt['VVIX_VIX'] = np.where(
+            (bt['VIX_Close'] > 0) & bt['VVIX_Live'].notna(),
+            bt['VVIX_Live'] / bt['VIX_Close'], np.nan
+        )
     elif 'VVIX_Close' in bt.columns:
-        # fallback: parquet
         bt['VVIX_VIX'] = np.where(bt['VIX_Close'] > 0, bt['VVIX_Close'] / bt['VIX_Close'], np.nan)
 
     # ── SKEW live ───────────────────────────────────────────────────
     if 'SKEW' in edge_extra and not edge_extra['SKEW'].empty:
         skew_s = edge_extra['SKEW'][['Close']].rename(columns={'Close': 'SKEW'})
-        bt = bt.join(skew_s, how='left')
-        log.info(f"SKEW joined: {bt['SKEW'].notna().sum()} valid rows" if 'SKEW' in bt.columns else "SKEW join failed")
+        if 'SKEW' not in bt.columns:
+            bt = bt.join(skew_s, how='left')
+        else:
+            bt['SKEW'] = bt['SKEW'].fillna(skew_s['SKEW'])
+        log.info(f"SKEW: {bt['SKEW'].notna().sum()} valid rows")
 
     # ── Credit Spread live (HYG vs IEF) ─────────────────────────────
     if 'HYG' in edge_extra and 'IEF' in edge_extra:
         hyg = edge_extra['HYG'][['Close']].rename(columns={'Close': 'HYG'})
         ief = edge_extra['IEF'][['Close']].rename(columns={'Close': 'IEF'})
-        bt = bt.join(hyg, how='left').join(ief, how='left')
+        if 'HYG' not in bt.columns:
+            bt = bt.join(hyg, how='left')
+        if 'IEF' not in bt.columns:
+            bt = bt.join(ief, how='left')
         if 'HYG' in bt.columns and 'IEF' in bt.columns:
             bt['Credit_Spread'] = -(
                 bt['HYG'].pct_change().rolling(20).sum() -
