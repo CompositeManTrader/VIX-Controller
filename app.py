@@ -1213,96 +1213,228 @@ COT_LEGACY_ID  = "6dca-aqww"                     # Legacy (si disagg falla)
 
 
 @st.cache_data(ttl=3600 * 6)  # 6h — datos semanales, no cambian intraday
-def _compute_har_rv(spy_close: pd.Series, vix_close: pd.Series,
-                    window: int = 252, h: int = 22) -> pd.DataFrame:
+
+@st.cache_data(ttl=55)
+def fetch_live_spy_vix() -> pd.DataFrame:
     """
-    HAR-RV (Heterogeneous Autoregressive Realized Volatility) model.
-    Ref: Corsi (2009) — A Simple Approximate Long-Memory Model of Realized Volatility.
-
-    El VIX es una medida de volatilidad IMPLÍCITA futura (30 días calendario).
-    El RV20 trailing es volatilidad PASADA — compararlo directamente con VIX es incorrecto
-    porque mezcla horizontes temporales distintos.
-
-    Solución HAR-RV:
-      E[RV_{t,t+h}] = β₀ + β₁·RV_d + β₂·RV_w + β₃·RV_m + ε
-    donde:
-      RV_d = volatilidad diaria (|r_t| × √252 × 100)
-      RV_w = media de RV_d en los últimos 5 días (horizonte semanal)
-      RV_m = media de RV_d en los últimos 22 días (horizonte mensual)
-      h    = 22 días hábiles ≈ 30 días calendario (mismo horizonte que VIX)
-
-    VRP_HAR = VIX_t - E[RV_{t,t+h}]  (prima de riesgo de volatilidad verdadera)
+    Extiende el parquet con datos SPY y VIX de los últimos 45 días.
+    Soluciona el gap entre la última fecha del parquet y hoy.
+    TTL=55s → misma cadencia que los precios de futuros.
     """
+    log = logging.getLogger("vix_controller")
+    frames = {}
+    for col, sym in [("SPY_Close", "SPY"), ("VIX_Close", "^VIX"),
+                     ("VVIX_Live", "^VVIX")]:
+        try:
+            h = yf.Ticker(sym).history(period="45d")
+            if h.empty:
+                continue
+            s = h["Close"].copy()
+            if hasattr(s.index, "tz") and s.index.tz is not None:
+                s.index = s.index.tz_localize(None)
+            s.index = pd.DatetimeIndex(s.index).normalize()
+            frames[col] = s
+        except Exception as ex:
+            log.warning(f"fetch_live_spy_vix {sym}: {ex}")
+    if "SPY_Close" in frames and "VIX_Close" in frames:
+        df = pd.DataFrame(frames)
+        log.info(f"Live extension: {len(df)} rows, last={df.index[-1].date()}")
+        return df
+    return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600)
+def _compute_har_rv_asymmetric(spy_close: pd.Series, vix_close: pd.Series,
+                                window: int = 252, h: int = 22) -> dict:
+    """
+    ════════════════════════════════════════════════════════════════
+    MODELO: HAR-RV-A — Heterogeneous Autoregressive Realized
+            Volatility with Asymmetry (Good/Bad Volatility)
+    ════════════════════════════════════════════════════════════════
+
+    REFERENCIA: Patton & Sheppard (2015) "Good Volatility, Bad Volatility:
+    Signed Jumps and the Persistence of Volatility"
+    Review of Economics and Statistics, 97(3), 683-697.
+
+    POR QUÉ ES EL MEJOR MODELO PARA ESTE PROPÓSITO:
+    ─────────────────────────────────────────────────
+    1. EFECTO LEVERAGE: Las caídas del mercado (ret < 0) generan más vol
+       futura que subidas de igual magnitud. HAR ignora esto; HAR-A lo captura
+       separando "buena vol" (días up) de "mala vol" (días down).
+
+    2. PARSIMONIA: 5 parámetros estimables con OLS simple. GARCH requiere MLE.
+       EGARCH más complejo aún. HAR-A es comparablemente preciso con menos costo.
+
+    3. MEMORIA LARGA: Las tres frecuencias (daily/weekly/monthly) capturan la
+       persistencia fraccional de la vol sin ARFIMA.
+
+    4. EVIDENCIA EMPÍRICA: Supera HAR, GARCH, EGARCH en la mayoría de mercados
+       de renta variable en QLIKE y RMSE OOS (Patton & Sheppard 2015).
+
+    5. HORIZONTE CORRECTO: Predice E[RV_{t,t+22d}] que matchea el VIX
+       (~30 días calendario). RV20 trailing NO hace esto.
+
+    ESPECIFICACIÓN:
+    ─────────────────────────────────────────────────
+    RV_{t+h} = β₀ + β₁·GV_d + β₂·BV_d + β₃·RV_w + β₄·RV_m + ε
+
+      GV_d = |rₜ|·√252·100  si rₜ > 0, else 0  (good vol — días alcistas)
+      BV_d = |rₜ|·√252·100  si rₜ ≤ 0, else 0  (bad vol  — días bajistas)
+      RV_w = (GV_d+BV_d) promedio últimos 5d
+      RV_m = (GV_d+BV_d) promedio últimos 22d
+      h    = 22 días hábiles ≈ 30 días calendario
+
+    Empíricamente: β₂ > β₁ → bad vol más persistente = leverage effect.
+    """
+    log = logging.getLogger("vix_controller")
     log_ret = np.log(spy_close / spy_close.shift(1))
 
-    # Componentes HAR: vol diaria, semanal, mensual (annualizada, en %)
-    rv_d = log_ret.abs() * np.sqrt(252) * 100
-    rv_w = rv_d.rolling(5,  min_periods=3).mean()
-    rv_m = rv_d.rolling(22, min_periods=10).mean()
-
-    # Variable objetivo: RV promedio h días hacia adelante (lo que VIX predice)
+    rv_tot = log_ret.abs() * np.sqrt(252) * 100
+    gv_d   = pd.Series(np.where(log_ret > 0,  rv_tot, 0.0), index=spy_close.index)
+    bv_d   = pd.Series(np.where(log_ret <= 0, rv_tot, 0.0), index=spy_close.index)
+    rv_w   = rv_tot.rolling(5,  min_periods=3).mean()
+    rv_m   = rv_tot.rolling(22, min_periods=10).mean()
     rv_fwd = log_ret.rolling(h, min_periods=int(h*0.8)).std().shift(-h) * np.sqrt(252) * 100
 
-    n = len(spy_close)
-    rv_d_a = rv_d.values
-    rv_w_a = rv_w.values
-    rv_m_a = rv_m.values
-    rv_f_a = rv_fwd.values
+    n    = len(spy_close)
+    gv_a = gv_d.values; bv_a = bv_d.values
+    rw_a = rv_w.values; rm_a = rv_m.values
+    rvf_a= rv_fwd.values; rt_a = rv_tot.values
 
-    forecasts = np.full(n, np.nan)
-    betas_log  = []           # Para diagnóstico / expander
+    forecasts  = np.full(n, np.nan)
+    betas_hist = []
 
-    for i in range(window + 22, n - h):
+    for i in range(window + 22, n):    # sin -h: predecimos hasta hoy inclusive
         t0 = i - window
-        X = np.column_stack([
-            np.ones(window),
-            rv_d_a[t0:i],
-            rv_w_a[t0:i],
-            rv_m_a[t0:i],
-        ])
-        y = rv_f_a[t0:i]
-        valid = np.isfinite(X).all(axis=1) & np.isfinite(y)
-        if valid.sum() < 60:
+        X  = np.column_stack([np.ones(window),
+                               gv_a[t0:i], bv_a[t0:i],
+                               rw_a[t0:i], rm_a[t0:i]])
+        y  = rvf_a[t0:i]
+        ok = np.isfinite(X).all(axis=1) & np.isfinite(y)
+        if ok.sum() < 60:
             continue
-        beta, _, _, _ = np.linalg.lstsq(X[valid], y[valid], rcond=None)
-        x_i = np.array([1.0, rv_d_a[i], rv_w_a[i], rv_m_a[i]])
-        if np.isfinite(x_i).all():
-            fc = float(np.dot(beta, x_i))
-            forecasts[i] = max(fc, 1.0)   # vol no puede ser negativa
-            betas_log.append(beta)
+        beta, _, _, _ = np.linalg.lstsq(X[ok], y[ok], rcond=None)
+        xi = np.array([1.0, gv_a[i], bv_a[i], rw_a[i], rm_a[i]])
+        if np.isfinite(xi).all():
+            forecasts[i] = max(float(np.dot(beta, xi)), 1.0)
+        betas_hist.append(beta.copy())
+
+    # ── Out-of-sample backtest — últimos 504 días como test ────────
+    test_start = max(window + 22, n - 504)
+    # Para el backtest necesitamos rv_fwd (que requiere h días futuros)
+    # Solo evaluamos donde hay tanto forecast como rv_fwd disponible
+    fc_s  = forecasts[test_start:n-h]
+    rv_s  = rvf_a[test_start:n-h]
+    ok_bt = np.isfinite(fc_s) & np.isfinite(rv_s)
+    fc_bt = fc_s[ok_bt]; rv_bt = rv_s[ok_bt]
+    idx_bt= spy_close.index[test_start:n-h][ok_bt]
+
+    backtest = {}
+    if len(fc_bt) >= 30:
+        ss_res = np.sum((rv_bt - fc_bt)**2)
+        ss_tot = np.sum((rv_bt - rv_bt.mean())**2)
+        r2_oos = 1.0 - ss_res/ss_tot if ss_tot > 0 else np.nan
+        rmse   = float(np.sqrt(np.mean((rv_bt - fc_bt)**2)))
+        mae    = float(np.mean(np.abs(rv_bt - fc_bt)))
+        # QLIKE: log(f²) + rv²/f² — penaliza subestimación asimétricamente
+        eps    = 1e-6
+        qlike  = float(np.mean(np.log(np.maximum(fc_bt,eps)**2) + rv_bt**2/np.maximum(fc_bt,eps)**2))
+        # Dirección (¿sube o baja?)
+        dir_acc= float(np.mean(np.sign(np.diff(rv_bt)) == np.sign(np.diff(fc_bt)))*100) if len(fc_bt) > 1 else np.nan
+        # Mincer-Zarnowitz: RV_actual = a + b*forecast + ε  (ideal: a≈0, b≈1)
+        Xmz = np.column_stack([np.ones(len(fc_bt)), fc_bt])
+        mz_b, _, _, _ = np.linalg.lstsq(Xmz, rv_bt, rcond=None)
+
+        # Benchmarks
+        ewma_arr = np.full(n, np.nan); ewma = 0.0
+        for j in range(n):
+            ewma = 0.94*ewma + 0.06*rt_a[j]**2 if np.isfinite(rt_a[j]) else ewma
+            ewma_arr[j] = np.sqrt(ewma*252) if ewma > 0 else np.nan
+        ew_bt = ewma_arr[test_start:n-h][ok_bt]
+        rm_bt = rm_a[test_start:n-h][ok_bt]
+
+        def _rmse_b(f, a): return float(np.sqrt(np.nanmean((np.where(np.isfinite(f),a-f,np.nan))**2)))
+        def _r2_b(f, a):
+            mask=np.isfinite(f); ss=np.nansum((a[mask]-f[mask])**2)
+            tot=np.nansum((a[mask]-a[mask].mean())**2)
+            return float(1-ss/tot) if tot>0 else np.nan
+
+        backtest = {
+            'r2_oos':     round(float(r2_oos), 4),
+            'rmse':       round(rmse, 3),
+            'mae':        round(mae, 3),
+            'qlike':      round(qlike, 4),
+            'dir_acc':    round(dir_acc, 1),
+            'mz_alpha':   round(float(mz_b[0]), 3),
+            'mz_beta':    round(float(mz_b[1]), 3),
+            'n_test':     int(len(fc_bt)),
+            'rmse_naive': round(_rmse_b(rm_bt, rv_bt), 3),
+            'rmse_ewma':  round(_rmse_b(ew_bt, rv_bt), 3),
+            'r2_naive':   round(_r2_b(rm_bt, rv_bt), 4),
+            'r2_ewma':    round(_r2_b(ew_bt, rv_bt), 4),
+            'fc_test':    fc_bt.tolist(),
+            'rv_test':    rv_bt.tolist(),
+            'idx_test':   [str(d.date()) for d in idx_bt],
+        }
+        log.info(f"HAR-A BT: R²={r2_oos:.3f} RMSE={rmse:.2f} n={len(fc_bt)}")
+
+    last_beta = betas_hist[-1] if betas_hist else None
+    beta_dict = {}
+    if last_beta is not None:
+        beta_dict = {
+            'β₀ intercepto': round(float(last_beta[0]), 3),
+            'β₁ GoodVol':    round(float(last_beta[1]), 3),
+            'β₂ BadVol':     round(float(last_beta[2]), 3),
+            'β₃ RV_weekly':  round(float(last_beta[3]), 3),
+            'β₄ RV_monthly': round(float(last_beta[4]), 3),
+        }
 
     idx = spy_close.index
-    result = pd.DataFrame(index=idx)
-    result['rv_d']        = rv_d.values
-    result['rv_w']        = rv_w.values
-    result['rv_m']        = rv_m.values
-    result['rv_fwd']      = rv_fwd.values      # Realized vol futura (solo conocible ex-post)
-    result['har_forecast']= forecasts           # E[RV_futura] del modelo HAR
-    result['vix']         = vix_close.values
-    result['vrp_har']     = vix_close.values - forecasts
-    result['vrp_rv20']    = vix_close.values - rv_m.values   # definición tradicional (referencia)
+    df_out = pd.DataFrame({
+        'rv_tot':         rt_a,
+        'gv_d':           gv_d.values,
+        'bv_d':           bv_d.values,
+        'rv_w':           rw_a,
+        'rv_m':           rm_a,
+        'rv_fwd':         rvf_a,
+        'har_a_forecast': forecasts,
+        'vix':            vix_close.values,
+        'vrp_har_a':      vix_close.values - forecasts,
+    }, index=idx)
 
-    # Últimos coeficientes para el expander de diagnóstico
-    if betas_log:
-        last_beta = betas_log[-1]
-        result.attrs['har_beta'] = {
-            'β0 (intercepto)': round(float(last_beta[0]), 3),
-            'β1 (RV diaria)':  round(float(last_beta[1]), 3),
-            'β2 (RV semanal)': round(float(last_beta[2]), 3),
-            'β3 (RV mensual)': round(float(last_beta[3]), 3),
-        }
-    return result
+    return {'df': df_out, 'beta': beta_dict, 'backtest': backtest}
 
 
 def compute_edge_analytics(df, edge_extra):
     log = logging.getLogger("vix_controller")
     out = {}
 
-    # Normalizar índice del parquet a UTC-naive para joins seguros
+    # ── Normalizar índice del parquet ────────────────────────────────
     bt = df[df['VIX_Close'].notna() & df['SPY_Close'].notna()].copy()
     if bt.index.tz is not None:
         bt.index = bt.index.tz_localize(None)
     bt.index = pd.DatetimeIndex(bt.index).normalize()
+
+    # ── EXTENSIÓN LIVE: rellenar gap parquet → hoy ───────────────────
+    try:
+        live_ext = fetch_live_spy_vix()
+        if not live_ext.empty:
+            cutoff = bt.index[-1]
+            new_rows = live_ext[live_ext.index > cutoff].copy()
+            if not new_rows.empty:
+                # Solo llevar las columnas SPY_Close, VIX_Close (y VVIX_Live si existe)
+                for col in ['SPY_Close', 'VIX_Close']:
+                    if col in new_rows.columns:
+                        pass  # se añaden via concat
+                bt = pd.concat([bt, new_rows[new_rows.columns.intersection(bt.columns.tolist() + ['SPY_Close','VIX_Close','VVIX_Live'])]])
+                bt = bt[~bt.index.duplicated(keep='last')].sort_index()
+                # Si hay VVIX_Live en la extensión, mantenerlo en bt
+                if 'VVIX_Live' in new_rows.columns and 'VVIX_Live' not in bt.columns:
+                    bt['VVIX_Live'] = np.nan
+                    bt.update(new_rows[['VVIX_Live']])
+                log.info(f"Live extension: +{len(new_rows)} rows → bt ends {bt.index[-1].date()}")
+    except Exception as ex:
+        log.warning(f"Live extension failed: {ex}")
 
     if len(bt) < 60:
         return out
@@ -1312,23 +1444,27 @@ def compute_edge_analytics(df, edge_extra):
     bt['RV10'] = log_ret.rolling(10).std() * np.sqrt(252) * 100
     bt['RV20'] = log_ret.rolling(20).std() * np.sqrt(252) * 100
     bt['RV60'] = log_ret.rolling(60).std() * np.sqrt(252) * 100
-    bt['VRP']  = bt['VIX_Close'] - bt['RV20']   # definición tradicional (mantenida para compatibilidad)
+    bt['VRP']  = bt['VIX_Close'] - bt['RV20']
 
-    # ── HAR-RV: VRP correctamente definido ──────────────────────────
+    # ── HAR-RV-A: modelo asimétrico (Patton & Sheppard 2015) ─────────
     try:
-        har_df = _compute_har_rv(bt['SPY_Close'], bt['VIX_Close'])
-        bt['HAR_Forecast'] = har_df['har_forecast'].values
-        bt['VRP_HAR']      = har_df['vrp_har'].values
+        har_result = _compute_har_rv_asymmetric(bt['SPY_Close'], bt['VIX_Close'])
+        har_df         = har_result['df']
+        bt['HAR_Forecast'] = har_df['har_a_forecast'].values
+        bt['VRP_HAR']      = har_df['vrp_har_a'].values
         bt['RV_Fwd_22']    = har_df['rv_fwd'].values
-        out['har_beta']    = har_df.attrs.get('har_beta', {})
-        log.info("HAR-RV model computed OK")
+        bt['GV_d']         = har_df['gv_d'].values   # good vol
+        bt['BV_d']         = har_df['bv_d'].values   # bad vol
+        out['har_beta']    = har_result['beta']
+        out['har_backtest']= har_result['backtest']
+        log.info("HAR-A model OK")
     except Exception as e:
-        log.warning(f"HAR-RV error: {e}")
+        log.warning(f"HAR-A error: {e}")
         bt['HAR_Forecast'] = np.nan
-        bt['VRP_HAR']      = bt['VRP']   # fallback a definición tradicional
+        bt['VRP_HAR']      = bt['VRP']
 
-    # VRP percentile (usa VRP_HAR si disponible)
-    vrp_col = 'VRP_HAR' if 'VRP_HAR' in bt.columns else 'VRP'
+    # VRP percentile (usa HAR si disponible)
+    vrp_col = 'VRP_HAR' if 'VRP_HAR' in bt.columns and bt['VRP_HAR'].notna().sum() > 20 else 'VRP'
     vrp_2y = bt[vrp_col].tail(504).dropna()
     if len(vrp_2y) > 20:
         out['vrp_percentile'] = round((vrp_2y < vrp_2y.iloc[-1]).mean() * 100, 0)
@@ -1483,6 +1619,94 @@ def build_vrp_chart(bt, window=252):
                     font=dict(size=9, color='#C9D1D9', family='JetBrains Mono')),
         hovermode='x unified', bargap=0)
     return fig
+
+
+def build_har_backtest_charts(backtest: dict) -> tuple:
+    """
+    Retorna dos figuras:
+    1. Time-series: HAR-A forecast vs RV realizada (test set)
+    2. Scatter Mincer-Zarnowitz: predicho vs actual
+    """
+    if not backtest or 'fc_test' not in backtest:
+        return go.Figure(), go.Figure()
+
+    fc  = np.array(backtest['fc_test'])
+    rv  = np.array(backtest['rv_test'])
+    idx = pd.to_datetime(backtest['idx_test'])
+
+    # ── Fig 1: Time-series ─────────────────────────────────────────
+    fig_ts = go.Figure()
+    fig_ts.add_trace(go.Scatter(
+        x=idx, y=rv, name='RV Realizada (ex-post, 22d)',
+        line=dict(color='#39D2C0', width=2),
+        hovertemplate='%{x|%Y-%m-%d}<br>RV real: %{y:.1f}%<extra></extra>'))
+    fig_ts.add_trace(go.Scatter(
+        x=idx, y=fc, name='HAR-A Forecast',
+        line=dict(color='#F0883E', width=2, dash='dash'),
+        hovertemplate='HAR-A: %{y:.1f}%<extra></extra>'))
+    # Error band
+    err = fc - rv
+    fig_ts.add_trace(go.Scatter(
+        x=list(idx)+list(idx[::-1]),
+        y=list(np.maximum(fc,rv))+list(np.minimum(fc,rv)[::-1]),
+        fill='toself', fillcolor='rgba(240,136,62,0.08)',
+        line=dict(width=0), name='Error band', hoverinfo='skip'))
+    r2   = backtest.get('r2_oos', np.nan)
+    rmse = backtest.get('rmse', np.nan)
+    fig_ts.update_layout(
+        title=dict(
+            text=f'<b>HAR-A Backtest — Forecast vs RV Realizada</b>'
+                 f'<sup>  OOS R²={r2:.3f} · RMSE={rmse:.2f} · n={backtest["n_test"]}d</sup>',
+            font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
+        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
+        height=300, margin=dict(l=55, r=30, t=60, b=40),
+        xaxis=dict(gridcolor='#21262D', tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
+        yaxis=dict(title='Vol % (anualizada)', gridcolor='#21262D',
+                   tickfont=dict(size=9, color='#8B949E')),
+        legend=dict(orientation='h', y=1.02, bgcolor='rgba(0,0,0,0)',
+                    font=dict(size=9, color='#C9D1D9', family='JetBrains Mono')),
+        hovermode='x unified')
+
+    # ── Fig 2: Mincer-Zarnowitz scatter ───────────────────────────
+    # Ideal: todos los puntos sobre la línea de 45°
+    vmin = float(min(fc.min(), rv.min())) * 0.9
+    vmax = float(max(fc.max(), rv.max())) * 1.05
+    alpha = backtest.get('mz_alpha', 0)
+    beta  = backtest.get('mz_beta', 1)
+
+    fig_mz = go.Figure()
+    fig_mz.add_trace(go.Scatter(
+        x=fc, y=rv, mode='markers',
+        marker=dict(color='#58A6FF', size=4, opacity=0.5),
+        name='Observaciones',
+        hovertemplate='Forecast: %{x:.1f}%<br>Real: %{y:.1f}%<extra></extra>'))
+    # Línea ideal 45°
+    fig_mz.add_trace(go.Scatter(
+        x=[vmin, vmax], y=[vmin, vmax], mode='lines',
+        name='Ideal (a=0, b=1)',
+        line=dict(color='#3FB950', width=2, dash='dot')))
+    # Línea MZ regresión
+    x_line = np.linspace(vmin, vmax, 100)
+    y_line = alpha + beta * x_line
+    fig_mz.add_trace(go.Scatter(
+        x=x_line, y=y_line, mode='lines',
+        name=f'MZ fit: a={alpha:.2f}, b={beta:.2f}',
+        line=dict(color='#F0883E', width=2)))
+    fig_mz.update_layout(
+        title=dict(
+            text=f'<b>Mincer-Zarnowitz</b>'
+                 f'<sup>  a={alpha:.2f} (↓0) · b={beta:.2f} (↑1) · sin sesgo si a≈0, b≈1</sup>',
+            font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
+        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
+        height=300, margin=dict(l=55, r=30, t=60, b=55),
+        xaxis=dict(title='HAR-A Forecast (%)', gridcolor='#21262D',
+                   tickfont=dict(size=9, color='#8B949E')),
+        yaxis=dict(title='RV Realizada (%)', gridcolor='#21262D',
+                   tickfont=dict(size=9, color='#8B949E')),
+        legend=dict(orientation='h', y=1.02, bgcolor='rgba(0,0,0,0)',
+                    font=dict(size=9, color='#C9D1D9', family='JetBrains Mono')))
+
+    return fig_ts, fig_mz
 
 
 def build_rv_chart(bt, window=252):
@@ -2618,11 +2842,65 @@ E[RV_futura] = β₀ + β₁·RV_diaria + β₂·RV_semanal(5d) + β₃·RV_mens
             st.markdown("<div style='border-top:1px solid #30363D;margin:0.6rem 0'></div>",
                         unsafe_allow_html=True)
 
-            # Charts
+            # ── Última fecha disponible ──────────────────────────────
+            last_date_ebt = ebt.index[-1].date()
+            st.markdown(
+                f'<div style="font-family:JetBrains Mono;font-size:0.7rem;color:#8B949E;margin-bottom:0.4rem">'
+                f'📅 Datos hasta: <b style="color:#C9D1D9">{last_date_ebt}</b>'
+                f'{"  ✅ Al día" if last_date_ebt >= (now_cdmx().date() - timedelta(days=3)) else "  ⚠ parquet desactualizado"}'
+                f'</div>',
+                unsafe_allow_html=True)
+
+            # ── VRP + Backtest ───────────────────────────────────────
             try:
                 st.plotly_chart(build_vrp_chart(ebt), width="stretch", config=dict(displayModeBar=False))
             except Exception as e:
                 st.error(f"Error VRP: {e}")
+
+            # Backtest del modelo HAR-A
+            har_bt = edge.get('har_backtest', {})
+            if har_bt:
+                with st.expander("📈 Backtest HAR-A — ¿Qué tan bien predice la volatilidad futura?", expanded=False):
+                    # Métricas en tabla
+                    brow1 = {
+                        "Métrica":      ["R² OOS", "RMSE", "MAE", "QLIKE", "Dir. Accuracy"],
+                        "HAR-A":        [f"{har_bt.get('r2_oos','—'):.3f}",
+                                         f"{har_bt.get('rmse','—'):.2f}",
+                                         f"{har_bt.get('mae','—'):.2f}",
+                                         f"{har_bt.get('qlike','—'):.4f}",
+                                         f"{har_bt.get('dir_acc','—'):.1f}%"],
+                        "RV_m (naive)": [f"{har_bt.get('r2_naive','—'):.3f}",
+                                         f"{har_bt.get('rmse_naive','—'):.2f}", "—", "—", "—"],
+                        "EWMA(0.94)":   [f"{har_bt.get('r2_ewma','—'):.3f}",
+                                         f"{har_bt.get('rmse_ewma','—'):.2f}", "—", "—", "—"],
+                    }
+                    mz_a = har_bt.get('mz_alpha', '—'); mz_b = har_bt.get('mz_beta', '—')
+                    n_t  = har_bt.get('n_test', '—')
+                    st.dataframe(pd.DataFrame(brow1), use_container_width=True, hide_index=True)
+                    st.markdown(f"""
+<div style="font-family:'JetBrains Mono';font-size:0.75rem;color:#8B949E;margin:0.3rem 0">
+<b style="color:#C9D1D9">Mincer-Zarnowitz:</b> α={mz_a} (ideal 0) · β={mz_b} (ideal 1) ·
+<b style="color:#C9D1D9">Muestra test:</b> {n_t} días (~2 años)
+</div>
+<div style="font-family:'JetBrains Mono';font-size:0.7rem;color:#8B949E;margin-top:0.3rem">
+<b>Interpretación:</b>
+R² OOS > 0.20 = buena predicción (vol es difícil de predecir) ·
+QLIKE penaliza asimétricamente subestimaciones ·
+Dir. Acc. > 55% = útil para timing ·
+β ≈ 1.0 en MZ = sin sesgo sistemático
+</div>""", unsafe_allow_html=True)
+
+                    try:
+                        fig_bts, fig_mz = build_har_backtest_charts(har_bt)
+                        col_bts1, col_bts2 = st.columns([1.4, 1])
+                        with col_bts1:
+                            if fig_bts.data:
+                                st.plotly_chart(fig_bts, width="stretch", config=dict(displayModeBar=False))
+                        with col_bts2:
+                            if fig_mz.data:
+                                st.plotly_chart(fig_mz, width="stretch", config=dict(displayModeBar=False))
+                    except Exception as ex:
+                        st.error(f"Error backtest charts: {ex}")
 
             try:
                 st.plotly_chart(build_rv_chart(ebt), width="stretch", config=dict(displayModeBar=False))
@@ -2661,8 +2939,11 @@ E[RV_futura] = β₀ + β₁·RV_diaria + β₂·RV_semanal(5d) + β₃·RV_mens
                 except Exception as e:
                     st.error(f"Error Credit: {e}")
 
-            har_src = 'HAR-RV (Corsi 2009)' if use_har else 'RV20 trailing'
-            st.caption(f"Edge Analytics · VRP: {har_src} · VVIX/SKEW/Credit: ^VVIX ^SKEW HYG IEF (yfinance live) · Parquet: SPY/VIX histórico")
+            har_src = 'HAR-A (Patton & Sheppard 2015)' if use_har else 'RV20 trailing'
+            st.caption(
+                f"Edge Analytics · VRP: {har_src} · "
+                f"Datos: SPY+VIX parquet extendido con yfinance live (hasta {ebt.index[-1].date()}) · "
+                f"VVIX / SKEW / Credit: ^VVIX ^SKEW HYG IEF yfinance")
 
 
 # ━━━━━━━━━━━━━━━━━ TAB: VOL SKEW & SURFACE ━━━━━━━━━━━━━━━━━
