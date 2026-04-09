@@ -4112,18 +4112,12 @@ with tab2:
                 except Exception as e:
                     st.error(f"Error trades chart: {e}")
 
-                # Tabla completa
-                st.dataframe(
-                    trades.style.format({
-                        "ret_pct": "{:+.2f}%",
-                        "hold_d":  "{:.0f}d",
-                    }).applymap(
-                        lambda v: "color: #3FB950" if isinstance(v, (int, float)) and v > 0
-                                  else "color: #F85149" if isinstance(v, (int, float)) and v < 0 else "",
-                        subset=["ret_pct"]
-                    ),
-                    use_container_width=True, hide_index=True
-                )
+                # Tabla de trades — sin estilos para máxima compatibilidad
+                trades_display = trades.copy()
+                trades_display["ret_pct"] = trades_display["ret_pct"].apply(lambda x: f"{x:+.2f}%")
+                if "hold_d" in trades_display.columns:
+                    trades_display["hold_d"] = trades_display["hold_d"].apply(lambda x: f"{int(x)}d")
+                st.dataframe(trades_display, use_container_width=True, hide_index=True)
 
                 # Resumen de salidas
                 if "exit_why" in trades.columns:
