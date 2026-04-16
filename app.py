@@ -1837,127 +1837,8 @@ def build_iv_heatmap(chains: dict, spot: float,
     return fig
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# COT — Commitments of Traders via cot_reports library
-# Fuente: CFTC "Traders in Financial Futures" report
-# VIX Futures: buscamos "VIX" en Market and Exchange Names
-# Leveraged Funds ≈ Managed Money (hedge funds / CTAs)
-# Asset Manager ≈ Institucionales pasivos
-# Publicación: cada martes ~15:30 ET con datos del martes anterior
+# LIVE EXTENSION — SPY + VIX desde yfinance
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-@st.cache_data(ttl=3600 * 6)
-def fetch_cot_vix(n_weeks: int = 104) -> pd.DataFrame:
-    """
-    Descarga el COT de Traders in Financial Futures para VIX via cot_reports.
-    Columnas clave:
-      - mm_long / mm_short   : Leveraged Funds (hedge funds/CTAs)
-      - asset_long / short   : Asset Managers (institucionales)
-      - dealer_long / short  : Dealer Intermediaries
-      - net_mm               : Leveraged Funds net
-      - net_mm_pct           : % del Open Interest
-    """
-    log = logging.getLogger("vix_controller")
-    try:
-        import cot_reports
-    except ImportError:
-        log.error("cot_reports no instalado. Agrega 'cot_reports' a requirements.txt")
-        return pd.DataFrame()
-
-    try:
-        current_year = datetime.now().year
-        years_needed = max(1, (n_weeks // 52) + 2)
-        frames = []
-        for yr in range(current_year - years_needed + 1, current_year + 1):
-            try:
-                df_yr = cot_reports.cot_year(
-                    year=yr,
-                    cot_report_type="traders_in_financial_futures_fut"
-                )
-                frames.append(df_yr)
-                log.info(f"COT: año {yr} OK ({len(df_yr)} filas)")
-            except Exception as e:
-                log.warning(f"COT año {yr}: {e}")
-                continue
-
-        if not frames:
-            log.error("COT: no se pudo descargar ningún año")
-            return pd.DataFrame()
-
-        df = pd.concat(frames, ignore_index=True)
-
-        # Filtrar VIX futures
-        mask = df["Market and Exchange Names"].str.contains("VIX", case=False, na=False)
-        df   = df[mask].copy()
-        if df.empty:
-            log.error("COT: no se encontraron filas de VIX futures")
-            return pd.DataFrame()
-
-        # Parsear fecha
-        date_col = "As of Date in Form YYYY-MM-DD"
-        if date_col in df.columns:
-            df["date"] = pd.to_datetime(df[date_col], errors="coerce")
-        else:
-            # Alternativa: buscar columna con fecha
-            date_cols = [c for c in df.columns if "date" in c.lower() or "yyyy" in c.lower()]
-            df["date"] = pd.to_datetime(df[date_cols[0]], errors="coerce") if date_cols else pd.NaT
-
-        df = df.sort_values("date").reset_index(drop=True)
-
-        # Renombrar columnas (TFF report)
-        col_map = {
-            "Open Interest (All)":                        "oi",
-            "Leveraged Funds-Long (All)":                 "mm_long",
-            "Leveraged Funds-Short (All)":                "mm_short",
-            "Leveraged Funds-Spreading (All)":            "mm_spread",
-            "Asset Manager/Institutional-Long (All)":     "asset_long",
-            "Asset Manager/Institutional-Short (All)":    "asset_short",
-            "Dealer Intermediary-Long (All)":             "dealer_long",
-            "Dealer Intermediary-Short (All)":            "dealer_short",
-            "Other Reportables-Long (All)":               "other_long",
-            "Other Reportables-Short (All)":              "other_short",
-        }
-        df = df.rename(columns={k:v for k,v in col_map.items() if k in df.columns})
-
-        # Convertir a numérico
-        for c in ["oi","mm_long","mm_short","mm_spread","asset_long","asset_short",
-                  "dealer_long","dealer_short","other_long","other_short"]:
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-
-        # Métricas derivadas
-        if "mm_long" in df.columns and "mm_short" in df.columns:
-            df["net_mm"]     = df["mm_long"] - df["mm_short"]
-            df["net_mm_pct"] = (df["net_mm"] / df["oi"] * 100).where(df["oi"] > 0)
-            df["net_mm_pct_pctile"] = df["net_mm_pct"].rank(pct=True) * 100
-
-        if "dealer_long" in df.columns and "dealer_short" in df.columns:
-            df["net_dealer"] = df["dealer_long"] - df["dealer_short"]
-
-        if "asset_long" in df.columns and "asset_short" in df.columns:
-            df["net_commercial"] = df["asset_long"] - df["asset_short"]
-
-        last_ok = df["date"].dropna().iloc[-1].strftime("%Y-%m-%d") if not df["date"].dropna().empty else "?"
-        log.info(f"COT VIX (TFF): {len(df)} semanas · última: {last_ok}")
-        return df.tail(n_weeks).reset_index(drop=True)
-
-    except Exception as e:
-        log.error(f"fetch_cot_vix: {e}")
-        return pd.DataFrame()
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# COT — Commitments of Traders (CFTC Public API)
-# Futuros VIX: código CFTC 1170E1 · Disaggregated Report
-# API: https://publicreporting.cftc.gov (Socrata, sin auth)
-# Publicación: martes ~15:30 ET con datos del martes anterior
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-COT_VIX_CODE   = "1170E1"                        # CBOE VIX VOLATILITY INDEX
-COT_API_BASE   = "https://publicreporting.cftc.gov/resource"
-COT_DISAGG_ID  = "72hh-3qpy"                     # Disaggregated Futures & Options Combined
-COT_LEGACY_ID  = "6dca-aqww"                     # Legacy (si disagg falla)
-
-
-@st.cache_data(ttl=3600 * 6)  # 6h — datos semanales, no cambian intraday
 
 @st.cache_data(ttl=55)
 def fetch_live_spy_vix() -> pd.DataFrame:
@@ -3272,167 +3153,939 @@ def build_vxx_operational_chart(bt: pd.DataFrame,
                                  final_sig_today: int,
                                  ct_today: float | None) -> go.Figure:
     """
-    Gráfica operativa VXX con dos subpaneles:
+    Gráfica operativa VXX — versión mejorada v2.
 
-    Panel 1 — VXX + SMA(20) + BB 2σ:
-      · Zona verde      : LONG activo (sig_final==1)
-      · Zona roja tenue : Backwardation (sig_bb==1 pero ct==0)
-      · ▲ verde         : Entrada (sig_final 0→1)
-      · ▼ naranja       : Salida por BB (VXX cruzó BB_Upper)
-      · ▼ rojo          : Salida por Contango Rule (CT se apagó)
-      · 💎 hoy          : precio actual (verde=LONG, rojo=CASH)
+    Tres paneles:
+      Panel 1 (55%) : VXX + SMA(20) + BB 2σ + shading por bloques LONG/BKWD
+                       + flechas grandes ENTRY/EXIT como scatter markers (visibles)
+                       + marker "HOY" grande
+      Panel 2 (20%) : Contango % histórico (barras)
+      Panel 3 (25%) : Equity SVXY del régimen (la estrategia en sí, no el VXX)
 
-    Panel 2 — Contango % histórico (barras verdes/rojas del CSV)
-              + punto de hoy en CBOE live
+    Mejoras vs v1:
+      - Shading por rectángulos (vrect) en lugar de fill tozeroy que tapaba
+      - Flechas = markers Scatter (triángulos nativos) con size=14, outline blanco
+        → se ven incluso en sparkline, no se pierden como text annotations
+      - Tooltip custom que muestra qué regla disparó la salida
+      - Panel de equity: muestra cuánto ganó/perdió la estrategia históricamente
+      - Título informativo con P&L total, # trades, win rate
     """
     from plotly.subplots import make_subplots
 
     fig = make_subplots(
-        rows=2, cols=1,
+        rows=3, cols=1,
         shared_xaxes=True,
-        row_heights=[0.68, 0.32],
-        vertical_spacing=0.03,
+        row_heights=[0.55, 0.20, 0.25],
+        vertical_spacing=0.035,
+        subplot_titles=(
+            "<b>VXX · Precio + Bollinger Bands</b>",
+            "<b>Contango (M2-M1)/M1 %</b>",
+            "<b>Equity Curve — Estrategia BB × Contango sobre VXX inverso</b>",
+        ),
     )
 
-    sig    = bt['sig_final']
-    sig_bb = bt['sig_bb']
-    ct     = bt['ct_filter']
+    sig    = bt['sig_final'].astype(int)
+    sig_bb = bt['sig_bb'].astype(int)
+    ct     = bt['ct_filter'].astype(int)
     vxx    = bt['VXX_Close']
-    y_top  = vxx.max() * 1.25
 
-    # ── Zona LONG (verde) ─────────────────────────────────────
-    long_y = np.where(sig == 1, y_top, np.nan)
-    fig.add_trace(go.Scatter(
-        x=bt.index, y=long_y, mode='none',
-        fill='tozeroy', fillcolor='rgba(63,185,80,0.09)',
-        showlegend=True, name='LONG activo', hoverinfo='skip',
-    ), row=1, col=1)
+    # ══════════════════════════════════════════════════════
+    # PANEL 1: VXX + BB + shading + flechas
+    # ══════════════════════════════════════════════════════
 
-    # ── Zona Backwardation (rojo tenue) ───────────────────────
-    bkwd_y = np.where((sig_bb == 1) & (ct == 0), y_top, np.nan)
-    fig.add_trace(go.Scatter(
-        x=bt.index, y=bkwd_y, mode='none',
-        fill='tozeroy', fillcolor='rgba(248,81,73,0.07)',
-        showlegend=True, name='Backwardation', hoverinfo='skip',
-    ), row=1, col=1)
+    # ── Shading por bloques LONG ─────────────────────────
+    # Detectar bloques contiguos donde sig==1 y pintar rectangle verde tenue
+    in_block = False
+    block_start = None
+    long_blocks = []
+    for dt, s in sig.items():
+        if s == 1 and not in_block:
+            block_start = dt
+            in_block = True
+        elif s == 0 and in_block:
+            long_blocks.append((block_start, dt))
+            in_block = False
+    if in_block:
+        long_blocks.append((block_start, sig.index[-1]))
 
-    # ── BB + SMA + VXX ────────────────────────────────────────
+    for start, end in long_blocks:
+        fig.add_vrect(x0=start, x1=end, row=1, col=1,
+                      fillcolor='rgba(63,185,80,0.08)', line_width=0, layer='below')
+
+    # ── Shading por bloques BACKWARDATION (sig_bb=1 pero ct=0) ─
+    bkwd_mask = (sig_bb == 1) & (ct == 0)
+    in_block = False
+    block_start = None
+    bkwd_blocks = []
+    for dt, m in bkwd_mask.items():
+        if m and not in_block:
+            block_start = dt; in_block = True
+        elif not m and in_block:
+            bkwd_blocks.append((block_start, dt)); in_block = False
+    if in_block:
+        bkwd_blocks.append((block_start, bkwd_mask.index[-1]))
+    for start, end in bkwd_blocks:
+        fig.add_vrect(x0=start, x1=end, row=1, col=1,
+                      fillcolor='rgba(248,81,73,0.07)', line_width=0, layer='below')
+
+    # Proxy traces para aparecer en la leyenda (shading no genera entries)
+    fig.add_trace(go.Scatter(x=[None], y=[None], mode='markers',
+        marker=dict(size=10, color='rgba(63,185,80,0.35)', symbol='square'),
+        name='Zona LONG', showlegend=True), row=1, col=1)
+    fig.add_trace(go.Scatter(x=[None], y=[None], mode='markers',
+        marker=dict(size=10, color='rgba(248,81,73,0.35)', symbol='square'),
+        name='Backwardation', showlegend=True), row=1, col=1)
+
+    # ── BB band (fill entre upper y lower) ────────────────
     fig.add_trace(go.Scatter(x=bt.index, y=bt['BB_Upper'],
-        mode='lines', name='BB 2σ',
-        line=dict(color='#F85149', width=1, dash='dot')), row=1, col=1)
+        mode='lines', name='BB 2σ Upper',
+        line=dict(color='#F85149', width=1, dash='dot'),
+        hoverinfo='skip'), row=1, col=1)
     fig.add_trace(go.Scatter(x=bt.index, y=bt['BB_Lower'],
-        mode='lines', showlegend=False,
-        line=dict(color='#F85149', width=0.5, dash='dot'),
-        fill='tonexty', fillcolor='rgba(248,81,73,0.03)'), row=1, col=1)
+        mode='lines', name='BB 2σ Lower', showlegend=False,
+        line=dict(color='#F85149', width=0.7, dash='dot'),
+        fill='tonexty', fillcolor='rgba(248,81,73,0.04)',
+        hoverinfo='skip'), row=1, col=1)
     fig.add_trace(go.Scatter(x=bt.index, y=bt['BB_SMA20'],
         mode='lines', name='SMA(20)',
-        line=dict(color='#58A6FF', width=1.5, dash='dash')), row=1, col=1)
+        line=dict(color='#58A6FF', width=1.5, dash='dash'),
+        hovertemplate='%{x|%Y-%m-%d} · SMA: $%{y:.2f}<extra></extra>'), row=1, col=1)
     fig.add_trace(go.Scatter(x=bt.index, y=vxx,
         mode='lines', name='VXX',
-        line=dict(color='#F0F6FC', width=2),
-        hovertemplate='%{x|%Y-%m-%d}  VXX: $%{y:.2f}<extra></extra>'), row=1, col=1)
+        line=dict(color='#F0F6FC', width=2.2),
+        hovertemplate='<b>%{x|%Y-%m-%d}</b><br>VXX: <b>$%{y:.2f}</b><extra></extra>'),
+        row=1, col=1)
 
-    # ── Flechas ───────────────────────────────────────────────
-    for i in range(1, len(sig)):
-        date     = sig.index[i]
-        y_val    = vxx.iloc[i]
-        prev_sig = sig.iloc[i-1];   cur_sig  = sig.iloc[i]
-        prev_bb  = sig_bb.iloc[i-1]; cur_bb  = sig_bb.iloc[i]
-        prev_ct  = ct.iloc[i-1];    cur_ct   = ct.iloc[i]
+    # ── Flechas como SCATTER MARKERS (visibles) ──────────
+    entry_dates, entry_prices = [], []
+    exit_bb_dates, exit_bb_prices = [], []
+    exit_ct_dates, exit_ct_prices = [], []
 
-        if cur_sig == 1 and prev_sig == 0:
-            # Entrada
-            fig.add_annotation(x=date, y=y_val, yshift=-22,
-                text="▲", showarrow=False,
-                font=dict(size=16, color='#3FB950', family='JetBrains Mono'),
-                row=1, col=1)
-        elif cur_sig == 0 and prev_sig == 1:
+    sig_arr    = sig.values
+    sig_bb_arr = sig_bb.values
+    ct_arr     = ct.values
+    idx_arr    = sig.index
+    vxx_arr    = vxx.values
+
+    for i in range(1, len(sig_arr)):
+        prev_s, cur_s   = sig_arr[i-1], sig_arr[i]
+        prev_bb, cur_bb = sig_bb_arr[i-1], sig_bb_arr[i]
+        prev_ct, cur_ct = ct_arr[i-1], ct_arr[i]
+
+        if cur_s == 1 and prev_s == 0:
+            entry_dates.append(idx_arr[i])
+            entry_prices.append(vxx_arr[i])
+        elif cur_s == 0 and prev_s == 1:
+            # Determinar regla que disparó salida
             if cur_bb == 0 and prev_bb == 1:
-                # Salida por BB (naranja)
-                fig.add_annotation(x=date, y=y_val, yshift=22,
-                    text="▼", showarrow=False,
-                    font=dict(size=16, color='#D29922', family='JetBrains Mono'),
-                    row=1, col=1)
+                exit_bb_dates.append(idx_arr[i])
+                exit_bb_prices.append(vxx_arr[i])
             elif cur_ct == 0 and prev_ct == 1:
-                # Salida por Contango Rule (rojo)
-                fig.add_annotation(x=date, y=y_val, yshift=22,
-                    text="▼", showarrow=False,
-                    font=dict(size=16, color='#F85149', family='JetBrains Mono'),
-                    row=1, col=1)
+                exit_ct_dates.append(idx_arr[i])
+                exit_ct_prices.append(vxx_arr[i])
             else:
-                # Ambas (naranja — BB dominó)
-                fig.add_annotation(x=date, y=y_val, yshift=22,
-                    text="▼", showarrow=False,
-                    font=dict(size=16, color='#D29922', family='JetBrains Mono'),
-                    row=1, col=1)
+                exit_bb_dates.append(idx_arr[i])
+                exit_bb_prices.append(vxx_arr[i])
 
-    # Punto de hoy
+    n_entries = len(entry_dates)
+
+    # Entries (triángulo verde hacia arriba, debajo del precio)
+    if entry_dates:
+        fig.add_trace(go.Scatter(
+            x=entry_dates,
+            y=[p * 0.94 for p in entry_prices],  # ligeramente debajo
+            mode='markers',
+            name=f'▲ Entrada ({n_entries})',
+            marker=dict(size=14, color='#3FB950', symbol='triangle-up',
+                        line=dict(width=1.5, color='#FFFFFF')),
+            hovertemplate='<b>ENTRADA</b><br>%{x|%Y-%m-%d}<br>VXX: $%{customdata:.2f}<extra></extra>',
+            customdata=entry_prices,
+        ), row=1, col=1)
+
+    # Exits por BB (triángulo amarillo hacia abajo, encima del precio)
+    if exit_bb_dates:
+        fig.add_trace(go.Scatter(
+            x=exit_bb_dates,
+            y=[p * 1.06 for p in exit_bb_prices],
+            mode='markers',
+            name=f'▼ Salida BB ({len(exit_bb_dates)})',
+            marker=dict(size=14, color='#D29922', symbol='triangle-down',
+                        line=dict(width=1.5, color='#FFFFFF')),
+            hovertemplate='<b>SALIDA · BB 2σ</b><br>%{x|%Y-%m-%d}<br>VXX: $%{customdata:.2f}<extra></extra>',
+            customdata=exit_bb_prices,
+        ), row=1, col=1)
+
+    # Exits por Contango Rule
+    if exit_ct_dates:
+        fig.add_trace(go.Scatter(
+            x=exit_ct_dates,
+            y=[p * 1.06 for p in exit_ct_prices],
+            mode='markers',
+            name=f'▼ Salida CT ({len(exit_ct_dates)})',
+            marker=dict(size=14, color='#F85149', symbol='triangle-down',
+                        line=dict(width=1.5, color='#FFFFFF')),
+            hovertemplate='<b>SALIDA · Contango</b><br>%{x|%Y-%m-%d}<br>VXX: $%{customdata:.2f}<extra></extra>',
+            customdata=exit_ct_prices,
+        ), row=1, col=1)
+
+    # Punto HOY (grande, con halo)
     today_clr = '#3FB950' if final_sig_today else '#F85149'
+    today_lbl = 'HOY · LONG' if final_sig_today else 'HOY · CASH'
+    # Halo (marker grande semi-transparente)
     fig.add_trace(go.Scatter(
         x=[bt.index[-1]], y=[vxx_today],
-        mode='markers', name='HOY — LONG' if final_sig_today else 'HOY — CASH',
+        mode='markers', showlegend=False,
+        marker=dict(size=26, color=today_clr, opacity=0.25, symbol='circle'),
+        hoverinfo='skip',
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=[bt.index[-1]], y=[vxx_today],
+        mode='markers', name=today_lbl,
         marker=dict(size=14, color=today_clr,
-                    line=dict(width=2, color='white'), symbol='diamond'),
-        hovertemplate=f'HOY: ${vxx_today:.2f}<extra></extra>',
+                    line=dict(width=2.5, color='white'), symbol='diamond'),
+        hovertemplate=f'<b>{today_lbl}</b><br>VXX: ${vxx_today:.2f}<extra></extra>',
     ), row=1, col=1)
 
-    # ── Panel 2: Contango histórico ───────────────────────────
+    # ══════════════════════════════════════════════════════
+    # PANEL 2: Contango histórico
+    # ══════════════════════════════════════════════════════
     if 'Contango_pct' in bt.columns:
         ct_hist  = bt['Contango_pct'].fillna(0)
         bar_clrs = ['#3FB950' if v > 0 else '#F85149' for v in ct_hist]
         fig.add_trace(go.Bar(
             x=bt.index, y=ct_hist,
-            name='Contango %', marker_color=bar_clrs, opacity=0.7,
-            hovertemplate='%{x|%Y-%m-%d}  CT: %{y:+.2f}%<extra></extra>',
+            name='Contango % hist', marker_color=bar_clrs, opacity=0.75,
+            hovertemplate='<b>%{x|%Y-%m-%d}</b><br>Contango: %{y:+.2f}%<extra></extra>',
+            showlegend=False,
         ), row=2, col=1)
         if ct_today is not None:
             ct_clr = '#3FB950' if ct_today > 0 else '#F85149'
             fig.add_trace(go.Scatter(
                 x=[bt.index[-1]], y=[ct_today],
                 mode='markers', name=f'CT hoy: {ct_today:+.2f}%',
-                marker=dict(size=10, color=ct_clr, symbol='diamond',
+                marker=dict(size=12, color=ct_clr, symbol='diamond',
                             line=dict(width=2, color='white')),
+                showlegend=False,
             ), row=2, col=1)
         fig.add_hline(y=0, line_color='#484F58', line_width=1, row=2, col=1)
 
-    # ── Layout ────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════
+    # PANEL 3: Equity Curve del régimen (estrategia inversa sobre VXX)
+    # Cuando sig_final==1, capturamos -VXX return (porque estamos LONG SVXY ~ -0.5x VXX)
+    # ══════════════════════════════════════════════════════
+    vxx_ret    = vxx.pct_change().fillna(0)
+    # Posición aplicada con shift=1 (señal de cierre, ejecutamos al open siguiente)
+    pos        = sig.shift(1).fillna(0)
+    # SVXY ~ -0.5x VXX (intraday), aproximación razonable
+    strat_ret  = -0.5 * vxx_ret * pos
+    equity     = (1.0 + strat_ret).cumprod()
+
+    # Benchmark buy-and-hold VXX (inverso para comparar "qué tan mejor")
+    bh_ret    = -0.5 * vxx_ret  # si siempre hubiéramos estado LONG SVXY
+    bh_equity = (1.0 + bh_ret).cumprod()
+
+    fig.add_trace(go.Scatter(
+        x=bt.index, y=bh_equity,
+        mode='lines', name='Buy & Hold SVXY',
+        line=dict(color='#8B949E', width=1.2, dash='dash'),
+        hovertemplate='B&H: %{y:.3f}x<extra></extra>',
+    ), row=3, col=1)
+    fig.add_trace(go.Scatter(
+        x=bt.index, y=equity,
+        mode='lines', name='Estrategia BB × CT',
+        line=dict(color='#39D2C0', width=2.2),
+        fill='tozeroy', fillcolor='rgba(57,210,192,0.08)',
+        hovertemplate='<b>%{x|%Y-%m-%d}</b><br>Equity: %{y:.3f}x<extra></extra>',
+    ), row=3, col=1)
+    fig.add_hline(y=1.0, line_color='#484F58', line_width=1,
+                  line_dash='dot', row=3, col=1)
+
+    # ── Stats para el título ──────────────────────────────
+    final_eq  = equity.iloc[-1]
+    bh_eq     = bh_equity.iloc[-1]
+    total_ret = (final_eq - 1) * 100
+    # Días en LONG
+    days_long = int(sig.sum())
+    pct_long  = days_long / len(sig) * 100 if len(sig) else 0
+    # Win rate por trade (por bloque LONG)
+    wins = 0
+    trades = 0
+    for start, end in long_blocks:
+        if start in equity.index and end in equity.index:
+            r = equity.loc[end] / equity.loc[start] - 1
+            trades += 1
+            if r > 0:
+                wins += 1
+    win_rate = (wins / trades * 100) if trades else 0
+
+    # ══════════════════════════════════════════════════════
+    # LAYOUT
+    # ══════════════════════════════════════════════════════
+    title_html = (
+        f"<b>VXX — Monitor Operativo · BB(20, 2σ) × Contango Rule</b>"
+        f"<br><span style='font-size:0.7rem;color:#8B949E;font-family:JetBrains Mono'>"
+        f"Trades: <b style='color:#58A6FF'>{trades}</b> · "
+        f"Win Rate: <b style='color:{'#3FB950' if win_rate>=50 else '#D29922'}'>{win_rate:.0f}%</b> · "
+        f"Días LONG: <b style='color:#3FB950'>{pct_long:.0f}%</b> · "
+        f"Retorno estrategia: <b style='color:{'#3FB950' if total_ret>=0 else '#F85149'}'>{total_ret:+.0f}%</b> · "
+        f"vs B&H SVXY: <b style='color:#F0F6FC'>{(bh_eq-1)*100:+.0f}%</b>"
+        f"</span>"
+    )
+
+    fig.update_layout(
+        title=dict(text=title_html, font=dict(size=14, color='#F0F6FC',
+                    family='Inter'), x=0.5, xanchor='center'),
+        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
+        height=720, margin=dict(l=60, r=30, t=95, b=45),
+        hovermode='x unified', dragmode='zoom', bargap=0,
+        legend=dict(orientation='h', yanchor='bottom', y=1.04, x=0.5, xanchor='center',
+                    bgcolor='rgba(0,0,0,0)',
+                    font=dict(size=9.5, color='#C9D1D9', family='JetBrains Mono')),
+    )
+
+    # Subplot titles (las subtítulos generados por make_subplots)
+    for annotation in fig['layout']['annotations'][:3]:
+        annotation['font'] = dict(size=11, color='#8B949E', family='Inter')
+        annotation['xanchor'] = 'left'
+        annotation['x'] = 0.01
+
+    # Axes
+    fig.update_xaxes(
+        gridcolor='#21262D', showgrid=True,
+        tickfont=dict(size=10, color='#8B949E', family='JetBrains Mono'),
+    )
+    fig.update_xaxes(
+        row=1, col=1,
+        rangeselector=dict(
+            buttons=[
+                dict(count=1,  label="1M",  step="month", stepmode="backward"),
+                dict(count=3,  label="3M",  step="month", stepmode="backward"),
+                dict(count=6,  label="6M",  step="month", stepmode="backward"),
+                dict(count=1,  label="1A",  step="year",  stepmode="backward"),
+                dict(count=3,  label="3A",  step="year",  stepmode="backward"),
+                dict(step="all", label="Todo"),
+            ],
+            bgcolor='#161B22', activecolor='#F7931A', bordercolor='#30363D',
+            font=dict(size=9, color='#C9D1D9', family='JetBrains Mono'),
+            y=1.12,
+        ),
+    )
+    fig.update_yaxes(gridcolor='#21262D',
+                     tickfont=dict(size=9.5, color='#8B949E', family='JetBrains Mono'))
+    fig.update_yaxes(title=dict(text="VXX ($)", font=dict(size=10, color='#8B949E')),
+                     row=1, col=1)
+    fig.update_yaxes(title=dict(text="CT (%)", font=dict(size=10, color='#8B949E')),
+                     zeroline=True, zerolinecolor='#30363D', row=2, col=1)
+    fig.update_yaxes(title=dict(text="Equity ($1 → x)", font=dict(size=10, color='#8B949E')),
+                     row=3, col=1)
+
+    return fig
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# VTS VOLATILITY BAROMETER — 13 métricas de volatilidad
+# Inspirado en VolatilityTradingStrategies.com (Brent Osachoff)
+# Cada métrica se convierte a percentil rolling (252d o lifetime),
+# luego se promedian para obtener un score 0-100%.
+#
+# Lectura:
+#   0-20%   : Vol BAJA     → SVXY/SVIX net short vol (agresivo)
+#   20-40%  : Vol moderada → SVXY (posición normal)
+#   40-60%  : Vol mid      → Cash / parcial
+#   60-80%  : Vol ELEVADA  → Cash / defensivo
+#   80-100% : Vol EXTREMA  → Long VIX / hedge / short equities
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _rolling_percentile(s: pd.Series, window: int = 252) -> pd.Series:
+    """
+    Percentil rolling del último valor vs la ventana histórica.
+    Devuelve 0-100. Usa método 'rank' — 0 = mínimo hist, 100 = máximo hist.
+    """
+    return s.rolling(window, min_periods=max(30, window // 5)).apply(
+        lambda x: (x.rank(pct=True).iloc[-1]) * 100 if len(x) > 0 else np.nan,
+        raw=False,
+    )
+
+
+@st.cache_data(ttl=300)
+def compute_vts_barometer(
+    bt: pd.DataFrame,
+    edge_extra: dict,
+    gex_summary: dict | None = None,
+    skew_metrics: dict | None = None,
+    window: int = 252,
+) -> dict:
+    """
+    Calcula el VTS Volatility Barometer — 13 métricas promediadas a score 0-100.
+
+    Parameters
+    ----------
+    bt : DataFrame con VIX_Close, SPY_Close, M1_Price, M2_Price,
+         Contango_pct, VXX_Close, BB_SMA20, VVIX_Live (opcional)
+    edge_extra : dict de DataFrames de fetch_edge_extra() — VVIX, SKEW, HYG, IEF
+    gex_summary : dict opcional con net_gex (del tab GEX)
+    skew_metrics : dict opcional con skew_25d (del tab Vol Skew)
+    window : ventana rolling para percentiles (252 = 1 año)
+
+    Returns
+    -------
+    dict con:
+      - score : float 0-100 (el barómetro VTS)
+      - regime : str ("LOW", "MID", "ELEVATED", "EXTREME")
+      - position : str (recomendación operativa)
+      - metrics : list[dict] con cada métrica, su valor y su percentil
+      - history : pd.Series del score histórico (últimos 252 días)
+    """
+    if bt.empty or len(bt) < 60:
+        return {}
+
+    df = bt.copy()
+    metrics = []
+
+    # ══════════════════════════════════════════════════════
+    # MÉTRICA 1 — VIX SPOT LEVEL
+    # Percentil alto = vol alta
+    # ══════════════════════════════════════════════════════
+    if 'VIX_Close' in df.columns:
+        vix_pct = _rolling_percentile(df['VIX_Close'], window)
+        last_val = df['VIX_Close'].iloc[-1]
+        last_pct = vix_pct.iloc[-1] if pd.notna(vix_pct.iloc[-1]) else 50
+        metrics.append({
+            'name': 'VIX Spot Level',
+            'value': f"{last_val:.2f}",
+            'percentile': last_pct,
+            'weight': 1.2,  # más peso — es la señal primaria
+            'interpretation': 'Nivel absoluto de volatilidad implícita',
+            'series': vix_pct,
+        })
+
+    # ══════════════════════════════════════════════════════
+    # MÉTRICA 2 — VIX/VIX3M RATIO (term structure inversion)
+    # ratio > 1 = backwardation (stress). Percentil alto = vol alta
+    # ══════════════════════════════════════════════════════
+    # Proxy: 1 - Contango_pct/100 es ~VIX/M1 spread
+    # Mejor: usar VIX / M1_Price directamente
+    if 'VIX_Close' in df.columns and 'M1_Price' in df.columns:
+        vix_m1 = df['VIX_Close'] / df['M1_Price']
+        vm1_pct = _rolling_percentile(vix_m1, window)
+        metrics.append({
+            'name': 'VIX / VIX-Fut M1',
+            'value': f"{vix_m1.iloc[-1]:.3f}",
+            'percentile': vm1_pct.iloc[-1] if pd.notna(vm1_pct.iloc[-1]) else 50,
+            'weight': 1.0,
+            'interpretation': '>1 indica backwardation (stress a corto plazo)',
+            'series': vm1_pct,
+        })
+
+    # ══════════════════════════════════════════════════════
+    # MÉTRICA 3 — VVIX (vol de vol) — percentil alto = stress
+    # ══════════════════════════════════════════════════════
+    vvix_s = None
+    if 'VVIX_Live' in df.columns and df['VVIX_Live'].notna().sum() > 60:
+        vvix_s = df['VVIX_Live']
+    elif 'VVIX' in edge_extra and not edge_extra['VVIX'].empty:
+        vvix_s = edge_extra['VVIX']['Close'].reindex(df.index).ffill()
+    if vvix_s is not None and vvix_s.notna().sum() > 60:
+        vvix_pct = _rolling_percentile(vvix_s, window)
+        metrics.append({
+            'name': 'VVIX (vol del VIX)',
+            'value': f"{vvix_s.iloc[-1]:.1f}" if pd.notna(vvix_s.iloc[-1]) else '—',
+            'percentile': vvix_pct.iloc[-1] if pd.notna(vvix_pct.iloc[-1]) else 50,
+            'weight': 1.0,
+            'interpretation': 'Demanda de protección via opciones sobre VIX',
+            'series': vvix_pct,
+        })
+
+    # ══════════════════════════════════════════════════════
+    # MÉTRICA 4 — CONTANGO M1-M2 (inverted: alto contango = vol baja)
+    # INVERTIDO: vol alta = bajo contango/backwardation = 100-contango_pct
+    # ══════════════════════════════════════════════════════
+    if 'Contango_pct' in df.columns:
+        ct_pct = _rolling_percentile(df['Contango_pct'], window)
+        # Invertido: contango alto = vol baja = score bajo
+        inv_pct = 100 - ct_pct
+        metrics.append({
+            'name': 'Contango M1-M2 (inv)',
+            'value': f"{df['Contango_pct'].iloc[-1]:+.2f}%",
+            'percentile': inv_pct.iloc[-1] if pd.notna(inv_pct.iloc[-1]) else 50,
+            'weight': 1.2,  # clave para la estrategia
+            'interpretation': 'Contango alto = vol baja (invertido para el score)',
+            'series': inv_pct,
+        })
+
+    # ══════════════════════════════════════════════════════
+    # MÉTRICA 5 — VXX MOMENTUM vs SMA(20)
+    # VXX > SMA significa vol subiendo. Percentil del ratio.
+    # ══════════════════════════════════════════════════════
+    if 'VXX_Close' in df.columns and 'BB_SMA20' in df.columns:
+        vxx_mom = df['VXX_Close'] / df['BB_SMA20']
+        vxx_mom_pct = _rolling_percentile(vxx_mom, window)
+        metrics.append({
+            'name': 'VXX / SMA(20)',
+            'value': f"{vxx_mom.iloc[-1]:.3f}",
+            'percentile': vxx_mom_pct.iloc[-1] if pd.notna(vxx_mom_pct.iloc[-1]) else 50,
+            'weight': 0.9,
+            'interpretation': '>1 = momentum alcista en vol',
+            'series': vxx_mom_pct,
+        })
+
+    # ══════════════════════════════════════════════════════
+    # MÉTRICA 6 — SPY REALIZED VOL 22d (annualizada)
+    # ══════════════════════════════════════════════════════
+    if 'SPY_Close' in df.columns:
+        log_ret = np.log(df['SPY_Close'] / df['SPY_Close'].shift(1))
+        rv22 = log_ret.rolling(22).std() * np.sqrt(252) * 100
+        rv_pct = _rolling_percentile(rv22, window)
+        metrics.append({
+            'name': 'SPY RV 22d (ann.)',
+            'value': f"{rv22.iloc[-1]:.2f}%" if pd.notna(rv22.iloc[-1]) else '—',
+            'percentile': rv_pct.iloc[-1] if pd.notna(rv_pct.iloc[-1]) else 50,
+            'weight': 1.0,
+            'interpretation': 'Volatilidad realizada del SPY últimos 22 días',
+            'series': rv_pct,
+        })
+
+    # ══════════════════════════════════════════════════════
+    # MÉTRICA 7 — VRP (VIX - RV) — Risk Premium
+    # VRP bajo o negativo = vol siendo exigida fuerte = stress
+    # INVERTIDO: vrp bajo = stress alto
+    # ══════════════════════════════════════════════════════
+    if 'SPY_Close' in df.columns and 'VIX_Close' in df.columns:
+        log_ret = np.log(df['SPY_Close'] / df['SPY_Close'].shift(1))
+        rv22 = log_ret.rolling(22).std() * np.sqrt(252) * 100
+        vrp = df['VIX_Close'] - rv22
+        vrp_pct = _rolling_percentile(vrp, window)
+        # Invertido: VRP bajo = stress
+        inv_vrp = 100 - vrp_pct
+        metrics.append({
+            'name': 'VRP (VIX-RV) inv',
+            'value': f"{vrp.iloc[-1]:+.2f}" if pd.notna(vrp.iloc[-1]) else '—',
+            'percentile': inv_vrp.iloc[-1] if pd.notna(inv_vrp.iloc[-1]) else 50,
+            'weight': 0.9,
+            'interpretation': 'VRP bajo = mercado exige prima alta por vol',
+            'series': inv_vrp,
+        })
+
+    # ══════════════════════════════════════════════════════
+    # MÉTRICA 8 — SKEW INDEX (CBOE)
+    # SKEW alto = cola izquierda cara = demanda de puts OTM
+    # ══════════════════════════════════════════════════════
+    if 'SKEW' in edge_extra and not edge_extra['SKEW'].empty:
+        skew_s = edge_extra['SKEW']['Close'].reindex(df.index).ffill()
+        if skew_s.notna().sum() > 60:
+            skew_pct = _rolling_percentile(skew_s, window)
+            metrics.append({
+                'name': 'CBOE SKEW Index',
+                'value': f"{skew_s.iloc[-1]:.1f}" if pd.notna(skew_s.iloc[-1]) else '—',
+                'percentile': skew_pct.iloc[-1] if pd.notna(skew_pct.iloc[-1]) else 50,
+                'weight': 0.8,
+                'interpretation': 'Demanda de puts OTM (cola izquierda del SPX)',
+                'series': skew_pct,
+            })
+
+    # ══════════════════════════════════════════════════════
+    # MÉTRICA 9 — HYG/IEF ratio (credit spread proxy)
+    # HYG cae vs IEF = credit stress. INVERTIDO.
+    # ══════════════════════════════════════════════════════
+    if ('HYG' in edge_extra and not edge_extra['HYG'].empty and
+        'IEF' in edge_extra and not edge_extra['IEF'].empty):
+        hyg_s = edge_extra['HYG']['Close'].reindex(df.index).ffill()
+        ief_s = edge_extra['IEF']['Close'].reindex(df.index).ffill()
+        hyg_ief = hyg_s / ief_s
+        if hyg_ief.notna().sum() > 60:
+            hyg_pct = _rolling_percentile(hyg_ief, window)
+            # Invertido: ratio bajo = credit stress
+            inv_hyg = 100 - hyg_pct
+            metrics.append({
+                'name': 'HYG/IEF (credit, inv)',
+                'value': f"{hyg_ief.iloc[-1]:.3f}" if pd.notna(hyg_ief.iloc[-1]) else '—',
+                'percentile': inv_hyg.iloc[-1] if pd.notna(inv_hyg.iloc[-1]) else 50,
+                'weight': 0.7,
+                'interpretation': 'HYG/IEF cae → credit spread se abre → stress',
+                'series': inv_hyg,
+            })
+
+    # ══════════════════════════════════════════════════════
+    # MÉTRICA 10 — SPY 20d Drawdown
+    # Drawdown profundo = stress. Usamos -dd para que sea positivo=stress
+    # ══════════════════════════════════════════════════════
+    if 'SPY_Close' in df.columns:
+        roll_max = df['SPY_Close'].rolling(20, min_periods=5).max()
+        dd20 = (df['SPY_Close'] / roll_max - 1) * 100  # negativo
+        dd_inv = -dd20  # positivo
+        dd_pct = _rolling_percentile(dd_inv, window)
+        metrics.append({
+            'name': 'SPY Drawdown 20d',
+            'value': f"{dd20.iloc[-1]:.2f}%" if pd.notna(dd20.iloc[-1]) else '—',
+            'percentile': dd_pct.iloc[-1] if pd.notna(dd_pct.iloc[-1]) else 50,
+            'weight': 0.8,
+            'interpretation': 'Profundidad del drawdown reciente',
+            'series': dd_pct,
+        })
+
+    # ══════════════════════════════════════════════════════
+    # MÉTRICA 11 — VIX 5d momentum (vol subiendo rápido)
+    # ══════════════════════════════════════════════════════
+    if 'VIX_Close' in df.columns:
+        vix_5d = df['VIX_Close'].pct_change(5) * 100
+        vix_5d_pct = _rolling_percentile(vix_5d, window)
+        metrics.append({
+            'name': 'VIX 5d Change %',
+            'value': f"{vix_5d.iloc[-1]:+.2f}%" if pd.notna(vix_5d.iloc[-1]) else '—',
+            'percentile': vix_5d_pct.iloc[-1] if pd.notna(vix_5d_pct.iloc[-1]) else 50,
+            'weight': 0.7,
+            'interpretation': 'Velocidad de subida/bajada del VIX',
+            'series': vix_5d_pct,
+        })
+
+    # ══════════════════════════════════════════════════════
+    # MÉTRICA 12 — Contango M4-M7 (parte larga de la curva)
+    # Inversión aquí es más grave. INVERTIDO.
+    # ══════════════════════════════════════════════════════
+    if 'M4_Price' in df.columns and 'M7_Price' in df.columns:
+        long_ct = (df['M7_Price'] - df['M4_Price']) / df['M4_Price'] * 100
+        long_ct_pct = _rolling_percentile(long_ct, window)
+        inv_long = 100 - long_ct_pct
+        metrics.append({
+            'name': 'Contango M4-M7 (inv)',
+            'value': f"{long_ct.iloc[-1]:+.2f}%" if pd.notna(long_ct.iloc[-1]) else '—',
+            'percentile': inv_long.iloc[-1] if pd.notna(inv_long.iloc[-1]) else 50,
+            'weight': 0.8,
+            'interpretation': 'Curva larga — inversión aquí es stress estructural',
+            'series': inv_long,
+        })
+
+    # ══════════════════════════════════════════════════════
+    # MÉTRICA 13 — SPY/SMA(200) distance (tendencia macro)
+    # Por debajo de SMA(200) = mercado bajista = stress
+    # INVERTIDO: distancia positiva = vol baja
+    # ══════════════════════════════════════════════════════
+    if 'SPY_Close' in df.columns:
+        sma200 = df['SPY_Close'].rolling(200, min_periods=50).mean()
+        spy_dist = (df['SPY_Close'] / sma200 - 1) * 100
+        spy_dist_pct = _rolling_percentile(spy_dist, window)
+        # Invertido: distancia alta = bull = vol baja
+        inv_dist = 100 - spy_dist_pct
+        metrics.append({
+            'name': 'SPY vs SMA(200) inv',
+            'value': f"{spy_dist.iloc[-1]:+.2f}%" if pd.notna(spy_dist.iloc[-1]) else '—',
+            'percentile': inv_dist.iloc[-1] if pd.notna(inv_dist.iloc[-1]) else 50,
+            'weight': 0.6,
+            'interpretation': 'SPY debajo de SMA(200) = bear regime',
+            'series': inv_dist,
+        })
+
+    # ══════════════════════════════════════════════════════
+    # MÉTRICA OPCIONAL 14 — GEX (si está disponible)
+    # GEX negativo = dealers short gamma = movimientos amplificados = stress
+    # ══════════════════════════════════════════════════════
+    if gex_summary and 'net_gex' in gex_summary:
+        ng = gex_summary.get('net_gex', 0)
+        # Simple mapping: gex muy negativo (-3B+) = 90pct, gex muy positivo (+3B+) = 10pct
+        # Normalización grosera: percentil basado en thresholds típicos del SPX
+        if ng < -3e9:     gex_p = 90
+        elif ng < -1e9:   gex_p = 75
+        elif ng < 0:      gex_p = 60
+        elif ng < 1e9:    gex_p = 45
+        elif ng < 3e9:    gex_p = 30
+        else:             gex_p = 15
+        metrics.append({
+            'name': 'Net GEX (SPX)',
+            'value': f"{ng/1e9:+.2f}B",
+            'percentile': gex_p,
+            'weight': 0.7,
+            'interpretation': 'GEX negativo = dealers amplifican movimientos',
+            'series': None,
+        })
+
+    # ══════════════════════════════════════════════════════
+    # MÉTRICA OPCIONAL 15 — Skew 25Δ (si está disponible)
+    # Skew alto = puts caros vs calls = demanda de protección = stress
+    # ══════════════════════════════════════════════════════
+    if skew_metrics and 'atm_iv' in skew_metrics:
+        # Si hay skew data, usar como métrica adicional
+        skew_val = skew_metrics.get('skew_25d', None)
+        if skew_val is not None:
+            # Mapping simple: skew > 3% = alto stress
+            if skew_val > 5:      sk_p = 85
+            elif skew_val > 3:    sk_p = 70
+            elif skew_val > 1:    sk_p = 50
+            elif skew_val > 0:    sk_p = 30
+            else:                 sk_p = 15
+            metrics.append({
+                'name': 'Put/Call Skew 25Δ',
+                'value': f"{skew_val:+.2f}%",
+                'percentile': sk_p,
+                'weight': 0.6,
+                'interpretation': 'Skew positivo = puts caros vs calls',
+                'series': None,
+            })
+
+    # ══════════════════════════════════════════════════════
+    # SCORE FINAL — promedio ponderado
+    # ══════════════════════════════════════════════════════
+    total_w    = sum(m['weight'] for m in metrics if pd.notna(m['percentile']))
+    weighted_s = sum(m['percentile'] * m['weight']
+                     for m in metrics if pd.notna(m['percentile']))
+    score = weighted_s / total_w if total_w > 0 else 50.0
+
+    # Régimen
+    if   score < 20: regime, position = "VOL BAJA",     "Aggressive short vol (SVXY/SVIX)"
+    elif score < 40: regime, position = "MODERADA",     "Short vol estándar (SVXY)"
+    elif score < 60: regime, position = "MID",          "Cash / posición parcial"
+    elif score < 80: regime, position = "ELEVADA",      "Cash / defensivo"
+    else:            regime, position = "EXTREMA",      "Long VIX / hedge / short equities"
+
+    # Histórico del score (para timeline)
+    # Calculamos score histórico promediando las series de percentiles
+    score_hist = None
+    series_list = [(m['series'], m['weight']) for m in metrics
+                    if m.get('series') is not None]
+    if series_list:
+        weighted_df = pd.concat(
+            [s * w for s, w in series_list], axis=1
+        ).sum(axis=1)
+        total_weights = pd.concat(
+            [s.notna().astype(float) * w for s, w in series_list], axis=1
+        ).sum(axis=1)
+        score_hist = (weighted_df / total_weights).dropna()
+
+    return {
+        'score':    float(score),
+        'regime':   regime,
+        'position': position,
+        'metrics':  metrics,
+        'history':  score_hist,
+        'window':   window,
+        'date':     df.index[-1],
+    }
+
+
+def build_vts_barometer_gauge(score: float, regime: str,
+                               date_str: str = "") -> go.Figure:
+    """
+    Gauge idéntico al VTS Volatility Barometer original.
+    Semicírculo con colormap verde→amarillo→rojo y aguja negra.
+    """
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=score,
+        number=dict(
+            suffix="%",
+            font=dict(size=40, color='#F0F6FC', family='Inter'),
+            valueformat='.2f',
+        ),
+        domain={'x': [0, 1], 'y': [0, 1]},
+        title=dict(
+            text=f"<span style='font-size:0.85rem;color:#8B949E;font-family:JetBrains Mono'>"
+                 f"{date_str}</span><br>"
+                 f"<b style='font-size:1.1rem;color:#F0F6FC;font-family:Inter'>"
+                 f"VTS Volatility Barometer</b>",
+            font=dict(color='#F0F6FC'),
+        ),
+        gauge={
+            'axis': {
+                'range': [0, 100],
+                'tickwidth': 2,
+                'tickcolor': '#8B949E',
+                'tickfont': dict(size=11, color='#8B949E', family='JetBrains Mono'),
+                'tickmode': 'array',
+                'tickvals': [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100],
+                'ticktext': ['0%','10%','20%','30%','40%','50%',
+                             '60%','70%','80%','90%','100%'],
+            },
+            'bar': {'color': 'rgba(0,0,0,0)', 'thickness': 0.0},
+            # Sin borde grueso — el fondo del gauge es limpio
+            'bgcolor': '#0D1117',
+            'borderwidth': 0,
+            'bordercolor': '#0D1117',
+            'steps': [
+                {'range': [0, 20],   'color': '#2EA043'},    # verde fuerte
+                {'range': [20, 35],  'color': '#3FB950'},    # verde
+                {'range': [35, 50],  'color': '#85E89D'},    # verde claro
+                {'range': [50, 65],  'color': '#FFD33D'},    # amarillo
+                {'range': [65, 80],  'color': '#FB8500'},    # naranja
+                {'range': [80, 90],  'color': '#F85149'},    # rojo
+                {'range': [90, 100], 'color': '#B60205'},    # rojo oscuro
+            ],
+            'threshold': {
+                'line': {'color': '#0D1117', 'width': 8},
+                'thickness': 0.85,
+                'value': score,
+            },
+        },
+    ))
+
+    # Etiqueta de régimen debajo
+    if   score < 20: clr = '#2EA043'
+    elif score < 40: clr = '#3FB950'
+    elif score < 60: clr = '#FFD33D'
+    elif score < 80: clr = '#FB8500'
+    else:            clr = '#F85149'
+
+    fig.add_annotation(
+        x=0.5, y=-0.05, xref='paper', yref='paper',
+        text=f"<b style='font-size:1.3rem;color:{clr};font-family:Inter'>{regime}</b>",
+        showarrow=False,
+    )
+
+    fig.update_layout(
+        paper_bgcolor='#0D1117',
+        plot_bgcolor='#0D1117',
+        font=dict(color='#C9D1D9'),
+        height=420,
+        margin=dict(l=30, r=30, t=80, b=60),
+    )
+    return fig
+
+
+def build_vts_metrics_table(metrics: list) -> go.Figure:
+    """
+    Tabla horizontal de cada métrica con su percentil como barra de progreso.
+    Similar al desglose que usa VTS para justificar el score.
+    """
+    if not metrics:
+        return go.Figure()
+
+    n = len(metrics)
+    # Barras horizontales ordenadas por percentil descendente
+    sorted_m = sorted(metrics, key=lambda m: m['percentile'] if pd.notna(m['percentile']) else -1,
+                      reverse=True)
+
+    names  = [m['name'] for m in sorted_m]
+    pctls  = [m['percentile'] for m in sorted_m]
+    vals   = [m['value']  for m in sorted_m]
+    wts    = [m['weight'] for m in sorted_m]
+
+    # Color por bucket
+    def bucket_color(p):
+        if pd.isna(p): return '#484F58'
+        if p < 20:  return '#2EA043'
+        if p < 40:  return '#3FB950'
+        if p < 60:  return '#FFD33D'
+        if p < 80:  return '#FB8500'
+        return '#F85149'
+
+    bar_colors = [bucket_color(p) for p in pctls]
+
+    fig = go.Figure()
+
+    # Fondo: barra gris hasta 100
+    fig.add_trace(go.Bar(
+        x=[100] * n, y=names, orientation='h',
+        marker=dict(color='#161B22', line=dict(width=0)),
+        showlegend=False, hoverinfo='skip',
+        width=0.65,
+    ))
+    # Barra de percentil real
+    fig.add_trace(go.Bar(
+        x=pctls, y=names, orientation='h',
+        marker=dict(color=bar_colors, line=dict(width=0)),
+        text=[f"{p:.0f}% · {v} · w={w:.1f}" if pd.notna(p) else '—'
+              for p, v, w in zip(pctls, vals, wts)],
+        textposition='inside', insidetextanchor='start',
+        textfont=dict(size=10, color='#F0F6FC', family='JetBrains Mono'),
+        showlegend=False,
+        hovertemplate='<b>%{y}</b><br>Percentil: %{x:.1f}%<extra></extra>',
+        width=0.65,
+    ))
+
     fig.update_layout(
         title=dict(
-            text="<b>VXX — Monitor Operativo BB(20, 2σ) + Contango Rule</b>"
-                 "<sup>  ▲=Entrada  ▼🟡=Salida BB  ▼🔴=Salida CT  💎=Hoy</sup>",
-            font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5,
+            text="<b>Desglose del Barómetro — Percentil rolling por métrica</b>"
+                 "<br><span style='font-size:0.7rem;color:#8B949E;font-family:JetBrains Mono'>"
+                 "Ordenado por nivel de stress · Verde = vol baja · Rojo = vol alta"
+                 "</span>",
+            font=dict(size=13, color='#F0F6FC', family='Inter'), x=0.5, xanchor='center',
+        ),
+        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#0D1117',
+        barmode='overlay',
+        height=max(360, n * 34 + 110),
+        margin=dict(l=160, r=30, t=80, b=40),
+        xaxis=dict(
+            range=[0, 100], showgrid=True, gridcolor='#21262D',
+            tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono'),
+            tickvals=[0, 25, 50, 75, 100],
+            ticktext=['0%', '25%', '50%', '75%', '100%'],
+        ),
+        yaxis=dict(
+            tickfont=dict(size=10, color='#C9D1D9', family='JetBrains Mono'),
+            autorange='reversed',
+        ),
+        showlegend=False,
+    )
+
+    # Línea vertical en 50%
+    fig.add_vline(x=50, line_color='#30363D', line_dash='dot', line_width=1)
+
+    return fig
+
+
+def build_vts_history_chart(history: pd.Series, window: int = 252) -> go.Figure:
+    """
+    Timeline del score del barómetro con bandas de color para cada régimen.
+    """
+    fig = go.Figure()
+
+    if history is None or history.empty:
+        return fig
+
+    # Mostrar solo el último año para claridad
+    h = history.tail(window)
+
+    # Bandas de régimen (horizontales)
+    for y0, y1, color, label in [
+        (0, 20,   'rgba(46,160,67,0.10)',   'Vol Baja'),
+        (20, 40,  'rgba(63,185,80,0.08)',   'Moderada'),
+        (40, 60,  'rgba(255,211,61,0.08)',  'Mid'),
+        (60, 80,  'rgba(251,133,0,0.08)',   'Elevada'),
+        (80, 100, 'rgba(248,81,73,0.10)',   'Extrema'),
+    ]:
+        fig.add_hrect(y0=y0, y1=y1, fillcolor=color, line_width=0, layer='below')
+
+    # Línea del score
+    fig.add_trace(go.Scatter(
+        x=h.index, y=h.values,
+        mode='lines', name='Barómetro VTS',
+        line=dict(color='#58A6FF', width=2.2),
+        fill='tozeroy', fillcolor='rgba(88,166,255,0.06)',
+        hovertemplate='<b>%{x|%Y-%m-%d}</b><br>Score: %{y:.1f}%<extra></extra>',
+    ))
+
+    # Punto actual
+    fig.add_trace(go.Scatter(
+        x=[h.index[-1]], y=[h.iloc[-1]],
+        mode='markers', name='HOY',
+        marker=dict(size=14, color='#F7931A', symbol='diamond',
+                    line=dict(width=2, color='white')),
+        showlegend=False,
+    ))
+
+    # Línea de media histórica
+    mean_val = h.mean()
+    fig.add_hline(y=mean_val, line_color='#F7931A', line_dash='dash',
+                  line_width=1, annotation_text=f"Media: {mean_val:.1f}%",
+                  annotation_position='top right',
+                  annotation_font=dict(size=9, color='#F7931A'))
+
+    fig.update_layout(
+        title=dict(
+            text=f"<b>Histórico del Barómetro — últimos {len(h)} días de trading</b>",
+            font=dict(size=13, color='#F0F6FC', family='Inter'),
+            x=0.5, xanchor='center',
         ),
         template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
-        height=560, margin=dict(l=55, r=30, t=65, b=40),
-        xaxis=dict(
-            gridcolor='#21262D',
-            tickfont=dict(size=10, color='#8B949E', family='JetBrains Mono'),
-            rangeselector=dict(
-                buttons=[
-                    dict(count=1,  label="1M",  step="month", stepmode="backward"),
-                    dict(count=3,  label="3M",  step="month", stepmode="backward"),
-                    dict(count=6,  label="6M",  step="month", stepmode="backward"),
-                    dict(count=1,  label="1A",  step="year",  stepmode="backward"),
-                    dict(count=3,  label="3A",  step="year",  stepmode="backward"),
-                    dict(step="all", label="Todo"),
-                ],
-                bgcolor='#161B22', activecolor='#F7931A',
-                font=dict(size=9, color='#C9D1D9', family='JetBrains Mono'),
-            ),
+        height=380,
+        margin=dict(l=50, r=30, t=60, b=40),
+        xaxis=dict(gridcolor='#21262D',
+                   tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
+        yaxis=dict(
+            range=[0, 100], gridcolor='#21262D',
+            tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono'),
+            title=dict(text="Score %", font=dict(size=10, color='#8B949E')),
+            tickvals=[0, 20, 40, 60, 80, 100],
         ),
-        xaxis2=dict(gridcolor='#21262D',
-                    tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
-        yaxis=dict(title=dict(text="VXX ($)", font=dict(size=11, color='#8B949E')),
-                   gridcolor='#21262D',
-                   tickfont=dict(size=10, color='#8B949E', family='JetBrains Mono')),
-        yaxis2=dict(title=dict(text="Contango %", font=dict(size=10, color='#8B949E')),
-                    gridcolor='#21262D',
-                    tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono'),
-                    zeroline=True, zerolinecolor='#30363D'),
-        legend=dict(orientation='h', yanchor='bottom', y=1.05,
-                    bgcolor='rgba(0,0,0,0)',
-                    font=dict(size=9, color='#8B949E', family='JetBrains Mono')),
-        hovermode='x unified', dragmode=False, bargap=0,
+        hovermode='x unified', showlegend=False,
     )
     return fig
 
@@ -3637,13 +4290,13 @@ def fp(v):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # TABS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-tab1, tab2, tab_edge, tab_skew, tab_gex, tab_cot, tab3, tab4 = st.tabs([
+tab1, tab2, tab_baro, tab_edge, tab_skew, tab_gex, tab3, tab4 = st.tabs([
     "📈  Term Structure",
     "🎯  Monitor Operativo",
+    "🌡️  Barómetro VTS",
     "🔬  Edge Analytics",
     "📐  Vol Skew & Surface",
     "⚡  GEX",
-    "📋  COT · Futuros VIX",
     "💡  Recomendaciones",
     "ℹ️  Help",
 ])
@@ -3948,7 +4601,8 @@ with tab2:
         f"Histórico: {bt.index[0].strftime('%Y-%m-%d')} → {last_date.strftime('%Y-%m-%d')} "
         f"({len(bt):,} días) · Parquet del repo · "
         f"Contango hoy: {ct_source} · "
-        f"▲=Entrada  ▼🟡=Salida BB  ▼🔴=Salida CT"
+        f"▲ verde = Entrada · ▼ amarillo = Salida por BB · ▼ rojo = Salida por Contango · "
+        f"💎 = HOY"
     )
 
     # ═══════════════════════════════════════════════════════════
@@ -4978,170 +5632,212 @@ with tab_gex:
     )
 
 
-# ━━━━━━━━━━━━━━━━━ TAB: COT — COMMITMENTS OF TRADERS ━━━━━━━━
-with tab_cot:
+# ━━━━━━━━━━━━━━━━━ TAB: BARÓMETRO VTS ━━━━━━━━━━━━━━━━━━━━━━
+with tab_baro:
 
     st.markdown("""
     <div style="font-family:'JetBrains Mono',monospace;font-size:0.72rem;color:#8B949E;
                 padding:0.4rem 0 0.8rem;">
-    Fuente: <b>CFTC Disaggregated COT Report</b> · Código VIX Futures: <b>1170E1</b> ·
-    Publicación: martes ~15:30 ET con datos del martes anterior ·
-    API: publicreporting.cftc.gov (gratuita, sin autenticación)
+    <b>VTS Volatility Barometer</b> · Inspirado en <b>volatilitytradingstrategies.com</b>
+    · Combina <b>13+ métricas de volatilidad</b> en un score único 0-100% ·
+    Cada métrica convertida a percentil rolling (252 días) ·
+    Score = promedio ponderado ·
+    <span style="color:#3FB950">Verde</span> = posición agresiva short vol ·
+    <span style="color:#D29922">Amarillo</span> = cash / neutral ·
+    <span style="color:#F85149">Rojo</span> = hedge / long vol
     </div>
     """, unsafe_allow_html=True)
 
-    col_cot1, col_cot2 = st.columns([3, 1])
-    with col_cot1:
-        cot_weeks = st.slider("Semanas de historia", 26, 156, 104,
-                              help="1 año = 52 semanas · 3 años = 156")
-    with col_cot2:
-        if st.button("🔄 Actualizar COT", key="btn_refresh_cot"):
-            fetch_cot_vix.clear()
-            st.rerun()
-
-    with st.spinner("📋 Descargando COT de CFTC…"):
-        cot_df = fetch_cot_vix(n_weeks=max(cot_weeks + 10, 156))
-
-    if cot_df.empty:
-        st.error("❌ No se pudieron obtener datos COT del CFTC. Verifica conexión.")
-        st.info(
-            "La API CFTC (publicreporting.cftc.gov) es pública y gratuita. "
-            "Si falla, intenta de nuevo en unos minutos — el caché es de 6 horas."
+    # Slider para ventana
+    col_w1, col_w2 = st.columns([3, 1])
+    with col_w1:
+        baro_window = st.select_slider(
+            "Ventana rolling para percentiles",
+            options=[126, 252, 504, 756],
+            value=252,
+            format_func=lambda x: f"{x} días (~{x//21}m)",
+            help="VTS usa 252d = 1 año. Ventanas más cortas reaccionan más rápido.",
         )
-    else:
-        last_cot = cot_df.iloc[-1]
-        last_date_cot = last_cot["date"].strftime("%Y-%m-%d") if pd.notna(last_cot["date"]) else "?"
+    with col_w2:
+        st.write("")
+        st.write("")
+        if st.button("🔄 Recalcular", key="btn_baro_recalc"):
+            compute_vts_barometer.clear()
+            fetch_edge_extra.clear()
 
-        # ── Métricas de resumen ──────────────────────────────────
-        mm_net    = int(last_cot.get("net_mm", 0) or 0)
-        mm_pct    = last_cot.get("net_mm_pct", None)
-        mm_pctile = last_cot.get("net_mm_pct_pctile", None)
-        oi_val    = int(last_cot.get("oi", 0) or 0)
-        dealer_net = int(last_cot.get("net_dealer", 0) or 0)
-        comm_net   = int(last_cot.get("net_commercial", 0) or 0)
+    # ── Cargar datos necesarios ──────────────────────────
+    with st.spinner("🌡️ Calculando barómetro..."):
+        df_master_baro = load_master_parquet()
+        if df_master_baro.empty:
+            st.error("❌ No se encontró data/master.parquet")
+            st.stop()
 
-        # Señal interpretativa
-        if mm_pctile is not None:
-            if mm_net > 0 and mm_pctile > 70:
-                cot_signal = "⚡ MM NET LONG extremo — alta demanda de vol"
-                cot_sig_clr = "var(--r)"
-                cot_interp = ("Managed Money está net long VIX futures por encima del percentil 70 histórico. "
-                              "El mercado está pagando prima de volatilidad elevada — favorable para estrategias de venta de vol "
-                              "pero indica precaución: el mercado anticipa movimiento.")
-            elif mm_net > 0:
-                cot_signal = "📈 MM NET LONG moderado"
-                cot_sig_clr = "var(--y)"
-                cot_interp = ("Managed Money tiene posición neta long en VIX futures — expectativa moderada de vol. "
-                              "El contango puede estar bajo presión.")
-            elif mm_net < 0 and mm_pctile is not None and mm_pctile < 30:
-                cot_signal = "✅ MM NET SHORT — complacencia elevada"
-                cot_sig_clr = "var(--g)"
-                cot_interp = ("Managed Money está net short VIX futures — los especuladores apuestan a que la vol baja. "
-                              "Históricamente favorable para estrategias de inverse vol como SVXY/SVIX. "
-                              "Señal de complacencia: el mercado no anticipa volatilidad.")
-            else:
-                cot_signal = "➡️ Posicionamiento neutral"
-                cot_sig_clr = "var(--b)"
-                cot_interp = "Managed Money está cerca del equilibrio en futuros VIX."
+        # Aplicar estrategia (añade BB_SMA20 etc.)
+        bt_baro = build_strategy_cached(df_master_baro)
+
+        # Extender con datos live
+        live_ext = fetch_live_spy_vix()
+        if not live_ext.empty:
+            # Merge solo donde el parquet no tiene datos
+            for col in live_ext.columns:
+                if col in bt_baro.columns:
+                    bt_baro[col] = bt_baro[col].fillna(
+                        live_ext[col].reindex(bt_baro.index))
+                else:
+                    bt_baro[col] = live_ext[col].reindex(bt_baro.index)
+
+        # Fetch de datos extra (VVIX, SKEW, HYG, IEF)
+        edge_extra_baro = fetch_edge_extra()
+
+        # Calcular el barómetro
+        baro = compute_vts_barometer(
+            bt=bt_baro,
+            edge_extra=edge_extra_baro,
+            gex_summary=None,       # opcional — se agrega si está disponible
+            skew_metrics=None,      # opcional
+            window=baro_window,
+        )
+
+    if not baro:
+        st.warning("⚠️ No se pudo calcular el barómetro — verifica datos")
+        st.stop()
+
+    # ── Layout principal: Gauge + KPIs ───────────────────
+    col_gauge, col_kpi = st.columns([1.15, 1])
+
+    with col_gauge:
+        gauge_fig = build_vts_barometer_gauge(
+            score=baro['score'],
+            regime=baro['regime'],
+            date_str=baro['date'].strftime('%Y-%m-%d'),
+        )
+        st.plotly_chart(gauge_fig, width="stretch", config=dict(displayModeBar=False))
+
+    with col_kpi:
+        score    = baro['score']
+        regime   = baro['regime']
+        position = baro['position']
+        n_metrics = len(baro['metrics'])
+
+        # Determinar color del régimen
+        if   score < 20: rc = 'var(--g)'
+        elif score < 40: rc = 'var(--g)'
+        elif score < 60: rc = 'var(--y)'
+        elif score < 80: rc = '#FB8500'
+        else:            rc = 'var(--r)'
+
+        # Percentil del score HOY vs su historia
+        if baro['history'] is not None and not baro['history'].empty:
+            h = baro['history']
+            score_pctile = (h <= score).mean() * 100
+            h_mean = h.mean()
+            h_max = h.max()
+            h_min = h.min()
         else:
-            cot_signal = "—"
-            cot_sig_clr = "var(--dim)"
-            cot_interp  = ""
-
-        mm_pct_s   = f"{mm_pct:+.1f}% del OI" if mm_pct is not None else "—"
-        mm_pctile_s = f"Pct {mm_pctile:.0f}°" if mm_pctile is not None else "—"
+            score_pctile = 50; h_mean = 50; h_max = 100; h_min = 0
 
         st.markdown(f"""
-        <div class="mrow">
-            <div class="mpill" style="min-width:180px">
-                <div class="ml">Señal COT</div>
-                <div style="font-family:'Inter',sans-serif;font-weight:700;font-size:0.9rem;
-                            color:{cot_sig_clr}">{cot_signal}</div>
+        <div style="padding:0.5rem 0;">
+            <div class="sig-box" style="background:rgba(247,147,26,0.08);
+                 border-color:#F7931A;margin-bottom:0.8rem;">
+                <div class="sl" style="color:{rc};">{score:.2f}%</div>
+                <div class="sd" style="font-size:0.85rem;color:{rc};font-weight:700;">
+                    Régimen: {regime}
+                </div>
+                <div class="sd" style="margin-top:4px;">{position}</div>
             </div>
-            <div class="mpill">
-                <div class="ml">Net MM · {last_date_cot}</div>
-                <div class="mv {'up' if mm_net>=0 else 'dn'}">{mm_net:+,}</div>
-            </div>
-            <div class="mpill">
-                <div class="ml">Net MM % OI</div>
-                <div class="mv nt">{mm_pct_s}</div>
-            </div>
-            <div class="mpill">
-                <div class="ml">Percentil histórico</div>
-                <div class="mv nt">{mm_pctile_s}</div>
-            </div>
-            <div class="mpill">
-                <div class="ml">Open Interest</div>
-                <div class="mv nt">{oi_val:,}</div>
-            </div>
-            <div class="mpill">
-                <div class="ml">Net Dealers</div>
-                <div class="mv {'up' if dealer_net>=0 else 'dn'}">{dealer_net:+,}</div>
-            </div>
-            <div class="mpill">
-                <div class="ml">Net Commercial</div>
-                <div class="mv {'up' if comm_net>=0 else 'dn'}">{comm_net:+,}</div>
+            <div class="icard">
+                <div class="ic-title">📊 Métricas del barómetro</div>
+                <div class="ic-row"><span class="ic-label">Métricas activas</span>
+                    <span class="ic-val">{n_metrics}</span></div>
+                <div class="ic-row"><span class="ic-label">Ventana rolling</span>
+                    <span class="ic-val">{baro['window']}d</span></div>
+                <div class="ic-row"><span class="ic-label">Score HOY</span>
+                    <span class="ic-val" style="color:{rc};font-weight:700">{score:.2f}%</span></div>
+                <div class="ic-row"><span class="ic-label">Percentil histórico</span>
+                    <span class="ic-val">{score_pctile:.1f}°</span></div>
+                <div class="ic-row"><span class="ic-label">Media histórica</span>
+                    <span class="ic-val">{h_mean:.1f}%</span></div>
+                <div class="ic-row"><span class="ic-label">Rango (min-max)</span>
+                    <span class="ic-val">{h_min:.1f}% – {h_max:.1f}%</span></div>
             </div>
         </div>
         """, unsafe_allow_html=True)
 
-        if cot_interp:
-            with st.expander("📊 Interpretación COT", expanded=True):
-                st.markdown(cot_interp)
-                st.markdown("""
-**Guía de lectura rápida:**
-- **Managed Money net LONG VIX** → especuladores apuestan a subida de vol → mercado defensivo
-- **Managed Money net SHORT VIX** → especuladores apuestan a vol baja → contango favorable
-- **OI creciente + MM net short** → el trade de inverse vol tiene viento de cola
-- **OI cayendo** → posiciones se están cerrando, reducir convicción
-- El COT se publica **cada martes** con datos de la semana anterior
-                """)
+    st.markdown("<div style='border-top:1px solid #30363D;margin:0.8rem 0'></div>",
+                unsafe_allow_html=True)
 
-        st.markdown("<div style='border-top:1px solid #30363D;margin:0.5rem 0'></div>",
-                    unsafe_allow_html=True)
+    # ── Histórico del score ──────────────────────────────
+    if baro['history'] is not None and not baro['history'].empty:
+        hist_fig = build_vts_history_chart(baro['history'], window=baro_window)
+        st.plotly_chart(hist_fig, width="stretch", config=dict(displayModeBar=False))
 
-        # ── Charts ──────────────────────────────────────────────
-        try:
-            fig_pos = build_cot_positioning_chart(cot_df, window=cot_weeks)
-            if fig_pos.data:
-                st.plotly_chart(fig_pos, width="stretch", config=dict(displayModeBar=False))
-        except Exception as e:
-            st.error(f"Error chart posicionamiento: {e}")
+    st.markdown("<div style='border-top:1px solid #30363D;margin:0.8rem 0'></div>",
+                unsafe_allow_html=True)
 
-        col_oi, col_bd = st.columns(2)
-        with col_oi:
-            try:
-                fig_oi = build_cot_oi_chart(cot_df, window=cot_weeks)
-                if fig_oi.data:
-                    st.plotly_chart(fig_oi, width="stretch", config=dict(displayModeBar=False))
-            except Exception as e:
-                st.error(f"Error chart OI: {e}")
+    # ── Desglose de métricas ─────────────────────────────
+    metrics_fig = build_vts_metrics_table(baro['metrics'])
+    st.plotly_chart(metrics_fig, width="stretch", config=dict(displayModeBar=False))
 
-        with col_bd:
-            try:
-                fig_bd = build_cot_breakdown_chart(cot_df, window=min(cot_weeks, 104))
-                if fig_bd.data:
-                    st.plotly_chart(fig_bd, width="stretch", config=dict(displayModeBar=False))
-            except Exception as e:
-                st.error(f"Error chart breakdown: {e}")
+    # ── Interpretación y guía de lectura ─────────────────
+    with st.expander("📖 Metodología y guía de lectura", expanded=False):
+        st.markdown(f"""
+**Qué mide el barómetro**
 
-        # ── Tabla histórica ─────────────────────────────────────
-        with st.expander("📋 Datos semanales COT"):
-            show_cols = [c for c in
-                ["date","oi","mm_long","mm_short","net_mm","net_mm_pct","net_mm_pct_pctile",
-                 "dealer_long","dealer_short","net_dealer","prod_long","prod_short","net_commercial"]
-                if c in cot_df.columns]
-            st.dataframe(
-                cot_df[show_cols].tail(cot_weeks).sort_values("date", ascending=False),
-                use_container_width=True, hide_index=True,
-            )
+El VTS Volatility Barometer combina {n_metrics} métricas de volatilidad en un único score
+0-100%. Cada métrica individual solo captura una porción del mercado
+(futuros VIX, opciones SPX, credit, etc.), pero combinadas ofrecen una lectura robusta
+del régimen de volatilidad actual.
 
-        st.caption(
-            f"CFTC Disaggregated COT · VIX Futures (1170E1) · "
-            f"Última semana: {last_date_cot} · "
-            f"Cache: 6h · publicreporting.cftc.gov"
-        )
+**Métricas incluidas en esta implementación:**
 
+1. **VIX Spot Level** — percentil del nivel absoluto del VIX
+2. **VIX / VIX-Fut M1** — inversión de la parte corta de la curva
+3. **VVIX** — volatilidad del VIX (demanda de opciones sobre VIX)
+4. **Contango M1-M2 (invertido)** — roll yield disponible
+5. **VXX / SMA(20)** — momentum direccional del VXX
+6. **SPY RV 22d** — volatilidad realizada del subyacente
+7. **VRP (VIX-RV) invertido** — risk premium compression
+8. **CBOE SKEW Index** — demanda de puts OTM SPX
+9. **HYG/IEF (invertido)** — proxy de credit spread
+10. **SPY Drawdown 20d** — profundidad del drawdown reciente
+11. **VIX 5d change %** — velocidad del cambio de vol
+12. **Contango M4-M7 (invertido)** — curva larga, stress estructural
+13. **SPY vs SMA(200) (invertido)** — régimen macro bull/bear
+
+**Interpretación del score:**
+
+- **0-20% (Vol BAJA)**: Todos los indicadores apuntan a vol estable.
+  Posición agresiva short vol — SVXY/SVIX al 100%.
+- **20-40% (MODERADA)**: La mayoría de señales verdes pero algunos indicadores
+  elevados. SVXY al 75-100% — el trade funciona pero con alerta.
+- **40-60% (MID)**: Señales mixtas. Cash o posición parcial (25-50%).
+  Es el rango donde más falsos positivos ocurren.
+- **60-80% (ELEVADA)**: Mayoría de señales rojas. Cash. Evitar short vol.
+- **80-100% (EXTREMA)**: Entorno de crisis (COVID, Aug 2015, Feb 2018).
+  Oportunidad de **long VIX / short equities / long puts**.
+
+**Diferencias vs VTS original:**
+
+VTS usa su propia mezcla propietaria de 13 métricas con pesos afinados durante más
+de una década. Esta implementación usa métricas similares pero los pesos pueden
+diferir. La utilidad principal es como **filtro de régimen**: confirma cuándo el
+entorno es favorable para la estrategia BB × Contango del Monitor Operativo.
+
+**Uso recomendado:**
+
+- Score < 40% + señal LONG del Monitor Operativo = **convicción alta**
+- Score 40-60% + señal LONG = **reducir tamaño o esperar confirmación**
+- Score > 60% = **NO tomar señal LONG aunque el Monitor la marque**
+- Score > 80% = **considerar posiciones long vol (VXX/UVXY)** como hedge
+""")
+
+    st.caption(
+        f"VTS Volatility Barometer v1.0 · "
+        f"Inspirado en volatilitytradingstrategies.com · "
+        f"Ventana: {baro_window}d · Métricas: {n_metrics} · "
+        f"Última actualización: {baro['date'].strftime('%Y-%m-%d')}"
+    )
 
 
 # ━━━━━━━━━━━━━━━━━ TAB 3: RECOMENDACIONES ━━━━━━━━━━━━━━━━━
@@ -5217,29 +5913,58 @@ with tab4:
     st.markdown("""
     ### VIX Controller — Guía
 
-    **Tab 1: Term Structure** — Réplica de VIXCentral.com
-    - Datos scrapeados directamente de la tabla CBOE Delayed Quotes via **Playwright + Chromium**
-    - Solo contratos mensuales (regex `^VX/[A-Z]\\d+$` — filtra weeklys como VX12, VX13, etc.)
-    - Muestra columnas: **Last, Change, High, Low, Settlement, Volume** (como la tabla CBOE)
+    **Tab 1 · Term Structure** — Réplica de VIXCentral.com
+    - Datos scrapeados de CBOE Delayed Quotes vía **Playwright + Chromium**
+    - Solo contratos mensuales (regex `^VX/[A-Z]\\d+$`)
+    - Columnas: **Last, Change, High, Low, Settlement, Volume**
     - Tabla de contango/diferencia entre meses (estilo VIXCentral)
-    - Month 7 to 4 contango
-    - Auto-refresh cada 60 segundos
+    - Refresh manual desde el botón del sidebar
 
-    **Tab 2: Monitor Operativo** — Señal BB × Contango
-    - **BB Timing**: VXX < SMA(20) = LONG, VXX > BB Superior = EXIT
-    - **Contango**: se alimenta automáticamente del term structure scrapeado
-    - **Señal Final** = BB × Contango
-    - Gráfico VXX + BB con zonas y flechas ENTRY/EXIT
+    **Tab 2 · Monitor Operativo** — Señal BB × Contango (v2)
+    - **BB Timing**: VXX < SMA(20) → LONG, VXX > BB Superior → EXIT
+    - **Contango Rule**: contango > 0 es requisito para estar LONG
+    - **Señal Final** = sig_BB × sig_Contango (AND lógico)
+    - Gráfica rediseñada con 3 paneles:
+      1. VXX + BB + flechas Entry/Exit diferenciadas
+      2. Contango histórico con barras verdes/rojas
+      3. **Equity Curve** de la estrategia vs Buy&Hold SVXY
+    - Backtest walk-forward con Sharpe rolling
+
+    **Tab 3 · Barómetro VTS** — *NUEVO*
+    - Inspirado en `volatilitytradingstrategies.com`
+    - **13+ métricas de volatilidad** combinadas en score 0-100%
+    - Percentiles rolling (window configurable: 126-756 días)
+    - Gauge visual con 5 regímenes coloreados
+    - Desglose por métrica + timeline histórico
+    - Filtro de régimen para validar señales del Monitor Operativo
+
+    **Tab 4 · Edge Analytics** — Diagnósticos estadísticos
+    - VRP (IV-RV), HAR-RV forecast, roll yield, VVIX ratio, skew, credit
+
+    **Tab 5 · Vol Skew & Surface** — IV via Black-Scholes + Brent
+    - Smile por vencimiento, term structure ATM, superficie 3D, heatmap
+    - SVI fit para smoothing y forecast
+
+    **Tab 6 · GEX** — Gamma Exposure del SPX
+    - Perfil GEX por strike, expected move, DEX, cumulative GEX
+    - Vanna/Charm, GEX por vencimiento
+    - Zero Gamma Level y flip point
 
     ---
 
-    **Fuentes:**
+    **Fuentes de datos:**
     - `cboe.com/delayed_quotes/futures/future_quotes` — scrapeado con Playwright
-    - Yahoo Finance — VIX spot, VXX, SVXY, SVIX, SPY
+    - Yahoo Finance — VIX, VVIX, SKEW, VXX, SVXY, SVIX, SPY, HYG, IEF, chains de opciones
+    - Parquet local `data/master.parquet` — histórico de VXX + futuros VIX
 
     **Para Streamlit Cloud necesitas:**
-    - `packages.txt` con dependencias de Chromium
-    - `requirements.txt` con playwright
+    - `packages.txt` con dependencias de Chromium (libnss3, libatk, etc.)
+    - `requirements.txt` con playwright + yfinance + plotly + scipy
+
+    **Bugs corregidos en esta versión:**
+    - Pestaña COT eliminada (funciones `build_cot_*_chart` nunca se definieron)
+    - Decorador `@st.cache_data` huérfano que causaba TTL incorrecto
+    - Gráfica Monitor Operativo: flechas ahora son markers scatter (no anotaciones de texto que se perdían)
     """)
 
 st.markdown(f"""
