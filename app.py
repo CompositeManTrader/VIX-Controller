@@ -291,12 +291,24 @@ def fetch_etps():
 
 @st.cache_data(ttl=300)
 def fetch_edge_extra():
-    """Fetches VVIX, SKEW, HYG, IEF live from yfinance.
-    Index is timezone-normalized to UTC-naive for safe joining."""
+    """Fetches VVIX, SKEW, HYG, IEF, y toda la familia VIX para barómetro.
+    Período 5y para percentiles rolling robustos (252d).
+    Index timezone-normalizado a UTC-naive para join seguro."""
     out = {}
-    for name, sym in [("VVIX","^VVIX"), ("SKEW","^SKEW"), ("HYG","HYG"), ("IEF","IEF")]:
+    tickers = [
+        ("VVIX",   "^VVIX"),
+        ("SKEW",   "^SKEW"),
+        ("HYG",    "HYG"),
+        ("IEF",    "IEF"),
+        # Familia VIX para el barómetro VTS
+        ("VIX9D",  "^VIX9D"),
+        ("VIX3M",  "^VIX3M"),
+        ("VIX6M",  "^VIX6M"),
+        ("VIX1Y",  "^VIX1Y"),
+    ]
+    for name, sym in tickers:
         try:
-            h = yf.download(sym, period="2y", progress=False, auto_adjust=True)
+            h = yf.download(sym, period="5y", progress=False, auto_adjust=True)
             if isinstance(h.columns, pd.MultiIndex):
                 h.columns = h.columns.get_level_values(0)
             if not h.empty:
@@ -3516,25 +3528,31 @@ def compute_vts_barometer(
     window: int = 252,
 ) -> dict:
     """
-    Calcula el VTS Volatility Barometer — 13 métricas promediadas a score 0-100.
+    VTS Volatility Barometer — 13 indicadores alineados al original
+    de volatilitytradingstrategies.com (Brent Osachoff).
 
-    Parameters
-    ----------
-    bt : DataFrame con VIX_Close, SPY_Close, M1_Price, M2_Price,
-         Contango_pct, VXX_Close, BB_SMA20, VVIX_Live (opcional)
-    edge_extra : dict de DataFrames de fetch_edge_extra() — VVIX, SKEW, HYG, IEF
-    gex_summary : dict opcional con net_gex (del tab GEX)
-    skew_metrics : dict opcional con skew_25d (del tab Vol Skew)
-    window : ventana rolling para percentiles (252 = 1 año)
+    Indicadores (según la imagen oficial del gauge VTS):
+        1.  M1:M2 VIX FUTURES          — contango front
+        2.  M4-M7 VIX FUTURES          — contango curva larga
+        3.  VX30:VIX ROLL YIELD        — roll yield constant-maturity
+        4.  VIX / VVIX / VOLI          — VIX·VVIX composite (VOLI → RV20 proxy)
+        5.  CASH VIX OSCILLATOR        — combinación de ratios VIX term structure
+        6.  VIX - VOLI RESIDUAL        — VIX menos VOLI (RV20 proxy)
+        7.  TRADERS VRP                — WMA(VX30 - HV5, w=1..5)
+        8.  SDEX / TDEX / SKEW         — CBOE SKEW (+ proxies SDEX/TDEX)
+        9.  VIX:VIX3M MEDIUM           — ratio medium term
+        10. EXTREME PUT/CALL RATIO     — skew extremo (proxy)
+        11. VIX9D:VIX FAST             — ratio fast term
+        12. VOLPOCALYPSE THRESHOLD     — trigger compuesto de vol extrema
+        13. (el core: VIX level)       — nivel absoluto VIX
+
+    Todas las métricas se convierten a percentil rolling (window días),
+    normalizadas a 0-100 donde 100 = máximo stress histórico.
 
     Returns
     -------
-    dict con:
-      - score : float 0-100 (el barómetro VTS)
-      - regime : str ("LOW", "MID", "ELEVATED", "EXTREME")
-      - position : str (recomendación operativa)
-      - metrics : list[dict] con cada métrica, su valor y su percentil
-      - history : pd.Series del score histórico (últimos 252 días)
+    dict con score (0-100), regime, position, metrics (lista de dicts),
+    history (serie), window, date.
     """
     if bt.empty or len(bt) < 60:
         return {}
@@ -3542,309 +3560,374 @@ def compute_vts_barometer(
     df = bt.copy()
     metrics = []
 
+    # ── Helpers para series de la familia VIX ──────────────────
+    def _get_series(key: str) -> pd.Series | None:
+        """Intenta obtener una serie de edge_extra alineada al índice de df."""
+        if key in edge_extra and not edge_extra[key].empty:
+            return edge_extra[key]['Close'].reindex(df.index).ffill()
+        return None
+
+    vix     = df.get('VIX_Close')
+    spy     = df.get('SPY_Close')
+    vvix_s  = _get_series('VVIX')
+    if vvix_s is None and 'VVIX_Live' in df.columns:
+        vvix_s = df['VVIX_Live']
+    vix9d   = _get_series('VIX9D')
+    vix3m   = _get_series('VIX3M')
+    vix6m   = _get_series('VIX6M')
+    vix1y   = _get_series('VIX1Y')
+    skew_s  = _get_series('SKEW')
+
+    # VX30 constant-maturity: interpolación lineal entre M1 y M2 a 30 días
+    vx30 = None
+    if all(c in df.columns for c in ['M1_Price', 'M2_Price', 'M1_DTE']):
+        dte1 = df['M1_DTE'].clip(lower=0)
+        # Si M2_DTE no existe, asumimos ~30 días después de M1
+        m2_dte = df['M2_DTE'] if 'M2_DTE' in df.columns else (dte1 + 30)
+        # Interpolación a 30 días
+        t = (30 - dte1) / (m2_dte - dte1).replace(0, np.nan)
+        t = t.clip(0, 1)
+        vx30 = df['M1_Price'] * (1 - t) + df['M2_Price'] * t
+        vx30 = vx30.where(vx30 > 0)
+
+    # HV (historical volatility) del SPY
+    hv5 = hv10 = hv20 = None
+    if spy is not None:
+        log_ret = np.log(spy / spy.shift(1))
+        hv5  = log_ret.rolling(5).std()  * np.sqrt(252) * 100
+        hv10 = log_ret.rolling(10).std() * np.sqrt(252) * 100
+        hv20 = log_ret.rolling(20).std() * np.sqrt(252) * 100
+
     # ══════════════════════════════════════════════════════
-    # MÉTRICA 1 — VIX SPOT LEVEL
-    # Percentil alto = vol alta
+    # 1. M1:M2 VIX FUTURES — contango frontal
+    # Valor alto de backwardation (ratio > 1) = stress
+    # Invertimos: contango alto → percentil bajo (vol baja)
     # ══════════════════════════════════════════════════════
-    if 'VIX_Close' in df.columns:
-        vix_pct = _rolling_percentile(df['VIX_Close'], window)
-        last_val = df['VIX_Close'].iloc[-1]
-        last_pct = vix_pct.iloc[-1] if pd.notna(vix_pct.iloc[-1]) else 50
+    if 'M1_Price' in df.columns and 'M2_Price' in df.columns:
+        m1m2 = df['M1_Price'] / df['M2_Price']  # >1 = backwardation
+        m1m2_pct = _rolling_percentile(m1m2, window)
         metrics.append({
-            'name': 'VIX Spot Level',
-            'value': f"{last_val:.2f}",
-            'percentile': last_pct,
-            'weight': 1.2,  # más peso — es la señal primaria
-            'interpretation': 'Nivel absoluto de volatilidad implícita',
+            'name': 'M1:M2 VIX FUTURES',
+            'value': f"{m1m2.iloc[-1]:.3f}" if pd.notna(m1m2.iloc[-1]) else '—',
+            'percentile': m1m2_pct.iloc[-1] if pd.notna(m1m2_pct.iloc[-1]) else 50,
+            'weight': 1.2,
+            'interpretation': 'Ratio M1/M2 — >1 indica backwardation (stress)',
+            'series': m1m2_pct,
+        })
+
+    # ══════════════════════════════════════════════════════
+    # 2. M4-M7 VIX FUTURES — contango curva larga
+    # ══════════════════════════════════════════════════════
+    if 'M4_Price' in df.columns and 'M7_Price' in df.columns:
+        m4m7 = df['M4_Price'] / df['M7_Price']  # >1 = backwardation en curva larga
+        m4m7_pct = _rolling_percentile(m4m7, window)
+        metrics.append({
+            'name': 'M4-M7 VIX FUTURES',
+            'value': f"{m4m7.iloc[-1]:.3f}" if pd.notna(m4m7.iloc[-1]) else '—',
+            'percentile': m4m7_pct.iloc[-1] if pd.notna(m4m7_pct.iloc[-1]) else 50,
+            'weight': 0.9,
+            'interpretation': 'Ratio M4/M7 — inversión en curva larga = stress estructural',
+            'series': m4m7_pct,
+        })
+
+    # ══════════════════════════════════════════════════════
+    # 3. VX30:VIX ROLL YIELD — roll yield constant-maturity
+    # Formula: (VX30 - VIX) / VIX
+    # Positivo (contango) = vol baja. Invertimos para score.
+    # ══════════════════════════════════════════════════════
+    if vx30 is not None and vix is not None:
+        roll_y = (vx30 - vix) / vix * 100  # % roll yield
+        ry_pct = _rolling_percentile(roll_y, window)
+        inv_ry = 100 - ry_pct  # alto roll yield = vol baja (invertimos)
+        metrics.append({
+            'name': 'VX30:VIX ROLL YIELD',
+            'value': f"{roll_y.iloc[-1]:+.2f}%" if pd.notna(roll_y.iloc[-1]) else '—',
+            'percentile': inv_ry.iloc[-1] if pd.notna(inv_ry.iloc[-1]) else 50,
+            'weight': 1.3,  # el más importante según VTS
+            'interpretation': 'Roll yield constant-maturity 30d · Alto = vol baja',
+            'series': inv_ry,
+        })
+
+    # ══════════════════════════════════════════════════════
+    # 4. VIX / VVIX / VOLI — composite
+    # Tomamos el percentil ponderado del trio. VOLI → RV20 proxy
+    # ══════════════════════════════════════════════════════
+    trio_pctiles = []
+    if vix is not None:
+        trio_pctiles.append(_rolling_percentile(vix, window).iloc[-1])
+    if vvix_s is not None and vvix_s.notna().sum() > 60:
+        trio_pctiles.append(_rolling_percentile(vvix_s, window).iloc[-1])
+    if hv20 is not None and hv20.notna().sum() > 60:
+        # VOLI proxy = RV20 (historial de vol realizada 20d)
+        trio_pctiles.append(_rolling_percentile(hv20, window).iloc[-1])
+    if trio_pctiles:
+        trio_pctiles = [p for p in trio_pctiles if pd.notna(p)]
+        trio_val = np.mean(trio_pctiles) if trio_pctiles else 50
+        # Serie histórica: promedio de los 3 percentiles
+        trio_series = []
+        if vix is not None:
+            trio_series.append(_rolling_percentile(vix, window))
+        if vvix_s is not None and vvix_s.notna().sum() > 60:
+            trio_series.append(_rolling_percentile(vvix_s, window))
+        if hv20 is not None and hv20.notna().sum() > 60:
+            trio_series.append(_rolling_percentile(hv20, window))
+        trio_hist = pd.concat(trio_series, axis=1).mean(axis=1) if trio_series else None
+        metrics.append({
+            'name': 'VIX / VVIX / VOLI',
+            'value': (f"V={vix.iloc[-1]:.1f}" if vix is not None else '') +
+                     (f" VV={vvix_s.iloc[-1]:.0f}" if vvix_s is not None and pd.notna(vvix_s.iloc[-1]) else ''),
+            'percentile': trio_val,
+            'weight': 1.0,
+            'interpretation': 'Composite nivel: VIX + VVIX + VOLI proxy (RV20)',
+            'series': trio_hist,
+        })
+
+    # ══════════════════════════════════════════════════════
+    # 5. CASH VIX OSCILLATOR — combinación de ratios term structure
+    # CVO = promedio de (VIX9D/VIX, VIX/VIX3M, VIX/VIX6M, VIX/VIX1Y)
+    # Alto = inversión de curva = stress
+    # ══════════════════════════════════════════════════════
+    ratios = []
+    ratio_series = []
+    if vix9d is not None and vix is not None:
+        r = vix9d / vix
+        if r.notna().sum() > 30:
+            ratios.append(r); ratio_series.append(r)
+    if vix is not None and vix3m is not None:
+        r = vix / vix3m
+        if r.notna().sum() > 30:
+            ratios.append(r); ratio_series.append(r)
+    if vix is not None and vix6m is not None:
+        r = vix / vix6m
+        if r.notna().sum() > 30:
+            ratios.append(r); ratio_series.append(r)
+    if vix is not None and vix1y is not None:
+        r = vix / vix1y
+        if r.notna().sum() > 30:
+            ratios.append(r); ratio_series.append(r)
+    if ratios:
+        cvo = pd.concat(ratios, axis=1).mean(axis=1)
+        cvo_pct = _rolling_percentile(cvo, window)
+        metrics.append({
+            'name': 'CASH VIX OSCILLATOR',
+            'value': f"{cvo.iloc[-1]:.3f}" if pd.notna(cvo.iloc[-1]) else '—',
+            'percentile': cvo_pct.iloc[-1] if pd.notna(cvo_pct.iloc[-1]) else 50,
+            'weight': 1.1,
+            'interpretation': 'Promedio ratios VIX term structure · Alto = curva invertida',
+            'series': cvo_pct,
+        })
+
+    # ══════════════════════════════════════════════════════
+    # 6. VIX - VOLI RESIDUAL — spread VIX menos VOLI (proxy RV20)
+    # VIX - RV20: bajo o negativo = vol exigida = stress
+    # Invertimos: residual bajo = score alto
+    # ══════════════════════════════════════════════════════
+    if vix is not None and hv20 is not None:
+        residual = vix - hv20
+        res_pct = _rolling_percentile(residual, window)
+        inv_res = 100 - res_pct
+        metrics.append({
+            'name': 'VIX - VOLI RESIDUAL',
+            'value': f"{residual.iloc[-1]:+.2f}" if pd.notna(residual.iloc[-1]) else '—',
+            'percentile': inv_res.iloc[-1] if pd.notna(inv_res.iloc[-1]) else 50,
+            'weight': 0.9,
+            'interpretation': 'VIX menos VOLI (RV20 proxy) · Bajo = mercado exige prima',
+            'series': inv_res,
+        })
+
+    # ══════════════════════════════════════════════════════
+    # 7. TRADERS VRP — WMA(VX30 - HV5, pesos 1,2,3,4,5)
+    # Traders VRP bajo = prima comprimida = stress. Invertimos.
+    # ══════════════════════════════════════════════════════
+    if vx30 is not None and hv5 is not None:
+        vrp = vx30 - hv5
+        # WMA 5-day con pesos 1,2,3,4,5 (normalizado)
+        weights = np.array([1, 2, 3, 4, 5], dtype=float)
+        weights /= weights.sum()
+        traders_vrp = vrp.rolling(5).apply(
+            lambda x: np.dot(x, weights) if len(x) == 5 else np.nan,
+            raw=True,
+        )
+        tvrp_pct = _rolling_percentile(traders_vrp, window)
+        inv_tvrp = 100 - tvrp_pct  # VRP bajo = stress alto
+        metrics.append({
+            'name': 'TRADERS VRP',
+            'value': f"{traders_vrp.iloc[-1]:+.2f}" if pd.notna(traders_vrp.iloc[-1]) else '—',
+            'percentile': inv_tvrp.iloc[-1] if pd.notna(inv_tvrp.iloc[-1]) else 50,
+            'weight': 1.0,
+            'interpretation': 'WMA(VX30 - HV5) · Bajo = prima comprimida (stress)',
+            'series': inv_tvrp,
+        })
+
+    # ══════════════════════════════════════════════════════
+    # 8. SDEX / TDEX / SKEW — CBOE SKEW Index + proxies
+    # SKEW alto = demanda de puts OTM = stress
+    # SDEX proxy = skew normalizado · TDEX proxy = SKEW rolling
+    # ══════════════════════════════════════════════════════
+    if skew_s is not None and skew_s.notna().sum() > 60:
+        skew_pct = _rolling_percentile(skew_s, window)
+        metrics.append({
+            'name': 'SDEX / TDEX / SKEW',
+            'value': f"{skew_s.iloc[-1]:.1f}" if pd.notna(skew_s.iloc[-1]) else '—',
+            'percentile': skew_pct.iloc[-1] if pd.notna(skew_pct.iloc[-1]) else 50,
+            'weight': 0.9,
+            'interpretation': 'CBOE SKEW Index · Alto = demanda de puts OTM (cola izq)',
+            'series': skew_pct,
+        })
+
+    # ══════════════════════════════════════════════════════
+    # 9. VIX:VIX3M MEDIUM — ratio medium term
+    # >1 = backwardation medio plazo = stress
+    # ══════════════════════════════════════════════════════
+    if vix is not None and vix3m is not None:
+        vv3m = vix / vix3m
+        if vv3m.notna().sum() > 30:
+            vv3m_pct = _rolling_percentile(vv3m, window)
+            metrics.append({
+                'name': 'VIX:VIX3M MEDIUM',
+                'value': f"{vv3m.iloc[-1]:.3f}" if pd.notna(vv3m.iloc[-1]) else '—',
+                'percentile': vv3m_pct.iloc[-1] if pd.notna(vv3m_pct.iloc[-1]) else 50,
+                'weight': 1.1,
+                'interpretation': 'VIX/VIX3M · >1 = backwardation medio plazo',
+                'series': vv3m_pct,
+            })
+
+    # ══════════════════════════════════════════════════════
+    # 10. EXTREME PUT/CALL RATIO — skew extremo (proxy)
+    # Usamos SKEW^2 como proxy de demanda extrema de puts
+    # O la variación 5d del SKEW (momentum de demanda defensiva)
+    # ══════════════════════════════════════════════════════
+    if skew_s is not None and skew_s.notna().sum() > 60:
+        # Momentum del SKEW: variación 5d amplifica señal extrema
+        skew_mom = skew_s.pct_change(5) * 100
+        # Combinamos nivel SKEW + momentum
+        skew_mom_pct = _rolling_percentile(skew_mom, window)
+        metrics.append({
+            'name': 'EXTREME PUT/CALL RATIO',
+            'value': f"{skew_mom.iloc[-1]:+.2f}%" if pd.notna(skew_mom.iloc[-1]) else '—',
+            'percentile': skew_mom_pct.iloc[-1] if pd.notna(skew_mom_pct.iloc[-1]) else 50,
+            'weight': 0.8,
+            'interpretation': 'SKEW momentum 5d · Alto = salto en demanda de puts',
+            'series': skew_mom_pct,
+        })
+
+    # ══════════════════════════════════════════════════════
+    # 11. VIX9D:VIX FAST — ratio fast term
+    # >1 = vol cola corta > vol 30d = stress inmediato
+    # ══════════════════════════════════════════════════════
+    if vix9d is not None and vix is not None:
+        fast = vix9d / vix
+        if fast.notna().sum() > 30:
+            fast_pct = _rolling_percentile(fast, window)
+            metrics.append({
+                'name': 'VIX9D:VIX FAST',
+                'value': f"{fast.iloc[-1]:.3f}" if pd.notna(fast.iloc[-1]) else '—',
+                'percentile': fast_pct.iloc[-1] if pd.notna(fast_pct.iloc[-1]) else 50,
+                'weight': 1.0,
+                'interpretation': 'VIX9D/VIX · >1 = cola corta caliente (stress inmediato)',
+                'series': fast_pct,
+            })
+
+    # ══════════════════════════════════════════════════════
+    # 12. VOLPOCALYPSE THRESHOLD — trigger compuesto vol extrema
+    # Combinación: VIX absoluto (nivel 30+) + backwardation M1/M2 + momentum VIX 5d
+    # Score 0-100 directo (no percentil)
+    # ══════════════════════════════════════════════════════
+    if vix is not None and 'M1_Price' in df.columns and 'M2_Price' in df.columns:
+        last_vix = vix.iloc[-1]
+        last_m1m2 = df['M1_Price'].iloc[-1] / df['M2_Price'].iloc[-1] if pd.notna(df['M2_Price'].iloc[-1]) else 1.0
+        vix_5d_chg = vix.pct_change(5).iloc[-1] * 100 if pd.notna(vix.pct_change(5).iloc[-1]) else 0
+
+        # Score heurístico:
+        #   VIX < 15 → 5    VIX 15-20 → 20    VIX 20-25 → 40
+        #   VIX 25-30 → 55  VIX 30-40 → 75    VIX > 40 → 90
+        if last_vix < 15:     vix_score = 5
+        elif last_vix < 20:   vix_score = 20
+        elif last_vix < 25:   vix_score = 40
+        elif last_vix < 30:   vix_score = 55
+        elif last_vix < 40:   vix_score = 75
+        else:                 vix_score = 92
+
+        # Backwardation boost
+        if last_m1m2 > 1.02:   vix_score = min(100, vix_score + 15)
+        elif last_m1m2 > 1.00: vix_score = min(100, vix_score + 5)
+
+        # Momentum boost
+        if vix_5d_chg > 40:    vix_score = min(100, vix_score + 10)
+        elif vix_5d_chg > 20:  vix_score = min(100, vix_score + 5)
+
+        # Serie histórica (cálculo vectorizado simplificado)
+        hist_scores = pd.Series(index=vix.index, dtype=float)
+        vix_arr = vix.values
+        m1m2_hist = (df['M1_Price'] / df['M2_Price']).fillna(1.0)
+        vix_chg_5d = vix.pct_change(5).fillna(0) * 100
+        for i in range(len(vix)):
+            v = vix_arr[i]
+            if pd.isna(v):
+                hist_scores.iloc[i] = np.nan; continue
+            if   v < 15: s = 5
+            elif v < 20: s = 20
+            elif v < 25: s = 40
+            elif v < 30: s = 55
+            elif v < 40: s = 75
+            else:        s = 92
+            r = m1m2_hist.iloc[i]
+            if r > 1.02:   s = min(100, s + 15)
+            elif r > 1.00: s = min(100, s + 5)
+            ch = vix_chg_5d.iloc[i]
+            if ch > 40:    s = min(100, s + 10)
+            elif ch > 20:  s = min(100, s + 5)
+            hist_scores.iloc[i] = s
+
+        metrics.append({
+            'name': 'VOLPOCALYPSE THRESHOLD',
+            'value': f"VIX={last_vix:.1f} · M1/M2={last_m1m2:.3f}",
+            'percentile': vix_score,
+            'weight': 1.0,
+            'interpretation': 'Trigger compuesto · VIX + backwardation + momentum',
+            'series': hist_scores,
+        })
+
+    # ══════════════════════════════════════════════════════
+    # 13. VIX LEVEL (core — nivel absoluto del VIX)
+    # Percentil rolling del nivel absoluto · mantenemos el VIX como ancla
+    # ══════════════════════════════════════════════════════
+    if vix is not None:
+        vix_pct = _rolling_percentile(vix, window)
+        metrics.append({
+            'name': 'VIX LEVEL (core)',
+            'value': f"{vix.iloc[-1]:.2f}",
+            'percentile': vix_pct.iloc[-1] if pd.notna(vix_pct.iloc[-1]) else 50,
+            'weight': 1.2,
+            'interpretation': 'Nivel absoluto del VIX · Ancla del barómetro',
             'series': vix_pct,
         })
 
     # ══════════════════════════════════════════════════════
-    # MÉTRICA 2 — VIX/VIX3M RATIO (term structure inversion)
-    # ratio > 1 = backwardation (stress). Percentil alto = vol alta
+    # SCORE FINAL — promedio ponderado de los percentiles
     # ══════════════════════════════════════════════════════
-    # Proxy: 1 - Contango_pct/100 es ~VIX/M1 spread
-    # Mejor: usar VIX / M1_Price directamente
-    if 'VIX_Close' in df.columns and 'M1_Price' in df.columns:
-        vix_m1 = df['VIX_Close'] / df['M1_Price']
-        vm1_pct = _rolling_percentile(vix_m1, window)
-        metrics.append({
-            'name': 'VIX / VIX-Fut M1',
-            'value': f"{vix_m1.iloc[-1]:.3f}",
-            'percentile': vm1_pct.iloc[-1] if pd.notna(vm1_pct.iloc[-1]) else 50,
-            'weight': 1.0,
-            'interpretation': '>1 indica backwardation (stress a corto plazo)',
-            'series': vm1_pct,
-        })
-
-    # ══════════════════════════════════════════════════════
-    # MÉTRICA 3 — VVIX (vol de vol) — percentil alto = stress
-    # ══════════════════════════════════════════════════════
-    vvix_s = None
-    if 'VVIX_Live' in df.columns and df['VVIX_Live'].notna().sum() > 60:
-        vvix_s = df['VVIX_Live']
-    elif 'VVIX' in edge_extra and not edge_extra['VVIX'].empty:
-        vvix_s = edge_extra['VVIX']['Close'].reindex(df.index).ffill()
-    if vvix_s is not None and vvix_s.notna().sum() > 60:
-        vvix_pct = _rolling_percentile(vvix_s, window)
-        metrics.append({
-            'name': 'VVIX (vol del VIX)',
-            'value': f"{vvix_s.iloc[-1]:.1f}" if pd.notna(vvix_s.iloc[-1]) else '—',
-            'percentile': vvix_pct.iloc[-1] if pd.notna(vvix_pct.iloc[-1]) else 50,
-            'weight': 1.0,
-            'interpretation': 'Demanda de protección via opciones sobre VIX',
-            'series': vvix_pct,
-        })
-
-    # ══════════════════════════════════════════════════════
-    # MÉTRICA 4 — CONTANGO M1-M2 (inverted: alto contango = vol baja)
-    # INVERTIDO: vol alta = bajo contango/backwardation = 100-contango_pct
-    # ══════════════════════════════════════════════════════
-    if 'Contango_pct' in df.columns:
-        ct_pct = _rolling_percentile(df['Contango_pct'], window)
-        # Invertido: contango alto = vol baja = score bajo
-        inv_pct = 100 - ct_pct
-        metrics.append({
-            'name': 'Contango M1-M2 (inv)',
-            'value': f"{df['Contango_pct'].iloc[-1]:+.2f}%",
-            'percentile': inv_pct.iloc[-1] if pd.notna(inv_pct.iloc[-1]) else 50,
-            'weight': 1.2,  # clave para la estrategia
-            'interpretation': 'Contango alto = vol baja (invertido para el score)',
-            'series': inv_pct,
-        })
-
-    # ══════════════════════════════════════════════════════
-    # MÉTRICA 5 — VXX MOMENTUM vs SMA(20)
-    # VXX > SMA significa vol subiendo. Percentil del ratio.
-    # ══════════════════════════════════════════════════════
-    if 'VXX_Close' in df.columns and 'BB_SMA20' in df.columns:
-        vxx_mom = df['VXX_Close'] / df['BB_SMA20']
-        vxx_mom_pct = _rolling_percentile(vxx_mom, window)
-        metrics.append({
-            'name': 'VXX / SMA(20)',
-            'value': f"{vxx_mom.iloc[-1]:.3f}",
-            'percentile': vxx_mom_pct.iloc[-1] if pd.notna(vxx_mom_pct.iloc[-1]) else 50,
-            'weight': 0.9,
-            'interpretation': '>1 = momentum alcista en vol',
-            'series': vxx_mom_pct,
-        })
-
-    # ══════════════════════════════════════════════════════
-    # MÉTRICA 6 — SPY REALIZED VOL 22d (annualizada)
-    # ══════════════════════════════════════════════════════
-    if 'SPY_Close' in df.columns:
-        log_ret = np.log(df['SPY_Close'] / df['SPY_Close'].shift(1))
-        rv22 = log_ret.rolling(22).std() * np.sqrt(252) * 100
-        rv_pct = _rolling_percentile(rv22, window)
-        metrics.append({
-            'name': 'SPY RV 22d (ann.)',
-            'value': f"{rv22.iloc[-1]:.2f}%" if pd.notna(rv22.iloc[-1]) else '—',
-            'percentile': rv_pct.iloc[-1] if pd.notna(rv_pct.iloc[-1]) else 50,
-            'weight': 1.0,
-            'interpretation': 'Volatilidad realizada del SPY últimos 22 días',
-            'series': rv_pct,
-        })
-
-    # ══════════════════════════════════════════════════════
-    # MÉTRICA 7 — VRP (VIX - RV) — Risk Premium
-    # VRP bajo o negativo = vol siendo exigida fuerte = stress
-    # INVERTIDO: vrp bajo = stress alto
-    # ══════════════════════════════════════════════════════
-    if 'SPY_Close' in df.columns and 'VIX_Close' in df.columns:
-        log_ret = np.log(df['SPY_Close'] / df['SPY_Close'].shift(1))
-        rv22 = log_ret.rolling(22).std() * np.sqrt(252) * 100
-        vrp = df['VIX_Close'] - rv22
-        vrp_pct = _rolling_percentile(vrp, window)
-        # Invertido: VRP bajo = stress
-        inv_vrp = 100 - vrp_pct
-        metrics.append({
-            'name': 'VRP (VIX-RV) inv',
-            'value': f"{vrp.iloc[-1]:+.2f}" if pd.notna(vrp.iloc[-1]) else '—',
-            'percentile': inv_vrp.iloc[-1] if pd.notna(inv_vrp.iloc[-1]) else 50,
-            'weight': 0.9,
-            'interpretation': 'VRP bajo = mercado exige prima alta por vol',
-            'series': inv_vrp,
-        })
-
-    # ══════════════════════════════════════════════════════
-    # MÉTRICA 8 — SKEW INDEX (CBOE)
-    # SKEW alto = cola izquierda cara = demanda de puts OTM
-    # ══════════════════════════════════════════════════════
-    if 'SKEW' in edge_extra and not edge_extra['SKEW'].empty:
-        skew_s = edge_extra['SKEW']['Close'].reindex(df.index).ffill()
-        if skew_s.notna().sum() > 60:
-            skew_pct = _rolling_percentile(skew_s, window)
-            metrics.append({
-                'name': 'CBOE SKEW Index',
-                'value': f"{skew_s.iloc[-1]:.1f}" if pd.notna(skew_s.iloc[-1]) else '—',
-                'percentile': skew_pct.iloc[-1] if pd.notna(skew_pct.iloc[-1]) else 50,
-                'weight': 0.8,
-                'interpretation': 'Demanda de puts OTM (cola izquierda del SPX)',
-                'series': skew_pct,
-            })
-
-    # ══════════════════════════════════════════════════════
-    # MÉTRICA 9 — HYG/IEF ratio (credit spread proxy)
-    # HYG cae vs IEF = credit stress. INVERTIDO.
-    # ══════════════════════════════════════════════════════
-    if ('HYG' in edge_extra and not edge_extra['HYG'].empty and
-        'IEF' in edge_extra and not edge_extra['IEF'].empty):
-        hyg_s = edge_extra['HYG']['Close'].reindex(df.index).ffill()
-        ief_s = edge_extra['IEF']['Close'].reindex(df.index).ffill()
-        hyg_ief = hyg_s / ief_s
-        if hyg_ief.notna().sum() > 60:
-            hyg_pct = _rolling_percentile(hyg_ief, window)
-            # Invertido: ratio bajo = credit stress
-            inv_hyg = 100 - hyg_pct
-            metrics.append({
-                'name': 'HYG/IEF (credit, inv)',
-                'value': f"{hyg_ief.iloc[-1]:.3f}" if pd.notna(hyg_ief.iloc[-1]) else '—',
-                'percentile': inv_hyg.iloc[-1] if pd.notna(inv_hyg.iloc[-1]) else 50,
-                'weight': 0.7,
-                'interpretation': 'HYG/IEF cae → credit spread se abre → stress',
-                'series': inv_hyg,
-            })
-
-    # ══════════════════════════════════════════════════════
-    # MÉTRICA 10 — SPY 20d Drawdown
-    # Drawdown profundo = stress. Usamos -dd para que sea positivo=stress
-    # ══════════════════════════════════════════════════════
-    if 'SPY_Close' in df.columns:
-        roll_max = df['SPY_Close'].rolling(20, min_periods=5).max()
-        dd20 = (df['SPY_Close'] / roll_max - 1) * 100  # negativo
-        dd_inv = -dd20  # positivo
-        dd_pct = _rolling_percentile(dd_inv, window)
-        metrics.append({
-            'name': 'SPY Drawdown 20d',
-            'value': f"{dd20.iloc[-1]:.2f}%" if pd.notna(dd20.iloc[-1]) else '—',
-            'percentile': dd_pct.iloc[-1] if pd.notna(dd_pct.iloc[-1]) else 50,
-            'weight': 0.8,
-            'interpretation': 'Profundidad del drawdown reciente',
-            'series': dd_pct,
-        })
-
-    # ══════════════════════════════════════════════════════
-    # MÉTRICA 11 — VIX 5d momentum (vol subiendo rápido)
-    # ══════════════════════════════════════════════════════
-    if 'VIX_Close' in df.columns:
-        vix_5d = df['VIX_Close'].pct_change(5) * 100
-        vix_5d_pct = _rolling_percentile(vix_5d, window)
-        metrics.append({
-            'name': 'VIX 5d Change %',
-            'value': f"{vix_5d.iloc[-1]:+.2f}%" if pd.notna(vix_5d.iloc[-1]) else '—',
-            'percentile': vix_5d_pct.iloc[-1] if pd.notna(vix_5d_pct.iloc[-1]) else 50,
-            'weight': 0.7,
-            'interpretation': 'Velocidad de subida/bajada del VIX',
-            'series': vix_5d_pct,
-        })
-
-    # ══════════════════════════════════════════════════════
-    # MÉTRICA 12 — Contango M4-M7 (parte larga de la curva)
-    # Inversión aquí es más grave. INVERTIDO.
-    # ══════════════════════════════════════════════════════
-    if 'M4_Price' in df.columns and 'M7_Price' in df.columns:
-        long_ct = (df['M7_Price'] - df['M4_Price']) / df['M4_Price'] * 100
-        long_ct_pct = _rolling_percentile(long_ct, window)
-        inv_long = 100 - long_ct_pct
-        metrics.append({
-            'name': 'Contango M4-M7 (inv)',
-            'value': f"{long_ct.iloc[-1]:+.2f}%" if pd.notna(long_ct.iloc[-1]) else '—',
-            'percentile': inv_long.iloc[-1] if pd.notna(inv_long.iloc[-1]) else 50,
-            'weight': 0.8,
-            'interpretation': 'Curva larga — inversión aquí es stress estructural',
-            'series': inv_long,
-        })
-
-    # ══════════════════════════════════════════════════════
-    # MÉTRICA 13 — SPY/SMA(200) distance (tendencia macro)
-    # Por debajo de SMA(200) = mercado bajista = stress
-    # INVERTIDO: distancia positiva = vol baja
-    # ══════════════════════════════════════════════════════
-    if 'SPY_Close' in df.columns:
-        sma200 = df['SPY_Close'].rolling(200, min_periods=50).mean()
-        spy_dist = (df['SPY_Close'] / sma200 - 1) * 100
-        spy_dist_pct = _rolling_percentile(spy_dist, window)
-        # Invertido: distancia alta = bull = vol baja
-        inv_dist = 100 - spy_dist_pct
-        metrics.append({
-            'name': 'SPY vs SMA(200) inv',
-            'value': f"{spy_dist.iloc[-1]:+.2f}%" if pd.notna(spy_dist.iloc[-1]) else '—',
-            'percentile': inv_dist.iloc[-1] if pd.notna(inv_dist.iloc[-1]) else 50,
-            'weight': 0.6,
-            'interpretation': 'SPY debajo de SMA(200) = bear regime',
-            'series': inv_dist,
-        })
-
-    # ══════════════════════════════════════════════════════
-    # MÉTRICA OPCIONAL 14 — GEX (si está disponible)
-    # GEX negativo = dealers short gamma = movimientos amplificados = stress
-    # ══════════════════════════════════════════════════════
-    if gex_summary and 'net_gex' in gex_summary:
-        ng = gex_summary.get('net_gex', 0)
-        # Simple mapping: gex muy negativo (-3B+) = 90pct, gex muy positivo (+3B+) = 10pct
-        # Normalización grosera: percentil basado en thresholds típicos del SPX
-        if ng < -3e9:     gex_p = 90
-        elif ng < -1e9:   gex_p = 75
-        elif ng < 0:      gex_p = 60
-        elif ng < 1e9:    gex_p = 45
-        elif ng < 3e9:    gex_p = 30
-        else:             gex_p = 15
-        metrics.append({
-            'name': 'Net GEX (SPX)',
-            'value': f"{ng/1e9:+.2f}B",
-            'percentile': gex_p,
-            'weight': 0.7,
-            'interpretation': 'GEX negativo = dealers amplifican movimientos',
-            'series': None,
-        })
-
-    # ══════════════════════════════════════════════════════
-    # MÉTRICA OPCIONAL 15 — Skew 25Δ (si está disponible)
-    # Skew alto = puts caros vs calls = demanda de protección = stress
-    # ══════════════════════════════════════════════════════
-    if skew_metrics and 'atm_iv' in skew_metrics:
-        # Si hay skew data, usar como métrica adicional
-        skew_val = skew_metrics.get('skew_25d', None)
-        if skew_val is not None:
-            # Mapping simple: skew > 3% = alto stress
-            if skew_val > 5:      sk_p = 85
-            elif skew_val > 3:    sk_p = 70
-            elif skew_val > 1:    sk_p = 50
-            elif skew_val > 0:    sk_p = 30
-            else:                 sk_p = 15
-            metrics.append({
-                'name': 'Put/Call Skew 25Δ',
-                'value': f"{skew_val:+.2f}%",
-                'percentile': sk_p,
-                'weight': 0.6,
-                'interpretation': 'Skew positivo = puts caros vs calls',
-                'series': None,
-            })
-
-    # ══════════════════════════════════════════════════════
-    # SCORE FINAL — promedio ponderado
-    # ══════════════════════════════════════════════════════
-    total_w    = sum(m['weight'] for m in metrics if pd.notna(m['percentile']))
-    weighted_s = sum(m['percentile'] * m['weight']
-                     for m in metrics if pd.notna(m['percentile']))
+    valid_metrics = [m for m in metrics if pd.notna(m['percentile'])]
+    if not valid_metrics:
+        return {}
+    total_w    = sum(m['weight'] for m in valid_metrics)
+    weighted_s = sum(m['percentile'] * m['weight'] for m in valid_metrics)
     score = weighted_s / total_w if total_w > 0 else 50.0
 
-    # Régimen
-    if   score < 20: regime, position = "VOL BAJA",     "Aggressive short vol (SVXY/SVIX)"
-    elif score < 40: regime, position = "MODERADA",     "Short vol estándar (SVXY)"
-    elif score < 60: regime, position = "MID",          "Cash / posición parcial"
-    elif score < 80: regime, position = "ELEVADA",      "Cash / defensivo"
-    else:            regime, position = "EXTREMA",      "Long VIX / hedge / short equities"
+    # Régimen (alineado a VTS: lower = low vol env, higher = high vol env)
+    if   score < 20: regime, position = "VOL BAJA",  "Aggressive short vol (SVXY/SVIX)"
+    elif score < 40: regime, position = "MODERADA",  "Short vol estándar (SVXY)"
+    elif score < 60: regime, position = "MID",       "Cash / posición parcial"
+    elif score < 80: regime, position = "ELEVADA",   "Cash / defensivo"
+    else:            regime, position = "EXTREMA",   "Long VIX / hedge / short equities"
 
-    # Histórico del score (para timeline)
-    # Calculamos score histórico promediando las series de percentiles
+    # Histórico del score
     score_hist = None
     series_list = [(m['series'], m['weight']) for m in metrics
                     if m.get('series') is not None]
     if series_list:
         weighted_df = pd.concat(
             [s * w for s, w in series_list], axis=1
-        ).sum(axis=1)
+        ).sum(axis=1, min_count=1)
         total_weights = pd.concat(
             [s.notna().astype(float) * w for s, w in series_list], axis=1
         ).sum(axis=1)
@@ -3859,6 +3942,7 @@ def compute_vts_barometer(
         'window':   window,
         'date':     df.index[-1],
     }
+
 
 
 def build_vts_barometer_gauge(score: float, regime: str,
@@ -3939,19 +4023,45 @@ def build_vts_barometer_gauge(score: float, regime: str,
     return fig
 
 
-def build_vts_metrics_table(metrics: list) -> go.Figure:
+def build_vts_metrics_table(metrics: list, sort_mode: str = 'vts') -> go.Figure:
     """
     Tabla horizontal de cada métrica con su percentil como barra de progreso.
-    Similar al desglose que usa VTS para justificar el score.
+    Similar al desglose que justifica el score del gauge VTS original.
+
+    sort_mode:
+      'vts'    → orden canónico VTS (como en la imagen oficial del gauge)
+      'stress' → ordenado por percentil descendente (más estrés arriba)
     """
     if not metrics:
         return go.Figure()
 
-    n = len(metrics)
-    # Barras horizontales ordenadas por percentil descendente
-    sorted_m = sorted(metrics, key=lambda m: m['percentile'] if pd.notna(m['percentile']) else -1,
-                      reverse=True)
+    # Orden canónico VTS (según imagen oficial del gauge)
+    VTS_ORDER = [
+        'M1:M2 VIX FUTURES',
+        'M4-M7 VIX FUTURES',
+        'VX30:VIX ROLL YIELD',
+        'VIX / VVIX / VOLI',
+        'CASH VIX OSCILLATOR',
+        'VIX - VOLI RESIDUAL',
+        'TRADERS VRP',
+        'SDEX / TDEX / SKEW',
+        'VIX:VIX3M MEDIUM',
+        'EXTREME PUT/CALL RATIO',
+        'VIX9D:VIX FAST',
+        'VOLPOCALYPSE THRESHOLD',
+        'VIX LEVEL (core)',
+    ]
 
+    if sort_mode == 'vts':
+        # Ordenar según VTS_ORDER, con fallback al final para las no conocidas
+        order_map = {name: i for i, name in enumerate(VTS_ORDER)}
+        sorted_m = sorted(metrics, key=lambda m: order_map.get(m['name'], 999))
+    else:  # stress
+        sorted_m = sorted(metrics,
+                          key=lambda m: m['percentile'] if pd.notna(m['percentile']) else -1,
+                          reverse=True)
+
+    n = len(sorted_m)
     names  = [m['name'] for m in sorted_m]
     pctls  = [m['percentile'] for m in sorted_m]
     vals   = [m['value']  for m in sorted_m]
@@ -3990,18 +4100,22 @@ def build_vts_metrics_table(metrics: list) -> go.Figure:
         width=0.65,
     ))
 
+    title_sub = ("Orden canónico VTS (como en el gauge oficial)"
+                 if sort_mode == 'vts'
+                 else "Ordenado por nivel de stress (mayor percentil arriba)")
+
     fig.update_layout(
         title=dict(
-            text="<b>Desglose del Barómetro — Percentil rolling por métrica</b>"
-                 "<br><span style='font-size:0.7rem;color:#8B949E;font-family:JetBrains Mono'>"
-                 "Ordenado por nivel de stress · Verde = vol baja · Rojo = vol alta"
-                 "</span>",
+            text=f"<b>Desglose del Barómetro — Percentil rolling por métrica</b>"
+                 f"<br><span style='font-size:0.7rem;color:#8B949E;font-family:JetBrains Mono'>"
+                 f"{title_sub} · Verde = vol baja · Rojo = vol alta"
+                 f"</span>",
             font=dict(size=13, color='#F0F6FC', family='Inter'), x=0.5, xanchor='center',
         ),
         template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#0D1117',
         barmode='overlay',
-        height=max(360, n * 34 + 110),
-        margin=dict(l=160, r=30, t=80, b=40),
+        height=max(420, n * 36 + 110),
+        margin=dict(l=180, r=30, t=80, b=40),
         xaxis=dict(
             range=[0, 100], showgrid=True, gridcolor='#21262D',
             tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono'),
@@ -5638,11 +5752,14 @@ with tab_baro:
     st.markdown("""
     <div style="font-family:'JetBrains Mono',monospace;font-size:0.72rem;color:#8B949E;
                 padding:0.4rem 0 0.8rem;">
-    <b>VTS Volatility Barometer</b> · Inspirado en <b>volatilitytradingstrategies.com</b>
-    · Combina <b>13+ métricas de volatilidad</b> en un score único 0-100% ·
-    Cada métrica convertida a percentil rolling (252 días) ·
-    Score = promedio ponderado ·
-    <span style="color:#3FB950">Verde</span> = posición agresiva short vol ·
+    <b>VTS Volatility Barometer</b> · Réplica de
+    <a href="https://www.volatilitytradingstrategies.com" target="_blank"
+       style="color:#58A6FF;text-decoration:none;">volatilitytradingstrategies.com</a>
+    · Combina los <b>13 indicadores oficiales VTS</b> (M1:M2, M4-M7, VX30:VIX Roll Yield,
+    VIX/VVIX/VOLI, Cash VIX Oscillator, VIX-VOLI Residual, Traders VRP, SDEX/TDEX/SKEW,
+    VIX:VIX3M Medium, Extreme Put/Call, VIX9D:VIX Fast, Volpocalypse Threshold, VIX Level)
+    · Score 0-100% · Percentil rolling · Promedio ponderado ·
+    <span style="color:#3FB950">Verde</span> = short vol agresivo ·
     <span style="color:#D29922">Amarillo</span> = cash / neutral ·
     <span style="color:#F85149">Rojo</span> = hedge / long vol
     </div>
@@ -5775,8 +5892,18 @@ with tab_baro:
     st.markdown("<div style='border-top:1px solid #30363D;margin:0.8rem 0'></div>",
                 unsafe_allow_html=True)
 
-    # ── Desglose de métricas ─────────────────────────────
-    metrics_fig = build_vts_metrics_table(baro['metrics'])
+    # ── Desglose de métricas (toggle: orden VTS vs stress) ───
+    col_mode1, col_mode2 = st.columns([3, 1])
+    with col_mode2:
+        sort_mode = st.radio(
+            "Orden",
+            options=['vts', 'stress'],
+            format_func=lambda x: '🎯 Canónico VTS' if x == 'vts' else '🔥 Por stress',
+            key='baro_sort_mode',
+            horizontal=False,
+            label_visibility='collapsed',
+        )
+    metrics_fig = build_vts_metrics_table(baro['metrics'], sort_mode=sort_mode)
     st.plotly_chart(metrics_fig, width="stretch", config=dict(displayModeBar=False))
 
     # ── Interpretación y guía de lectura ─────────────────
@@ -5784,52 +5911,64 @@ with tab_baro:
         st.markdown(f"""
 **Qué mide el barómetro**
 
-El VTS Volatility Barometer combina {n_metrics} métricas de volatilidad en un único score
-0-100%. Cada métrica individual solo captura una porción del mercado
-(futuros VIX, opciones SPX, credit, etc.), pero combinadas ofrecen una lectura robusta
-del régimen de volatilidad actual.
+El VTS Volatility Barometer combina **{n_metrics} métricas de volatilidad** en un único
+score 0-100%, replicando la metodología oficial de
+[volatilitytradingstrategies.com](https://www.volatilitytradingstrategies.com).
+Cada métrica captura una porción del mercado (futuros VIX, opciones SPX, term structure,
+credit, etc.) — combinadas ofrecen la lectura más robusta del régimen de vol actual.
 
-**Métricas incluidas en esta implementación:**
+**Los 13 indicadores VTS (alineados al gauge oficial):**
 
-1. **VIX Spot Level** — percentil del nivel absoluto del VIX
-2. **VIX / VIX-Fut M1** — inversión de la parte corta de la curva
-3. **VVIX** — volatilidad del VIX (demanda de opciones sobre VIX)
-4. **Contango M1-M2 (invertido)** — roll yield disponible
-5. **VXX / SMA(20)** — momentum direccional del VXX
-6. **SPY RV 22d** — volatilidad realizada del subyacente
-7. **VRP (VIX-RV) invertido** — risk premium compression
-8. **CBOE SKEW Index** — demanda de puts OTM SPX
-9. **HYG/IEF (invertido)** — proxy de credit spread
-10. **SPY Drawdown 20d** — profundidad del drawdown reciente
-11. **VIX 5d change %** — velocidad del cambio de vol
-12. **Contango M4-M7 (invertido)** — curva larga, stress estructural
-13. **SPY vs SMA(200) (invertido)** — régimen macro bull/bear
+| # | Indicador | Qué mide |
+|---|-----------|----------|
+| 1 | **M1:M2 VIX FUTURES** | Contango frontal — ratio entre M1 y M2 |
+| 2 | **M4-M7 VIX FUTURES** | Contango en la curva larga |
+| 3 | **VX30:VIX ROLL YIELD** | Roll yield constant-maturity a 30 días |
+| 4 | **VIX / VVIX / VOLI** | Composite nivel absoluto (VIX + VVIX + RV20) |
+| 5 | **CASH VIX OSCILLATOR** | Promedio de ratios VIX9D/VIX, VIX/VIX3M, VIX/VIX6M, VIX/VIX1Y |
+| 6 | **VIX - VOLI RESIDUAL** | VIX menos VOLI (proxy RV20) |
+| 7 | **TRADERS VRP** | WMA 5d con pesos 1-5 de (VX30 − HV5) |
+| 8 | **SDEX / TDEX / SKEW** | CBOE SKEW Index + proxies |
+| 9 | **VIX:VIX3M MEDIUM** | Ratio medium-term (invirtido en backwardation) |
+| 10 | **EXTREME PUT/CALL RATIO** | Momentum del SKEW 5d (proxy demanda de puts) |
+| 11 | **VIX9D:VIX FAST** | Ratio fast-term (>1 = cola corta caliente) |
+| 12 | **VOLPOCALYPSE THRESHOLD** | Trigger compuesto: VIX + backwardation + momentum |
+| 13 | **VIX LEVEL (core)** | Nivel absoluto del VIX — ancla del barómetro |
 
-**Interpretación del score:**
+Cada métrica se convierte a **percentil rolling** (ventana configurable 126–756 días).
+El score final es el **promedio ponderado** de todos los percentiles.
 
-- **0-20% (Vol BAJA)**: Todos los indicadores apuntan a vol estable.
-  Posición agresiva short vol — SVXY/SVIX al 100%.
-- **20-40% (MODERADA)**: La mayoría de señales verdes pero algunos indicadores
-  elevados. SVXY al 75-100% — el trade funciona pero con alerta.
-- **40-60% (MID)**: Señales mixtas. Cash o posición parcial (25-50%).
+**Proxies usados (cuando el dato original no está disponible):**
+- **VOLI** → Se usa Realized Volatility 20d del SPY (VOLI no está en yfinance gratis)
+- **SDEX / TDEX** → Se usa solo CBOE SKEW (los otros son propietarios)
+- **Put/Call Ratio extremo** → Momentum 5d del SKEW Index
+- **VX30** → Interpolación lineal M1↔M2 a 30 días
+
+**Interpretación del score (idéntica al VTS original):**
+
+- **0-20% (Vol BAJA)**: Todos los indicadores apuntan a vol estable →
+  **Short vol agresivo** (SVXY/SVIX al 100%).
+- **20-40% (MODERADA)**: Mayoría verdes pero algunos elevados →
+  **Short vol estándar** (SVXY al 75-100%).
+- **40-60% (MID)**: Señales mixtas → **Cash o posición parcial** (25-50%).
   Es el rango donde más falsos positivos ocurren.
-- **60-80% (ELEVADA)**: Mayoría de señales rojas. Cash. Evitar short vol.
-- **80-100% (EXTREMA)**: Entorno de crisis (COVID, Aug 2015, Feb 2018).
+- **60-80% (ELEVADA)**: Mayoría rojas → **Cash, evitar short vol**.
+- **80-100% (EXTREMA)**: Entorno de crisis (COVID 2020, Vol-geddon 2018, Aug 2015) →
   Oportunidad de **long VIX / short equities / long puts**.
 
 **Diferencias vs VTS original:**
 
-VTS usa su propia mezcla propietaria de 13 métricas con pesos afinados durante más
-de una década. Esta implementación usa métricas similares pero los pesos pueden
-diferir. La utilidad principal es como **filtro de régimen**: confirma cuándo el
-entorno es favorable para la estrategia BB × Contango del Monitor Operativo.
+VTS tiene 10+ años de refinamiento propietario en pesos y métricas exactas. Esta
+implementación usa las mismas fórmulas públicas documentadas por Brent Osachoff
+(`volatilitymaster.wordpress.com`) pero los pesos y proxies pueden diferir levemente.
+La utilidad principal es como **filtro de régimen** complementario al Monitor Operativo.
 
-**Uso recomendado:**
+**Uso recomendado en combo con Monitor Operativo:**
 
-- Score < 40% + señal LONG del Monitor Operativo = **convicción alta**
-- Score 40-60% + señal LONG = **reducir tamaño o esperar confirmación**
-- Score > 60% = **NO tomar señal LONG aunque el Monitor la marque**
-- Score > 80% = **considerar posiciones long vol (VXX/UVXY)** como hedge
+- Score **< 40%** + señal LONG = **convicción alta**, tamaño completo
+- Score **40-60%** + señal LONG = **reducir tamaño o esperar confirmación**
+- Score **> 60%** = **NO tomar señal LONG** aunque el Monitor la marque
+- Score **> 80%** = considerar **long vol (VXX/UVXY) como hedge táctico**
 """)
 
     st.caption(
@@ -5931,11 +6070,14 @@ with tab4:
     - Backtest walk-forward con Sharpe rolling
 
     **Tab 3 · Barómetro VTS** — *NUEVO*
-    - Inspirado en `volatilitytradingstrategies.com`
-    - **13+ métricas de volatilidad** combinadas en score 0-100%
+    - Réplica de `volatilitytradingstrategies.com` con los **13 indicadores oficiales**:
+      M1:M2, M4-M7, VX30:VIX Roll Yield, VIX/VVIX/VOLI, Cash VIX Oscillator,
+      VIX-VOLI Residual, Traders VRP, SDEX/TDEX/SKEW, VIX:VIX3M Medium,
+      Extreme Put/Call, VIX9D:VIX Fast, Volpocalypse Threshold, VIX Level
     - Percentiles rolling (window configurable: 126-756 días)
     - Gauge visual con 5 regímenes coloreados
-    - Desglose por métrica + timeline histórico
+    - Desglose por métrica con toggle: orden VTS canónico vs por stress
+    - Timeline histórico del score
     - Filtro de régimen para validar señales del Monitor Operativo
 
     **Tab 4 · Edge Analytics** — Diagnósticos estadísticos
