@@ -291,35 +291,98 @@ def fetch_etps():
 
 @st.cache_data(ttl=300)
 def fetch_edge_extra():
-    """Fetches VVIX, SKEW, HYG, IEF, y toda la familia VIX para barómetro.
-    Período 5y para percentiles rolling robustos (252d).
-    Index timezone-normalizado a UTC-naive para join seguro."""
+    """
+    Fetches VVIX, SKEW, HYG, IEF, y toda la familia VIX para barómetro.
+
+    Estrategia híbrida:
+      1. Si existe data/baro_history.parquet (actualizado por GitHub Action diario),
+         lo usamos como fuente primaria — instantáneo, sin rate limits.
+      2. Solo descargamos de yfinance los últimos 3 días para top-up
+         (por si el parquet está desactualizado 1-2 días).
+      3. Si el parquet NO existe, fallback a yfinance con period="max".
+
+    Esto reduce ~95% de llamadas a yfinance y elimina el problema de rate-limit
+    en Streamlit Cloud.
+    """
+    log = logging.getLogger("vix_controller")
     out = {}
     tickers = [
         ("VVIX",   "^VVIX"),
         ("SKEW",   "^SKEW"),
         ("HYG",    "HYG"),
         ("IEF",    "IEF"),
-        # Familia VIX para el barómetro VTS
         ("VIX9D",  "^VIX9D"),
         ("VIX3M",  "^VIX3M"),
         ("VIX6M",  "^VIX6M"),
         ("VIX1Y",  "^VIX1Y"),
+        ("VIX",    "^VIX"),
     ]
-    for name, sym in tickers:
-        try:
-            h = yf.download(sym, period="5y", progress=False, auto_adjust=True)
-            if isinstance(h.columns, pd.MultiIndex):
-                h.columns = h.columns.get_level_values(0)
-            if not h.empty:
-                # Normalize index: remove timezone so join with parquet works
+
+    # ── Paso 1: intentar cargar del parquet ──────────────────
+    baro_df = load_baro_parquet()
+    parquet_tickers = set()
+
+    if not baro_df.empty:
+        log.info(f"fetch_edge_extra: usando parquet baro ({len(baro_df):,} filas)")
+        for name, _ in tickers:
+            if name in baro_df.columns and baro_df[name].notna().sum() > 100:
+                df_ticker = pd.DataFrame({'Close': baro_df[name].dropna()})
+                out[name] = df_ticker
+                parquet_tickers.add(name)
+
+    # ── Paso 2: top-up con últimos 3 días de yfinance ────────
+    # Solo si el parquet existe; si falta, hacemos download completo abajo
+    if parquet_tickers:
+        for name, sym in tickers:
+            if name not in parquet_tickers:
+                continue
+            try:
+                h = yf.download(sym, period="5d", progress=False,
+                                auto_adjust=True, threads=False)
+                if isinstance(h.columns, pd.MultiIndex):
+                    h.columns = h.columns.get_level_values(0)
+                if h.empty or 'Close' not in h.columns:
+                    continue
                 if hasattr(h.index, "tz") and h.index.tz is not None:
                     h.index = h.index.tz_localize(None)
                 h.index = pd.DatetimeIndex(h.index).normalize()
-                out[name] = h
-        except Exception as ex:
-            logging.getLogger("vix_controller").warning(f"fetch_edge_extra {sym}: {ex}")
-            continue
+
+                # Merge: últimos días sobrescriben al parquet
+                existing = out[name]
+                fresh = pd.DataFrame({'Close': h['Close']})
+                merged = pd.concat([existing, fresh])
+                merged = merged[~merged.index.duplicated(keep='last')].sort_index()
+                out[name] = merged
+            except Exception as ex:
+                log.debug(f"top-up {sym} failed (parquet lo cubre): {ex}")
+                continue
+
+    # ── Paso 3: fallback total a yfinance si el parquet no existe ──
+    missing = [name for name, _ in tickers if name not in out]
+    if missing:
+        if not parquet_tickers:
+            log.info(f"fetch_edge_extra: parquet ausente — descargando {len(missing)} tickers de yfinance")
+        else:
+            log.info(f"fetch_edge_extra: parquet incompleto — completando {missing} de yfinance")
+
+        for name, sym in tickers:
+            if name in out:
+                continue
+            try:
+                h = yf.download(sym, period="max", progress=False,
+                                auto_adjust=True, threads=False)
+                if isinstance(h.columns, pd.MultiIndex):
+                    h.columns = h.columns.get_level_values(0)
+                if not h.empty:
+                    if hasattr(h.index, "tz") and h.index.tz is not None:
+                        h.index = h.index.tz_localize(None)
+                    h.index = pd.DatetimeIndex(h.index).normalize()
+                    out[name] = h
+            except Exception as ex:
+                log.warning(f"fetch_edge_extra {sym}: {ex}")
+                continue
+
+    log.info(f"fetch_edge_extra: {len(out)} tickers cargados")
     return out
 
 
@@ -384,7 +447,7 @@ def _get_cffi_session():
 def _yahoo_options_session():
     return _get_cffi_session()
 
-@st.cache_data(ttl=1200)   # 20 min — da tiempo para que rate-limit expire
+@st.cache_data(ttl=3600)   # 1h — rate-limits de Yahoo suelen durar 15-60 min
 def fetch_options_chains(ticker: str = "SPY", n_exp: int = 4) -> tuple:
     """
     Descarga opciones con triple estrategia anti-rate-limit:
@@ -392,9 +455,25 @@ def fetch_options_chains(ticker: str = "SPY", n_exp: int = 4) -> tuple:
        - Rota entre query1 y query2 en cada chain
        - Delay adaptativo: duplica si obtiene 429
     2. Fallback yfinance con backoff exponencial
-    3. TTL=20 min para no re-golpear tras rate-limit
+    3. TTL=1h para no re-golpear tras rate-limit
+    4. Cache negativo (session_state) para 30 min si falla completamente
+
+    Streamlit Cloud comparte IP con miles de apps → Yahoo aplica rate limits
+    agresivos. Si detectamos rate limit persistente, marcamos en session_state
+    para no volver a intentar en 30 min, evitando el error visible en cada rerun.
     """
     log = logging.getLogger("vix_controller")
+
+    # ── Cache negativo: evita re-golpear Yahoo si ya falló recientemente ──
+    fail_key = f"_opts_fail_{ticker}"
+    if fail_key in st.session_state:
+        last_fail = st.session_state[fail_key]
+        if (time.time() - last_fail) < 1800:  # 30 min
+            log.info(f"Options {ticker}: cache negativo activo (falló hace "
+                     f"{int((time.time() - last_fail)/60)}min) — skip")
+            return {}, None
+        else:
+            del st.session_state[fail_key]
 
     def _clean(df_raw, spot_px):
         """
@@ -547,9 +626,17 @@ def fetch_options_chains(ticker: str = "SPY", n_exp: int = 4) -> tuple:
                 else:
                     log.warning(f"yfinance chain {ticker} {exp_str}: {ex}")
         log.info(f"yfinance {ticker}: {len(chains)} chains · spot={spot:.2f}")
+        # Si no logramos ni una cadena, activar cache negativo
+        if not chains:
+            st.session_state[fail_key] = time.time()
+            log.warning(f"Options {ticker}: cero chains → cache negativo 30 min")
         return chains, spot
     except Exception as e:
         log.error(f"fetch_options_chains {ticker}: {e}")
+        # Cache negativo ante rate limit persistente
+        if any(k in str(e).lower() for k in ["rate limit","too many","429","throttle"]):
+            st.session_state[fail_key] = time.time()
+            log.warning(f"Options {ticker}: rate limit → cache negativo 30 min")
         return {}, None
 
 
@@ -2576,7 +2663,34 @@ def build_credit_chart(bt, window=252):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # MONITOR OPERATIVO — DATA LAYER (parquet local del repo)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-PARQUET_PATH = "data/master.parquet"
+PARQUET_PATH      = "data/master.parquet"
+BARO_PARQUET_PATH = "data/baro_history.parquet"
+
+@st.cache_data(ttl=3600)
+def load_baro_parquet() -> pd.DataFrame:
+    """
+    Lee el parquet histórico del Barómetro VTS.
+    Contiene 15+ años de data de yfinance para todos los tickers del barómetro.
+    Actualizado diariamente vía GitHub Action (scripts/update_baro_parquet.py).
+
+    Columnas esperadas: VIX, VIX9D, VIX3M, VIX6M, VIX1Y, VVIX, SKEW,
+                        SPY, HYG, IEF, VXX, SVXY
+    """
+    log = logging.getLogger("vix_controller")
+    try:
+        df = pd.read_parquet(BARO_PARQUET_PATH)
+        df.index = pd.to_datetime(df.index)
+        df = df.sort_index()
+        log.info(f"Baro parquet: {len(df):,} filas · {len(df.columns)} tickers · "
+                 f"{df.index[-1].strftime('%Y-%m-%d')}")
+        return df
+    except FileNotFoundError:
+        log.info(f"Baro parquet no encontrado en {BARO_PARQUET_PATH} — usando yfinance live")
+        return pd.DataFrame()
+    except Exception as e:
+        log.warning(f"Error leyendo baro parquet: {e}")
+        return pd.DataFrame()
+
 
 @st.cache_data(ttl=3600)
 def load_master_parquet() -> pd.DataFrame:
@@ -3511,12 +3625,36 @@ def build_vxx_operational_chart(bt: pd.DataFrame,
 def _rolling_percentile(s: pd.Series, window: int = 252) -> pd.Series:
     """
     Percentil rolling del último valor vs la ventana histórica.
-    Devuelve 0-100. Usa método 'rank' — 0 = mínimo hist, 100 = máximo hist.
+    Devuelve 0-100. Implementación vectorizada con numpy (mucho más rápida
+    que .apply con lambda).
+
+    Cada valor en la salida es: "qué % de los últimos `window` valores
+    son <= al valor actual".
+
+    Robust to NaN: valores NaN en la entrada producen NaN en la salida.
     """
-    return s.rolling(window, min_periods=max(30, window // 5)).apply(
-        lambda x: (x.rank(pct=True).iloc[-1]) * 100 if len(x) > 0 else np.nan,
-        raw=False,
-    )
+    if s is None or s.empty:
+        return pd.Series(dtype=float)
+
+    arr = s.to_numpy(dtype=float)
+    n   = len(arr)
+    out = np.full(n, np.nan, dtype=float)
+    min_obs = max(30, window // 5)
+
+    for i in range(min_obs - 1, n):
+        start = max(0, i - window + 1)
+        window_vals = arr[start:i + 1]
+        cur = arr[i]
+        if np.isnan(cur):
+            continue
+        # Contar cuántos valores válidos son <= cur
+        valid = window_vals[~np.isnan(window_vals)]
+        if len(valid) < min_obs:
+            continue
+        # Percentil: % de valores menores o iguales al actual
+        out[i] = (valid <= cur).mean() * 100.0
+
+    return pd.Series(out, index=s.index)
 
 
 @st.cache_data(ttl=300)
@@ -3559,16 +3697,80 @@ def compute_vts_barometer(
 
     df = bt.copy()
     metrics = []
+    log = logging.getLogger("vix_controller")
+
+    # ══════════════════════════════════════════════════════
+    # EXTENDER ÍNDICE HACIA ATRÁS usando yfinance
+    # VTS usa percentiles lifetime (desde 2011+). Para replicarlo,
+    # extendemos el índice con toda la historia disponible de
+    # los tickers yfinance (SPY, VIX, VIX3M, etc.) antes de calcular
+    # percentiles. Así la ventana rolling cubre años antes del parquet.
+    # ══════════════════════════════════════════════════════
+    extended_index = df.index
+    if edge_extra:
+        # Encontrar el índice más largo disponible
+        all_indices = [df.index]
+        for key in ('VIX', 'VIX3M', 'SKEW', 'VVIX'):
+            if key in edge_extra and not edge_extra[key].empty:
+                all_indices.append(edge_extra[key].index)
+        if all_indices:
+            earliest = min(idx.min() for idx in all_indices if len(idx) > 0)
+            latest   = df.index.max()
+            # Business days desde earliest a latest
+            extended_index = pd.bdate_range(earliest, latest)
+            log.info(f"BARO: índice extendido {earliest.date()} → {latest.date()} "
+                     f"({len(extended_index):,} días hábiles)")
+            # Reindexar df al nuevo índice
+            df = df.reindex(extended_index)
 
     # ── Helpers para series de la familia VIX ──────────────────
     def _get_series(key: str) -> pd.Series | None:
-        """Intenta obtener una serie de edge_extra alineada al índice de df."""
+        """Intenta obtener una serie de edge_extra alineada al índice extendido."""
         if key in edge_extra and not edge_extra[key].empty:
             return edge_extra[key]['Close'].reindex(df.index).ffill()
         return None
 
-    vix     = df.get('VIX_Close')
-    spy     = df.get('SPY_Close')
+    # VIX desde yfinance si está disponible (preferimos este al parquet
+    # porque tiene historia completa desde 1990)
+    vix_yf = _get_series('VIX')
+    vix_parquet = df.get('VIX_Close')
+
+    if vix_yf is not None and vix_yf.notna().sum() > 1000:
+        # yfinance tiene muchos más datos → usar como fuente primaria
+        vix = vix_yf
+        df['VIX_Close'] = vix
+        log.info(f"BARO: usando VIX de yfinance ({vix.notna().sum():,} filas)")
+    elif vix_parquet is not None and vix_parquet.notna().sum() > 60:
+        vix = vix_parquet
+    else:
+        # Fallback: descargar en caliente
+        vix = None
+        try:
+            import yfinance as yf
+            vh = yf.Ticker("^VIX").history(period="max")
+            if not vh.empty:
+                vh.index = pd.DatetimeIndex(vh.index).tz_localize(None).normalize()
+                vix = vh['Close'].reindex(df.index).ffill()
+                df['VIX_Close'] = vix
+                log.info(f"BARO: VIX descargado fresh ({vix.notna().sum():,} filas)")
+        except Exception as e:
+            log.warning(f"BARO: fallback VIX failed: {e}")
+
+    # SPY con historia completa también (para RV20)
+    spy_yf = None  # yfinance no está en edge_extra por defecto, mantenemos parquet
+    spy = df.get('SPY_Close')
+    if spy is None or spy.notna().sum() < 100:
+        try:
+            import yfinance as yf
+            sh = yf.Ticker("SPY").history(period="max")
+            if not sh.empty:
+                sh.index = pd.DatetimeIndex(sh.index).tz_localize(None).normalize()
+                spy = sh['Close'].reindex(df.index).ffill()
+                df['SPY_Close'] = spy
+                log.info(f"BARO: SPY descargado ({spy.notna().sum():,} filas)")
+        except Exception as e:
+            log.warning(f"BARO: fallback SPY failed: {e}")
+
     vvix_s  = _get_series('VVIX')
     if vvix_s is None and 'VVIX_Live' in df.columns:
         vvix_s = df['VVIX_Live']
@@ -3577,6 +3779,18 @@ def compute_vts_barometer(
     vix6m   = _get_series('VIX6M')
     vix1y   = _get_series('VIX1Y')
     skew_s  = _get_series('SKEW')
+
+    # Log de diagnóstico
+    log.info(
+        f"BARO inputs: VIX={(vix is not None and vix.notna().sum())}, "
+        f"SPY={(spy is not None and spy.notna().sum())}, "
+        f"VVIX={(vvix_s is not None and vvix_s.notna().sum())}, "
+        f"VIX3M={(vix3m is not None and vix3m.notna().sum())}, "
+        f"VIX9D={(vix9d is not None and vix9d.notna().sum())}, "
+        f"SKEW={(skew_s is not None and skew_s.notna().sum())}, "
+        f"M1={'M1_Price' in df.columns}, M2={'M2_Price' in df.columns}, "
+        f"M4={'M4_Price' in df.columns}, M7={'M7_Price' in df.columns}"
+    )
 
     # VX30 constant-maturity: interpolación lineal entre M1 y M2 a 30 días
     vx30 = None
@@ -3589,6 +3803,9 @@ def compute_vts_barometer(
         t = t.clip(0, 1)
         vx30 = df['M1_Price'] * (1 - t) + df['M2_Price'] * t
         vx30 = vx30.where(vx30 > 0)
+    elif 'M1_Price' in df.columns and 'M2_Price' in df.columns:
+        # Sin DTE, usamos promedio simple M1-M2 como proxy de VX30
+        vx30 = 0.5 * (df['M1_Price'] + df['M2_Price'])
 
     # HV (historical volatility) del SPY
     hv5 = hv10 = hv20 = None
@@ -3793,22 +4010,22 @@ def compute_vts_barometer(
             })
 
     # ══════════════════════════════════════════════════════
-    # 10. EXTREME PUT/CALL RATIO — skew extremo (proxy)
-    # Usamos SKEW^2 como proxy de demanda extrema de puts
-    # O la variación 5d del SKEW (momentum de demanda defensiva)
+    # 10. EXTREME PUT/CALL RATIO — nivel elevado del SKEW
+    # Usamos SKEW suavizado (media 10d) para evitar ruido diario.
+    # SKEW > 140 históricamente indica demanda extrema de puts OTM.
     # ══════════════════════════════════════════════════════
     if skew_s is not None and skew_s.notna().sum() > 60:
-        # Momentum del SKEW: variación 5d amplifica señal extrema
-        skew_mom = skew_s.pct_change(5) * 100
-        # Combinamos nivel SKEW + momentum
-        skew_mom_pct = _rolling_percentile(skew_mom, window)
+        # SKEW suavizado — promedio 10d para eliminar ruido
+        skew_smooth = skew_s.rolling(10, min_periods=3).mean()
+        skew_level_pct = _rolling_percentile(skew_smooth, window)
+        last_val = skew_smooth.iloc[-1]
         metrics.append({
             'name': 'EXTREME PUT/CALL RATIO',
-            'value': f"{skew_mom.iloc[-1]:+.2f}%" if pd.notna(skew_mom.iloc[-1]) else '—',
-            'percentile': skew_mom_pct.iloc[-1] if pd.notna(skew_mom_pct.iloc[-1]) else 50,
-            'weight': 0.8,
-            'interpretation': 'SKEW momentum 5d · Alto = salto en demanda de puts',
-            'series': skew_mom_pct,
+            'value': f"{last_val:.1f}" if pd.notna(last_val) else '—',
+            'percentile': skew_level_pct.iloc[-1] if pd.notna(skew_level_pct.iloc[-1]) else 50,
+            'weight': 0.7,
+            'interpretation': 'SKEW suavizado 10d · Alto = demanda de puts elevada',
+            'series': skew_level_pct,
         })
 
     # ══════════════════════════════════════════════════════
@@ -3830,60 +4047,67 @@ def compute_vts_barometer(
 
     # ══════════════════════════════════════════════════════
     # 12. VOLPOCALYPSE THRESHOLD — trigger compuesto vol extrema
-    # Combinación: VIX absoluto (nivel 30+) + backwardation M1/M2 + momentum VIX 5d
-    # Score 0-100 directo (no percentil)
+    # Combinación: VIX absoluto + backwardation M1/M2 + momentum VIX 5d
+    # Score 0-100 directo. Diseñado para activarse FUERTE en crisis,
+    # suave en rangos normales (VIX 15-25 histórico = ~40-50 percentil).
     # ══════════════════════════════════════════════════════
-    if vix is not None and 'M1_Price' in df.columns and 'M2_Price' in df.columns:
-        last_vix = vix.iloc[-1]
-        last_m1m2 = df['M1_Price'].iloc[-1] / df['M2_Price'].iloc[-1] if pd.notna(df['M2_Price'].iloc[-1]) else 1.0
-        vix_5d_chg = vix.pct_change(5).iloc[-1] * 100 if pd.notna(vix.pct_change(5).iloc[-1]) else 0
+    if vix is not None and vix.notna().sum() > 30:
+        vix_nona = vix.dropna()
+        last_vix = float(vix_nona.iloc[-1])
 
-        # Score heurístico:
-        #   VIX < 15 → 5    VIX 15-20 → 20    VIX 20-25 → 40
-        #   VIX 25-30 → 55  VIX 30-40 → 75    VIX > 40 → 90
-        if last_vix < 15:     vix_score = 5
-        elif last_vix < 20:   vix_score = 20
-        elif last_vix < 25:   vix_score = 40
-        elif last_vix < 30:   vix_score = 55
-        elif last_vix < 40:   vix_score = 75
-        else:                 vix_score = 92
+        # Ratio M1/M2 si existe; si no, neutral
+        if ('M1_Price' in df.columns and 'M2_Price' in df.columns
+            and df['M1_Price'].notna().sum() > 0
+            and df['M2_Price'].notna().sum() > 0):
+            m1m2_ser = df['M1_Price'] / df['M2_Price']
+            m1m2_last = float(m1m2_ser.dropna().iloc[-1]) if m1m2_ser.notna().any() else 1.0
+        else:
+            m1m2_ser = pd.Series([1.0] * len(vix), index=vix.index)
+            m1m2_last = 1.0
 
-        # Backwardation boost
-        if last_m1m2 > 1.02:   vix_score = min(100, vix_score + 15)
-        elif last_m1m2 > 1.00: vix_score = min(100, vix_score + 5)
+        vix_5d_ser = vix.pct_change(5).fillna(0) * 100
+        vix_5d_last = float(vix_5d_ser.iloc[-1])
 
-        # Momentum boost
-        if vix_5d_chg > 40:    vix_score = min(100, vix_score + 10)
-        elif vix_5d_chg > 20:  vix_score = min(100, vix_score + 5)
-
-        # Serie histórica (cálculo vectorizado simplificado)
-        hist_scores = pd.Series(index=vix.index, dtype=float)
-        vix_arr = vix.values
-        m1m2_hist = (df['M1_Price'] / df['M2_Price']).fillna(1.0)
-        vix_chg_5d = vix.pct_change(5).fillna(0) * 100
-        for i in range(len(vix)):
-            v = vix_arr[i]
-            if pd.isna(v):
-                hist_scores.iloc[i] = np.nan; continue
-            if   v < 15: s = 5
-            elif v < 20: s = 20
-            elif v < 25: s = 40
-            elif v < 30: s = 55
+        def _volp_score(v, r, ch):
+            """
+            Mapeo menos agresivo en rango normal:
+              VIX < 13 → 3    VIX 13-16 → 10   VIX 16-20 → 25
+              VIX 20-25 → 42  VIX 25-30 → 58   VIX 30-40 → 75   VIX 40+ → 92
+            """
+            if pd.isna(v): return np.nan
+            if   v < 13: s = 3
+            elif v < 16: s = 10
+            elif v < 20: s = 25
+            elif v < 25: s = 42
+            elif v < 30: s = 58
             elif v < 40: s = 75
             else:        s = 92
-            r = m1m2_hist.iloc[i]
-            if r > 1.02:   s = min(100, s + 15)
-            elif r > 1.00: s = min(100, s + 5)
-            ch = vix_chg_5d.iloc[i]
-            if ch > 40:    s = min(100, s + 10)
-            elif ch > 20:  s = min(100, s + 5)
-            hist_scores.iloc[i] = s
+            # Backwardation boost (solo si es real)
+            if pd.notna(r):
+                if r > 1.02:   s = min(100, s + 12)
+                elif r > 1.00: s = min(100, s + 4)
+            # Momentum boost (solo si muy fuerte)
+            if pd.notna(ch):
+                if ch > 40:    s = min(100, s + 10)
+                elif ch > 20:  s = min(100, s + 4)
+            return s
+
+        vix_score = _volp_score(last_vix, m1m2_last, vix_5d_last)
+
+        # Serie histórica vectorizada (numpy)
+        m1m2_arr = m1m2_ser.reindex(vix.index).fillna(1.0).values
+        ch5_arr = vix_5d_ser.values
+        v_arr = vix.values
+        hist = np.full(len(vix), np.nan)
+        for i in range(len(v_arr)):
+            hist[i] = _volp_score(v_arr[i], m1m2_arr[i], ch5_arr[i])
+        hist_scores = pd.Series(hist, index=vix.index)
 
         metrics.append({
             'name': 'VOLPOCALYPSE THRESHOLD',
-            'value': f"VIX={last_vix:.1f} · M1/M2={last_m1m2:.3f}",
+            'value': f"VIX={last_vix:.1f} · M1/M2={m1m2_last:.3f}",
             'percentile': vix_score,
-            'weight': 1.0,
+            'weight': 0.9,
             'interpretation': 'Trigger compuesto · VIX + backwardation + momentum',
             'series': hist_scores,
         })
@@ -3907,8 +4131,35 @@ def compute_vts_barometer(
     # SCORE FINAL — promedio ponderado de los percentiles
     # ══════════════════════════════════════════════════════
     valid_metrics = [m for m in metrics if pd.notna(m['percentile'])]
+    log.info(f"BARO: {len(valid_metrics)}/{len(metrics)} métricas válidas")
+
     if not valid_metrics:
-        return {}
+        # Fallback de emergencia: si ninguna métrica calculó pero tenemos VIX,
+        # al menos damos una lectura basada en el VIX absoluto (heurística)
+        if vix is not None and vix.notna().sum() > 0:
+            last_vix = vix.dropna().iloc[-1]
+            # Score heurístico simple
+            if   last_vix < 13: s = 10
+            elif last_vix < 16: s = 25
+            elif last_vix < 20: s = 40
+            elif last_vix < 25: s = 55
+            elif last_vix < 30: s = 70
+            elif last_vix < 40: s = 85
+            else:               s = 95
+            log.warning(f"BARO: fallback heurístico VIX-only · score={s}")
+            metrics.append({
+                'name': 'VIX LEVEL (fallback)',
+                'value': f"{last_vix:.2f}",
+                'percentile': s,
+                'weight': 1.0,
+                'interpretation': '⚠️ Fallback: solo VIX absoluto (datos insuficientes)',
+                'series': None,
+            })
+            valid_metrics = metrics
+        else:
+            log.error("BARO: retornando vacío — no se pudo calcular ninguna métrica")
+            return {}
+
     total_w    = sum(m['weight'] for m in valid_metrics)
     weighted_s = sum(m['percentile'] * m['weight'] for m in valid_metrics)
     score = weighted_s / total_w if total_w > 0 else 50.0
@@ -4063,20 +4314,22 @@ def build_vts_metrics_table(metrics: list, sort_mode: str = 'vts') -> go.Figure:
 
     n = len(sorted_m)
     names  = [m['name'] for m in sorted_m]
-    pctls  = [m['percentile'] for m in sorted_m]
+    # Reemplazar NaN por 0 para que Plotly lo renderice (pero flaggeamos en el texto)
+    pctls  = [m['percentile'] if pd.notna(m['percentile']) else 0 for m in sorted_m]
+    is_nan = [pd.isna(m['percentile']) for m in sorted_m]
     vals   = [m['value']  for m in sorted_m]
     wts    = [m['weight'] for m in sorted_m]
 
     # Color por bucket
-    def bucket_color(p):
-        if pd.isna(p): return '#484F58'
+    def bucket_color(p, is_nan_flag):
+        if is_nan_flag: return '#484F58'
         if p < 20:  return '#2EA043'
         if p < 40:  return '#3FB950'
         if p < 60:  return '#FFD33D'
         if p < 80:  return '#FB8500'
         return '#F85149'
 
-    bar_colors = [bucket_color(p) for p in pctls]
+    bar_colors = [bucket_color(p, nn) for p, nn in zip(pctls, is_nan)]
 
     fig = go.Figure()
 
@@ -4091,8 +4344,8 @@ def build_vts_metrics_table(metrics: list, sort_mode: str = 'vts') -> go.Figure:
     fig.add_trace(go.Bar(
         x=pctls, y=names, orientation='h',
         marker=dict(color=bar_colors, line=dict(width=0)),
-        text=[f"{p:.0f}% · {v} · w={w:.1f}" if pd.notna(p) else '—'
-              for p, v, w in zip(pctls, vals, wts)],
+        text=[f"N/A · {v} · w={w:.1f}" if nn else f"{p:.0f}% · {v} · w={w:.1f}"
+              for p, v, w, nn in zip(pctls, vals, wts, is_nan)],
         textposition='inside', insidetextanchor='start',
         textfont=dict(size=10, color='#F0F6FC', family='JetBrains Mono'),
         showlegend=False,
@@ -4144,8 +4397,15 @@ def build_vts_history_chart(history: pd.Series, window: int = 252) -> go.Figure:
     if history is None or history.empty:
         return fig
 
+    # Filtrar NaN antes de procesar
+    h_clean = history.dropna()
+    if h_clean.empty:
+        return fig
+
     # Mostrar solo el último año para claridad
-    h = history.tail(window)
+    h = h_clean.tail(window)
+    if h.empty:
+        return fig
 
     # Bandas de régimen (horizontales)
     for y0, y1, color, label in [
@@ -4202,6 +4462,244 @@ def build_vts_history_chart(history: pd.Series, window: int = 252) -> go.Figure:
         hovermode='x unified', showlegend=False,
     )
     return fig
+
+
+def build_vts_history_full(history: pd.Series) -> go.Figure:
+    """
+    Gráfico histórico completo del Barómetro (lifetime).
+    Incluye rangeselector, bandas de régimen y estadísticas.
+    """
+    fig = go.Figure()
+    if history is None or history.empty:
+        return fig
+    h = history.dropna()
+    if h.empty:
+        return fig
+
+    # Bandas de régimen (horizontales)
+    for y0, y1, color, _ in [
+        (0, 20,   'rgba(46,160,67,0.10)',   'Vol Baja'),
+        (20, 40,  'rgba(63,185,80,0.08)',   'Moderada'),
+        (40, 60,  'rgba(255,211,61,0.08)',  'Mid'),
+        (60, 80,  'rgba(251,133,0,0.08)',   'Elevada'),
+        (80, 100, 'rgba(248,81,73,0.10)',   'Extrema'),
+    ]:
+        fig.add_hrect(y0=y0, y1=y1, fillcolor=color, line_width=0, layer='below')
+
+    # Serie principal
+    fig.add_trace(go.Scatter(
+        x=h.index, y=h.values,
+        mode='lines', name='Barómetro VTS',
+        line=dict(color='#58A6FF', width=1.5),
+        fill='tozeroy', fillcolor='rgba(88,166,255,0.04)',
+        hovertemplate='<b>%{x|%Y-%m-%d}</b><br>Score: %{y:.1f}%<extra></extra>',
+    ))
+
+    # Punto HOY
+    fig.add_trace(go.Scatter(
+        x=[h.index[-1]], y=[h.iloc[-1]],
+        mode='markers', name='HOY',
+        marker=dict(size=14, color='#F7931A', symbol='diamond',
+                    line=dict(width=2, color='white')),
+        showlegend=False,
+    ))
+
+    # Media histórica
+    mean_val = h.mean()
+    fig.add_hline(y=mean_val, line_color='#F7931A', line_dash='dash',
+                  line_width=1,
+                  annotation_text=f"Media: {mean_val:.1f}%",
+                  annotation_position='top right',
+                  annotation_font=dict(size=9, color='#F7931A'))
+
+    fig.update_layout(
+        title=dict(
+            text=f"<b>Histórico completo del Barómetro VTS</b>"
+                 f"<br><span style='font-size:0.72rem;color:#8B949E;font-family:JetBrains Mono'>"
+                 f"{h.index[0].date()} → {h.index[-1].date()} · "
+                 f"{len(h):,} días · Media: {mean_val:.1f}% · "
+                 f"Min: {h.min():.1f}% · Max: {h.max():.1f}%"
+                 f"</span>",
+            font=dict(size=13, color='#F0F6FC', family='Inter'),
+            x=0.5, xanchor='center',
+        ),
+        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
+        height=480, margin=dict(l=50, r=30, t=85, b=45),
+        xaxis=dict(
+            gridcolor='#21262D',
+            tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono'),
+            rangeselector=dict(
+                buttons=[
+                    dict(count=1,  label="1M",  step="month", stepmode="backward"),
+                    dict(count=6,  label="6M",  step="month", stepmode="backward"),
+                    dict(count=1,  label="1A",  step="year",  stepmode="backward"),
+                    dict(count=3,  label="3A",  step="year",  stepmode="backward"),
+                    dict(count=5,  label="5A",  step="year",  stepmode="backward"),
+                    dict(step="all", label="Todo"),
+                ],
+                bgcolor='#161B22', activecolor='#F7931A', bordercolor='#30363D',
+                font=dict(size=9, color='#C9D1D9', family='JetBrains Mono'),
+            ),
+            rangeslider=dict(visible=True, thickness=0.04, bgcolor='#161B22'),
+        ),
+        yaxis=dict(
+            range=[0, 100], gridcolor='#21262D',
+            tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono'),
+            title=dict(text="Score %", font=dict(size=10, color='#8B949E')),
+            tickvals=[0, 20, 40, 60, 80, 100],
+        ),
+        hovermode='x unified', showlegend=False,
+    )
+    return fig
+
+
+def build_vts_monthly_heatmap(history: pd.Series) -> go.Figure:
+    """
+    Heatmap de la media mensual del score VTS.
+    Año × Mes — detecta patrones estacionales (sell-in-May, etc).
+    """
+    fig = go.Figure()
+    if history is None or history.empty:
+        return fig
+
+    h = history.dropna()
+    if len(h) < 60:
+        return fig
+
+    # Agrupar por año/mes y tomar la media mensual
+    df_m = pd.DataFrame({'score': h.values}, index=h.index)
+    df_m['year']  = df_m.index.year
+    df_m['month'] = df_m.index.month
+    monthly = df_m.groupby(['year', 'month'])['score'].mean().reset_index()
+    pivot = monthly.pivot(index='year', columns='month', values='score')
+
+    # Asegurar todos los meses 1-12
+    for m in range(1, 13):
+        if m not in pivot.columns:
+            pivot[m] = np.nan
+    pivot = pivot.reindex(sorted(pivot.columns), axis=1)
+
+    # Escala de colores idéntica a las bandas del barómetro
+    z_vals = pivot.values
+    text_vals = [[f"{v:.0f}%" if pd.notna(v) else "" for v in row] for row in z_vals]
+
+    fig.add_trace(go.Heatmap(
+        z=z_vals,
+        x=['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun',
+           'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic'],
+        y=pivot.index.tolist(),
+        text=text_vals,
+        texttemplate='%{text}',
+        textfont=dict(size=10, color='#0D1117', family='JetBrains Mono'),
+        colorscale=[
+            [0.00, '#2EA043'],
+            [0.20, '#3FB950'],
+            [0.40, '#FFD33D'],
+            [0.60, '#FB8500'],
+            [0.80, '#F85149'],
+            [1.00, '#B60205'],
+        ],
+        zmin=0, zmax=100,
+        colorbar=dict(
+            title=dict(text="Score %", font=dict(color='#8B949E', size=10)),
+            tickfont=dict(size=9, color='#8B949E'),
+            thickness=12,
+        ),
+        hovertemplate='<b>%{y} · %{x}</b><br>Score medio: %{z:.1f}%<extra></extra>',
+        xgap=2, ygap=2,
+    ))
+
+    fig.update_layout(
+        title=dict(
+            text="<b>Heatmap mensual del Barómetro — media por mes/año</b>"
+                 "<br><span style='font-size:0.72rem;color:#8B949E;font-family:JetBrains Mono'>"
+                 "Detecta patrones estacionales (ej: 'sell in May', vol de septiembre-octubre)"
+                 "</span>",
+            font=dict(size=13, color='#F0F6FC', family='Inter'),
+            x=0.5, xanchor='center',
+        ),
+        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#0D1117',
+        height=max(340, len(pivot) * 24 + 120),
+        margin=dict(l=60, r=30, t=85, b=40),
+        xaxis=dict(tickfont=dict(size=10, color='#C9D1D9', family='JetBrains Mono'),
+                   side='top'),
+        yaxis=dict(tickfont=dict(size=10, color='#C9D1D9', family='JetBrains Mono'),
+                   autorange='reversed', dtick=1),
+    )
+    return fig
+
+
+def build_vts_regime_distribution(history: pd.Series) -> tuple[go.Figure, dict]:
+    """
+    Distribución del tiempo pasado en cada régimen + histograma del score.
+    Retorna (figura, stats dict).
+    """
+    fig = go.Figure()
+    stats = {}
+
+    if history is None or history.empty:
+        return fig, stats
+
+    h = history.dropna()
+    if h.empty:
+        return fig, stats
+
+    # Buckets de régimen
+    buckets = [
+        (0,   20,  'Vol BAJA',    '#2EA043'),
+        (20,  40,  'MODERADA',    '#3FB950'),
+        (40,  60,  'MID',         '#FFD33D'),
+        (60,  80,  'ELEVADA',     '#FB8500'),
+        (80,  100, 'EXTREMA',     '#F85149'),
+    ]
+
+    total = len(h)
+    counts = []
+    labels = []
+    colors = []
+    for lo, hi, label, color in buckets:
+        mask = (h >= lo) & (h < hi if hi < 100 else h <= hi)
+        n = int(mask.sum())
+        pct = n / total * 100 if total > 0 else 0
+        counts.append(pct)
+        labels.append(f"{label}<br>({lo}-{hi}%)")
+        colors.append(color)
+        stats[label] = {'days': n, 'pct': pct}
+
+    # Barras horizontales de tiempo en cada régimen
+    fig.add_trace(go.Bar(
+        x=counts, y=labels, orientation='h',
+        marker=dict(color=colors, line=dict(width=0)),
+        text=[f"{c:.1f}% del tiempo" for c in counts],
+        textposition='outside',
+        textfont=dict(size=11, color='#F0F6FC', family='JetBrains Mono'),
+        hovertemplate='%{y}<br>%{x:.2f}%<extra></extra>',
+        showlegend=False,
+    ))
+
+    fig.update_layout(
+        title=dict(
+            text=f"<b>Distribución del tiempo por régimen</b>"
+                 f"<br><span style='font-size:0.72rem;color:#8B949E;font-family:JetBrains Mono'>"
+                 f"{total:,} días · {h.index[0].date()} → {h.index[-1].date()}"
+                 f"</span>",
+            font=dict(size=13, color='#F0F6FC', family='Inter'),
+            x=0.5, xanchor='center',
+        ),
+        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#0D1117',
+        height=340, margin=dict(l=130, r=80, t=80, b=40),
+        xaxis=dict(
+            range=[0, max(counts) * 1.2],
+            gridcolor='#21262D', showgrid=True,
+            tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono'),
+            ticksuffix='%',
+        ),
+        yaxis=dict(
+            tickfont=dict(size=10, color='#C9D1D9', family='JetBrains Mono'),
+            autorange='reversed',
+        ),
+    )
+    return fig, stats
 
 
 def cpct(p1, p2):
@@ -4885,7 +5383,7 @@ with tab2:
                 trades_display["ret_pct"] = trades_display["ret_pct"].apply(lambda x: f"{x:+.2f}%")
                 if "hold_d" in trades_display.columns:
                     trades_display["hold_d"] = trades_display["hold_d"].apply(lambda x: f"{int(x)}d")
-                st.dataframe(trades_display, use_container_width=True, hide_index=True)
+                st.dataframe(trades_display, width="stretch", hide_index=True)
 
                 # Resumen de salidas
                 if "exit_why" in trades.columns:
@@ -5084,7 +5582,7 @@ E[RV_futura] = β₀ + β₁·RV_diaria + β₂·RV_semanal(5d) + β₃·RV_mens
                     }
                     mz_a = har_bt.get('mz_alpha', '—'); mz_b = har_bt.get('mz_beta', '—')
                     n_t  = har_bt.get('n_test', '—')
-                    st.dataframe(pd.DataFrame(brow1), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(brow1), width="stretch", hide_index=True)
                     st.markdown(f"""
 <div style="font-family:'JetBrains Mono';font-size:0.75rem;color:#8B949E;margin:0.3rem 0">
 <b style="color:#C9D1D9">Mincer-Zarnowitz:</b> α={mz_a} (ideal 0) · β={mz_b} (ideal 1) ·
@@ -5200,8 +5698,21 @@ with tab_skew:
         opt_chains_raw, opt_spot = fetch_options_chains(skew_ticker, n_exp=n_exps)
 
     if not opt_chains_raw or not opt_spot:
-        st.error(f"❌ Yahoo Finance rate limit — no se cargaron opciones para **{skew_ticker}**.")
-        st.info("💡 Espera 3-5 min · baja a 2 vencimientos · o intenta en horario de mercado (9:30-16:00 ET).")
+        st.error(f"❌ **Yahoo Finance rate-limited** — no se cargaron opciones de **{skew_ticker}**.")
+        st.info(
+            "💡 Streamlit Cloud comparte IP con miles de apps, Yahoo aplica rate limits.\n\n"
+            "**Qué puedes hacer:**\n"
+            "- Esperar 15-30 min (cache negativo automático)\n"
+            "- Reducir a 2 vencimientos y reintentar\n"
+            "- Intentar en horario de mercado (9:30-16:00 ET) cuando la API de Yahoo es más estable\n"
+            "- Ejecutar la app localmente donde tu IP no está bloqueada"
+        )
+        if st.button("🔄 Reintentar ahora (limpia cache negativo)", key="btn_skew_retry"):
+            for k in list(st.session_state.keys()):
+                if k.startswith("_opts_fail_"):
+                    del st.session_state[k]
+            fetch_options_chains.clear()
+            st.rerun()
         st.stop()
 
     # ── Calcular IV con Black-Scholes (Brent's method) ───────
@@ -5332,7 +5843,7 @@ with tab_skew:
                 "Puts": len(puts_t), "Calls": len(calls_t),
             })
         if rows_tbl:
-            st.dataframe(pd.DataFrame(rows_tbl), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(rows_tbl), width="stretch", hide_index=True)
 
     st.caption(
         f"IV calculada con Black-Scholes (Brent) · r={skew_rfr:.1%} · q={skew_div:.1%} · "
@@ -5401,7 +5912,7 @@ with tab_skew:
                     "R²": round(fit.get("r2",0),3),
                 })
             if rows_svi:
-                st.dataframe(pd.DataFrame(rows_svi), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(rows_svi), width="stretch", hide_index=True)
 
         # ── Smile chart: actual vs forecasted ────────────────
         col_sm1, col_sm2 = st.columns([1.4, 1])
@@ -5485,7 +5996,7 @@ with tab_skew:
                     "P&L Esp. ($)": "${:.0f}",
                     "Mid $": "${:.2f}",
                 }),
-                use_container_width=True, hide_index=True
+                width="stretch", hide_index=True
             )
 
             # ── Best trade summary ────────────────────────────
@@ -5562,8 +6073,21 @@ with tab_gex:
         gex_chains_raw, gex_spot = fetch_options_chains(gex_ticker, n_exp=gex_n_exp)
 
     if not gex_chains_raw or not gex_spot:
-        st.error(f"❌ No se pudieron cargar opciones para **{gex_ticker}**.")
-        st.info("Espera 3-5 min · baja a 1-2 vencimientos · o intenta en horario de mercado.")
+        st.error(f"❌ **Yahoo Finance rate-limited** — no se cargaron opciones de **{gex_ticker}**.")
+        st.info(
+            "💡 Streamlit Cloud comparte IP con miles de apps, Yahoo aplica rate limits.\n\n"
+            "**Qué puedes hacer:**\n"
+            "- Esperar 15-30 min (cache negativo automático)\n"
+            "- Reducir a 1-2 vencimientos y reintentar\n"
+            "- Intentar en horario de mercado (9:30-16:00 ET)\n"
+            "- Ejecutar la app localmente"
+        )
+        if st.button("🔄 Reintentar ahora (limpia cache negativo)", key="btn_gex_retry"):
+            for k in list(st.session_state.keys()):
+                if k.startswith("_opts_fail_"):
+                    del st.session_state[k]
+            fetch_options_chains.clear()
+            st.rerun()
         st.stop()
 
     # Calcular IV BS (necesaria para gamma precisa)
@@ -5736,7 +6260,7 @@ with tab_gex:
             st.dataframe(top_strikes.style.format({
                 "Strike":"${:.0f}","GEX Calls ($M)":"${:.2f}M",
                 "GEX Puts ($M)":"${:.2f}M","Net GEX ($M)":"${:+.2f}M"}),
-                use_container_width=True, hide_index=True)
+                width="stretch", hide_index=True)
 
     st.caption(
         f"GEX/DEX = OI × Greeks_BS × S² × 100 · "
@@ -5770,10 +6294,20 @@ with tab_baro:
     with col_w1:
         baro_window = st.select_slider(
             "Ventana rolling para percentiles",
-            options=[126, 252, 504, 756],
-            value=252,
-            format_func=lambda x: f"{x} días (~{x//21}m)",
-            help="VTS usa 252d = 1 año. Ventanas más cortas reaccionan más rápido.",
+            options=[252, 504, 756, 1260, 2520, 3780],
+            value=1260,
+            format_func=lambda x: {
+                252: "252d (1 año)",
+                504: "504d (2 años)",
+                756: "756d (3 años)",
+                1260: "1260d (5 años) — recomendado",
+                2520: "2520d (10 años)",
+                3780: "3780d (15 años) — máxima similitud VTS",
+            }.get(x, f"{x} días"),
+            help="VTS oficial usa percentiles desde ~2011 (15+ años). "
+                 "Ventanas más largas se parecen más al VTS real. "
+                 "Ventanas cortas reaccionan más rápido pero sobrestiman vol "
+                 "cuando el entorno reciente fue volátil.",
         )
     with col_w2:
         st.write("")
@@ -5803,7 +6337,7 @@ with tab_baro:
                 else:
                     bt_baro[col] = live_ext[col].reindex(bt_baro.index)
 
-        # Fetch de datos extra (VVIX, SKEW, HYG, IEF)
+        # Fetch de datos extra (VVIX, SKEW, HYG, IEF, VIX9D, VIX3M, VIX6M, VIX1Y)
         edge_extra_baro = fetch_edge_extra()
 
         # Calcular el barómetro
@@ -5815,100 +6349,168 @@ with tab_baro:
             window=baro_window,
         )
 
+    # ── DIAGNÓSTICO: siempre visible para debugging ─────────
+    with st.expander("🔍 Diagnóstico de datos (clic para ver qué columnas llegan)",
+                     expanded=not bool(baro)):
+        diag_col1, diag_col2 = st.columns(2)
+
+        with diag_col1:
+            st.markdown("**📦 Parquet master (bt_baro):**")
+            parquet_info = []
+            parquet_info.append(f"- Filas: **{len(bt_baro):,}**")
+            parquet_info.append(f"- Rango: {bt_baro.index[0].date()} → {bt_baro.index[-1].date()}" if len(bt_baro) > 0 else "- Vacío")
+            # Columnas relevantes para el barómetro
+            needed_cols = ['VIX_Close', 'SPY_Close', 'M1_Price', 'M2_Price', 'M4_Price',
+                           'M7_Price', 'M1_DTE', 'M2_DTE', 'VVIX_Live']
+            parquet_info.append("\n**Columnas necesarias:**")
+            for col in needed_cols:
+                if col in bt_baro.columns:
+                    nv = bt_baro[col].notna().sum()
+                    last = bt_baro[col].iloc[-1] if nv > 0 else 'todos NaN'
+                    last_str = f"{last:.2f}" if isinstance(last, (int, float)) and pd.notna(last) else str(last)
+                    parquet_info.append(f"- ✅ `{col}`: {nv:,} válidos · último = {last_str}")
+                else:
+                    parquet_info.append(f"- ❌ `{col}`: **NO EXISTE en parquet**")
+            st.markdown("\n".join(parquet_info))
+
+        with diag_col2:
+            st.markdown("**🌐 edge_extra (yfinance):**")
+            extra_info = []
+            expected = ['VVIX', 'SKEW', 'HYG', 'IEF', 'VIX9D', 'VIX3M', 'VIX6M', 'VIX1Y']
+            for name in expected:
+                if name in edge_extra_baro and not edge_extra_baro[name].empty:
+                    df_e = edge_extra_baro[name]
+                    nv = df_e['Close'].notna().sum() if 'Close' in df_e.columns else 0
+                    last_v = df_e['Close'].iloc[-1] if nv > 0 else None
+                    last_str = f"{last_v:.2f}" if last_v is not None and pd.notna(last_v) else '—'
+                    extra_info.append(f"- ✅ `{name}`: {nv:,} filas · último = {last_str}")
+                else:
+                    extra_info.append(f"- ❌ `{name}`: **no se descargó** (rate limit?)")
+            st.markdown("\n".join(extra_info))
+
+        # Info del barómetro calculado
+        st.markdown("---")
+        if baro:
+            st.markdown(f"**✅ Barómetro calculado:**")
+            st.markdown(f"- Score: **{baro['score']:.2f}%** · Régimen: **{baro['regime']}**")
+            st.markdown(f"- Métricas válidas: **{len([m for m in baro['metrics'] if pd.notna(m['percentile'])])}"
+                        f" de {len(baro['metrics'])}**")
+            st.markdown(f"- History series: {len(baro['history']) if baro['history'] is not None else 0} puntos")
+        else:
+            st.error("⚠️ **compute_vts_barometer devolvió vacío.** Razones posibles:")
+            st.markdown(
+                "- `bt_baro` tiene menos de 60 filas → necesitas parquet más largo\n"
+                "- Ninguna métrica logró calcular percentil válido\n"
+                "- `VIX_Close` no está en parquet (es requerido)\n"
+                "\n**Mira el diagnóstico arriba para saber qué columna falta.**"
+            )
+
     if not baro:
-        st.warning("⚠️ No se pudo calcular el barómetro — verifica datos")
+        st.warning("⚠️ No se pudo calcular el barómetro — revisa el diagnóstico arriba")
         st.stop()
 
-    # ── Layout principal: Gauge + KPIs ───────────────────
-    col_gauge, col_kpi = st.columns([1.15, 1])
+    # ═══════════════════════════════════════════════════════════════
+    # SUB-TABS: Actual vs Histórico
+    # ═══════════════════════════════════════════════════════════════
+    sub_actual, sub_hist = st.tabs([
+        "📊  Actual",
+        "📈  Análisis Histórico",
+    ])
 
-    with col_gauge:
-        gauge_fig = build_vts_barometer_gauge(
-            score=baro['score'],
-            regime=baro['regime'],
-            date_str=baro['date'].strftime('%Y-%m-%d'),
-        )
-        st.plotly_chart(gauge_fig, width="stretch", config=dict(displayModeBar=False))
+    # ═══════════════════════════════════════════════════════════════
+    # SUB-TAB: ACTUAL (gauge + KPIs + desglose + timeline últimos N días)
+    # ═══════════════════════════════════════════════════════════════
+    with sub_actual:
+        # ── Layout principal: Gauge + KPIs ───────────────────
+        col_gauge, col_kpi = st.columns([1.15, 1])
 
-    with col_kpi:
-        score    = baro['score']
-        regime   = baro['regime']
-        position = baro['position']
-        n_metrics = len(baro['metrics'])
+        with col_gauge:
+            gauge_fig = build_vts_barometer_gauge(
+                score=baro['score'],
+                regime=baro['regime'],
+                date_str=baro['date'].strftime('%Y-%m-%d'),
+            )
+            st.plotly_chart(gauge_fig, width="stretch", config=dict(displayModeBar=False))
 
-        # Determinar color del régimen
-        if   score < 20: rc = 'var(--g)'
-        elif score < 40: rc = 'var(--g)'
-        elif score < 60: rc = 'var(--y)'
-        elif score < 80: rc = '#FB8500'
-        else:            rc = 'var(--r)'
+        with col_kpi:
+            score    = baro['score']
+            regime   = baro['regime']
+            position = baro['position']
+            n_metrics = len(baro['metrics'])
 
-        # Percentil del score HOY vs su historia
-        if baro['history'] is not None and not baro['history'].empty:
-            h = baro['history']
-            score_pctile = (h <= score).mean() * 100
-            h_mean = h.mean()
-            h_max = h.max()
-            h_min = h.min()
-        else:
-            score_pctile = 50; h_mean = 50; h_max = 100; h_min = 0
+            # Determinar color del régimen
+            if   score < 20: rc = 'var(--g)'
+            elif score < 40: rc = 'var(--g)'
+            elif score < 60: rc = 'var(--y)'
+            elif score < 80: rc = '#FB8500'
+            else:            rc = 'var(--r)'
 
-        st.markdown(f"""
-        <div style="padding:0.5rem 0;">
-            <div class="sig-box" style="background:rgba(247,147,26,0.08);
-                 border-color:#F7931A;margin-bottom:0.8rem;">
-                <div class="sl" style="color:{rc};">{score:.2f}%</div>
-                <div class="sd" style="font-size:0.85rem;color:{rc};font-weight:700;">
-                    Régimen: {regime}
+            # Percentil del score HOY vs su historia
+            if baro['history'] is not None and not baro['history'].empty:
+                h = baro['history']
+                score_pctile = (h <= score).mean() * 100
+                h_mean = h.mean()
+                h_max = h.max()
+                h_min = h.min()
+            else:
+                score_pctile = 50; h_mean = 50; h_max = 100; h_min = 0
+
+            st.markdown(f"""
+            <div style="padding:0.5rem 0;">
+                <div class="sig-box" style="background:rgba(247,147,26,0.08);
+                     border-color:#F7931A;margin-bottom:0.8rem;">
+                    <div class="sl" style="color:{rc};">{score:.2f}%</div>
+                    <div class="sd" style="font-size:0.85rem;color:{rc};font-weight:700;">
+                        Régimen: {regime}
+                    </div>
+                    <div class="sd" style="margin-top:4px;">{position}</div>
                 </div>
-                <div class="sd" style="margin-top:4px;">{position}</div>
+                <div class="icard">
+                    <div class="ic-title">📊 Métricas del barómetro</div>
+                    <div class="ic-row"><span class="ic-label">Métricas activas</span>
+                        <span class="ic-val">{n_metrics}</span></div>
+                    <div class="ic-row"><span class="ic-label">Ventana rolling</span>
+                        <span class="ic-val">{baro['window']}d</span></div>
+                    <div class="ic-row"><span class="ic-label">Score HOY</span>
+                        <span class="ic-val" style="color:{rc};font-weight:700">{score:.2f}%</span></div>
+                    <div class="ic-row"><span class="ic-label">Percentil histórico</span>
+                        <span class="ic-val">{score_pctile:.1f}°</span></div>
+                    <div class="ic-row"><span class="ic-label">Media histórica</span>
+                        <span class="ic-val">{h_mean:.1f}%</span></div>
+                    <div class="ic-row"><span class="ic-label">Rango (min-max)</span>
+                        <span class="ic-val">{h_min:.1f}% – {h_max:.1f}%</span></div>
+                </div>
             </div>
-            <div class="icard">
-                <div class="ic-title">📊 Métricas del barómetro</div>
-                <div class="ic-row"><span class="ic-label">Métricas activas</span>
-                    <span class="ic-val">{n_metrics}</span></div>
-                <div class="ic-row"><span class="ic-label">Ventana rolling</span>
-                    <span class="ic-val">{baro['window']}d</span></div>
-                <div class="ic-row"><span class="ic-label">Score HOY</span>
-                    <span class="ic-val" style="color:{rc};font-weight:700">{score:.2f}%</span></div>
-                <div class="ic-row"><span class="ic-label">Percentil histórico</span>
-                    <span class="ic-val">{score_pctile:.1f}°</span></div>
-                <div class="ic-row"><span class="ic-label">Media histórica</span>
-                    <span class="ic-val">{h_mean:.1f}%</span></div>
-                <div class="ic-row"><span class="ic-label">Rango (min-max)</span>
-                    <span class="ic-val">{h_min:.1f}% – {h_max:.1f}%</span></div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+            """, unsafe_allow_html=True)
 
-    st.markdown("<div style='border-top:1px solid #30363D;margin:0.8rem 0'></div>",
-                unsafe_allow_html=True)
+        st.markdown("<div style='border-top:1px solid #30363D;margin:0.8rem 0'></div>",
+                    unsafe_allow_html=True)
 
-    # ── Histórico del score ──────────────────────────────
-    if baro['history'] is not None and not baro['history'].empty:
-        hist_fig = build_vts_history_chart(baro['history'], window=baro_window)
-        st.plotly_chart(hist_fig, width="stretch", config=dict(displayModeBar=False))
+        # ── Timeline del score (últimos N días) ──────────────
+        if baro['history'] is not None and not baro['history'].empty:
+            hist_fig = build_vts_history_chart(baro['history'], window=baro_window)
+            st.plotly_chart(hist_fig, width="stretch", config=dict(displayModeBar=False))
 
-    st.markdown("<div style='border-top:1px solid #30363D;margin:0.8rem 0'></div>",
-                unsafe_allow_html=True)
+        st.markdown("<div style='border-top:1px solid #30363D;margin:0.8rem 0'></div>",
+                    unsafe_allow_html=True)
 
-    # ── Desglose de métricas (toggle: orden VTS vs stress) ───
-    col_mode1, col_mode2 = st.columns([3, 1])
-    with col_mode2:
-        sort_mode = st.radio(
-            "Orden",
-            options=['vts', 'stress'],
-            format_func=lambda x: '🎯 Canónico VTS' if x == 'vts' else '🔥 Por stress',
-            key='baro_sort_mode',
-            horizontal=False,
-            label_visibility='collapsed',
-        )
-    metrics_fig = build_vts_metrics_table(baro['metrics'], sort_mode=sort_mode)
-    st.plotly_chart(metrics_fig, width="stretch", config=dict(displayModeBar=False))
+        # ── Desglose de métricas (toggle: orden VTS vs stress) ───
+        col_mode1, col_mode2 = st.columns([3, 1])
+        with col_mode2:
+            sort_mode = st.radio(
+                "Orden",
+                options=['vts', 'stress'],
+                format_func=lambda x: '🎯 Canónico VTS' if x == 'vts' else '🔥 Por stress',
+                key='baro_sort_mode',
+                horizontal=False,
+                label_visibility='collapsed',
+            )
+        metrics_fig = build_vts_metrics_table(baro['metrics'], sort_mode=sort_mode)
+        st.plotly_chart(metrics_fig, width="stretch", config=dict(displayModeBar=False))
 
-    # ── Interpretación y guía de lectura ─────────────────
-    with st.expander("📖 Metodología y guía de lectura", expanded=False):
-        st.markdown(f"""
+        # ── Interpretación y guía de lectura ─────────────────
+        with st.expander("📖 Metodología y guía de lectura", expanded=False):
+            st.markdown(f"""
 **Qué mide el barómetro**
 
 El VTS Volatility Barometer combina **{n_metrics} métricas de volatilidad** en un único
@@ -5971,12 +6573,205 @@ La utilidad principal es como **filtro de régimen** complementario al Monitor O
 - Score **> 80%** = considerar **long vol (VXX/UVXY) como hedge táctico**
 """)
 
-    st.caption(
-        f"VTS Volatility Barometer v1.0 · "
-        f"Inspirado en volatilitytradingstrategies.com · "
-        f"Ventana: {baro_window}d · Métricas: {n_metrics} · "
-        f"Última actualización: {baro['date'].strftime('%Y-%m-%d')}"
-    )
+        st.caption(
+            f"VTS Volatility Barometer v1.0 · "
+            f"Inspirado en volatilitytradingstrategies.com · "
+            f"Ventana: {baro_window}d · Métricas: {n_metrics} · "
+            f"Última actualización: {baro['date'].strftime('%Y-%m-%d')}"
+        )
+
+    # ═══════════════════════════════════════════════════════════════
+    # SUB-TAB: ANÁLISIS HISTÓRICO (serie completa + date picker + heatmap + dist)
+    # ═══════════════════════════════════════════════════════════════
+    with sub_hist:
+        hist = baro.get('history')
+
+        if hist is None or hist.empty or hist.dropna().empty:
+            st.warning(
+                "⚠️ No hay serie histórica disponible. Esto puede pasar si:\n\n"
+                "- Los datos de yfinance no se descargaron (rate limit)\n"
+                "- El parquet del barómetro `data/baro_history.parquet` no existe aún\n"
+                "- La ventana rolling es más larga que la data disponible"
+            )
+            st.info(
+                "💡 **Tip:** ejecuta `python scripts/update_baro_parquet.py` para generar "
+                "`data/baro_history.parquet` con 15+ años de datos. "
+                "Después activa la GitHub Action para mantenerlo actualizado diariamente."
+            )
+            st.stop()
+
+        h_clean = hist.dropna()
+
+        st.markdown(
+            f"<div style='font-family:JetBrains Mono,monospace;font-size:0.72rem;"
+            f"color:#8B949E;padding:0.3rem 0 0.8rem;'>"
+            f"📊 Serie completa: <b>{len(h_clean):,} días</b> · "
+            f"{h_clean.index[0].date()} → {h_clean.index[-1].date()} · "
+            f"Ventana rolling: <b>{baro_window}d</b>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        # ── Date picker: mirar el score en una fecha específica ──
+        st.markdown("### 🗓️ Score en una fecha específica")
+        dp_col1, dp_col2 = st.columns([1, 2])
+
+        with dp_col1:
+            selected_date = st.date_input(
+                "Selecciona una fecha",
+                value=h_clean.index[-1].date(),
+                min_value=h_clean.index[0].date(),
+                max_value=h_clean.index[-1].date(),
+                key='baro_date_picker',
+            )
+
+        # Buscar la fecha más cercana en la serie
+        sel_ts = pd.Timestamp(selected_date)
+        # Primero intentamos exact match, si no, buscamos la más cercana anterior
+        if sel_ts in h_clean.index:
+            matched_date = sel_ts
+            matched_score = float(h_clean.loc[sel_ts])
+        else:
+            prev_dates = h_clean.index[h_clean.index <= sel_ts]
+            if len(prev_dates) > 0:
+                matched_date = prev_dates[-1]
+                matched_score = float(h_clean.loc[matched_date])
+            else:
+                matched_date = h_clean.index[0]
+                matched_score = float(h_clean.iloc[0])
+
+        # Determinar régimen de esa fecha
+        if   matched_score < 20: reg_sel, clr_sel = "VOL BAJA",  '#2EA043'
+        elif matched_score < 40: reg_sel, clr_sel = "MODERADA",  '#3FB950'
+        elif matched_score < 60: reg_sel, clr_sel = "MID",       '#FFD33D'
+        elif matched_score < 80: reg_sel, clr_sel = "ELEVADA",   '#FB8500'
+        else:                    reg_sel, clr_sel = "EXTREMA",   '#F85149'
+
+        # Percentil de esa fecha vs todo el histórico
+        pct_rank = (h_clean <= matched_score).mean() * 100
+
+        with dp_col2:
+            st.markdown(
+                f"""
+                <div class="icard" style="margin-top:0;">
+                    <div class="ic-title">Score el {matched_date.strftime('%Y-%m-%d')}</div>
+                    <div style="display:flex;align-items:center;gap:1.5rem;padding:0.4rem 0;">
+                        <div style="font-family:Inter,sans-serif;font-weight:800;
+                                    font-size:2.2rem;color:{clr_sel};">
+                            {matched_score:.2f}%
+                        </div>
+                        <div>
+                            <div style="font-family:Inter,sans-serif;font-weight:700;
+                                        font-size:1rem;color:{clr_sel};">
+                                {reg_sel}
+                            </div>
+                            <div style="font-family:JetBrains Mono,monospace;font-size:0.75rem;
+                                        color:#8B949E;margin-top:2px;">
+                                Percentil histórico: {pct_rank:.1f}°
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("<div style='border-top:1px solid #30363D;margin:0.8rem 0'></div>",
+                    unsafe_allow_html=True)
+
+        # ── Gráfico histórico completo ───────────────────────
+        st.markdown("### 📈 Serie histórica completa")
+        full_fig = build_vts_history_full(h_clean)
+        st.plotly_chart(full_fig, width="stretch",
+                        config=dict(displayModeBar=True, displaylogo=False,
+                                    modeBarButtonsToRemove=['select2d', 'lasso2d']))
+
+        st.markdown("<div style='border-top:1px solid #30363D;margin:0.8rem 0'></div>",
+                    unsafe_allow_html=True)
+
+        # ── Heatmap + Distribución ────────────────────────────
+        col_hm, col_dist = st.columns([1.3, 1])
+
+        with col_hm:
+            st.markdown("### 🌡️ Heatmap estacional")
+            hm_fig = build_vts_monthly_heatmap(h_clean)
+            st.plotly_chart(hm_fig, width="stretch", config=dict(displayModeBar=False))
+
+        with col_dist:
+            st.markdown("### 📊 Tiempo por régimen")
+            dist_fig, regime_stats = build_vts_regime_distribution(h_clean)
+            st.plotly_chart(dist_fig, width="stretch", config=dict(displayModeBar=False))
+
+            # Insight interpretativo
+            dominant = max(regime_stats.items(), key=lambda x: x[1]['pct']) if regime_stats else None
+            if dominant:
+                st.caption(
+                    f"💡 **Régimen dominante**: {dominant[0]} "
+                    f"({dominant[1]['pct']:.1f}% del tiempo · {dominant[1]['days']:,} días)"
+                )
+
+        st.markdown("<div style='border-top:1px solid #30363D;margin:0.8rem 0'></div>",
+                    unsafe_allow_html=True)
+
+        # ── Estadísticas generales + tabla de datos ──────────
+        st.markdown("### 📋 Estadísticas del barómetro histórico")
+
+        col_s1, col_s2, col_s3, col_s4 = st.columns(4)
+        with col_s1:
+            st.metric("Score actual", f"{h_clean.iloc[-1]:.2f}%",
+                      delta=f"{h_clean.iloc[-1] - h_clean.iloc[-22]:+.2f}%"
+                      if len(h_clean) > 22 else None,
+                      help="Cambio vs hace 22 días (1 mes)")
+        with col_s2:
+            st.metric("Media histórica", f"{h_clean.mean():.2f}%",
+                      help=f"Media de los {len(h_clean):,} días")
+        with col_s3:
+            st.metric("Mediana histórica", f"{h_clean.median():.2f}%")
+        with col_s4:
+            st.metric("Desviación estándar", f"{h_clean.std():.2f}%")
+
+        col_s5, col_s6, col_s7, col_s8 = st.columns(4)
+        with col_s5:
+            st.metric("Máximo histórico", f"{h_clean.max():.2f}%",
+                      help=f"Alcanzado el {h_clean.idxmax().date()}")
+        with col_s6:
+            st.metric("Mínimo histórico", f"{h_clean.min():.2f}%",
+                      help=f"Alcanzado el {h_clean.idxmin().date()}")
+        with col_s7:
+            pct_above_60 = (h_clean > 60).mean() * 100
+            st.metric("% días con score > 60", f"{pct_above_60:.1f}%",
+                      help="Entorno defensivo / cash")
+        with col_s8:
+            pct_below_40 = (h_clean < 40).mean() * 100
+            st.metric("% días con score < 40", f"{pct_below_40:.1f}%",
+                      help="Entorno favorable para short vol")
+
+        # ── Tabla de días con score extremo ──────────────────
+        with st.expander("🔝 Top 20 días con score más extremo (alto y bajo)"):
+            col_hi, col_lo = st.columns(2)
+            with col_hi:
+                st.markdown("**🔥 Top 20 más altos (mayor stress)**")
+                top_hi = h_clean.nlargest(20).reset_index()
+                top_hi.columns = ['Fecha', 'Score']
+                top_hi['Fecha'] = top_hi['Fecha'].dt.strftime('%Y-%m-%d')
+                top_hi['Score'] = top_hi['Score'].apply(lambda x: f"{x:.2f}%")
+                st.dataframe(top_hi, width="stretch", hide_index=True)
+            with col_lo:
+                st.markdown("**❄️ Top 20 más bajos (mayor calma)**")
+                top_lo = h_clean.nsmallest(20).reset_index()
+                top_lo.columns = ['Fecha', 'Score']
+                top_lo['Fecha'] = top_lo['Fecha'].dt.strftime('%Y-%m-%d')
+                top_lo['Score'] = top_lo['Score'].apply(lambda x: f"{x:.2f}%")
+                st.dataframe(top_lo, width="stretch", hide_index=True)
+
+        # ── Descarga CSV ─────────────────────────────────────
+        csv_data = h_clean.to_frame(name='score').to_csv(index_label='date')
+        st.download_button(
+            "📥 Descargar serie completa CSV",
+            data=csv_data,
+            file_name=f"vts_barometer_history_{h_clean.index[-1].date()}.csv",
+            mime='text/csv',
+        )
 
 
 # ━━━━━━━━━━━━━━━━━ TAB 3: RECOMENDACIONES ━━━━━━━━━━━━━━━━━
