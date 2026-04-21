@@ -1273,24 +1273,18 @@ def build_gex_expected_move_chart(gex_df: pd.DataFrame, chains: dict, spot: floa
 
 
 def fit_svi_slice(strikes: np.ndarray, ivs: np.ndarray, F: float,
-                  T: float | None = None,
+                  T: float,
                   max_iter: int = cfg.SVI_MAX_ITER) -> dict | None:
     """
     Wrapper de vix_controller.quant.svi.fit_svi_slice.
 
-    Refactor clave vs. versión original:
-      - T (time-to-expiry EN AÑOS) ahora es parámetro obligatorio para
-        normalizar varianza total w = IV² · T correctamente por slice.
-      - Si T es None se asume 1.0 (compat con llamadas legacy), pero
-        emite warning: el caller debería pasar el T real.
+    T (time-to-expiry EN AÑOS) es parámetro obligatorio para normalizar
+    varianza total w = IV² · T correctamente por slice. El fallback legacy
+    T=1.0 se eliminó: sesgaba la calibración de expirations cortos.
 
     Ver vix_controller/quant/svi.py para la docstring completa (Gatheral 2004,
     Durrleman 2005, constraints butterfly).
     """
-    if T is None:
-        logging.getLogger("vix_controller").warning(
-            "fit_svi_slice llamado sin T — usando T=1.0 (legacy)")
-        T = 1.0
     return _fit_svi_slice_mod(strikes, ivs, F, T, max_iter=max_iter)
 
 
@@ -1952,12 +1946,19 @@ def _compute_har_rv_asymmetric(spy_close: pd.Series, vix_close: pd.Series,
     forecasts  = np.full(n, np.nan)
     betas_hist = []
 
-    for i in range(window + 22, n):    # sin -h: predecimos hasta hoy inclusive
+    # FIX look-ahead: rv_fwd[j] = std(log_ret[j:j+h]) solo es conocido en t=j+h.
+    # Para entrenar al tiempo i, solo podemos usar pares (X_t, y_t) con t+h ≤ i.
+    # → training slice es [t0 : i-h], no [t0 : i]. Antes, las últimas h filas
+    # del fit usaban labels construidas con datos posteriores a i → bias de hindsight.
+    for i in range(window + h, n):
         t0 = i - window
-        X  = np.column_stack([np.ones(window),
-                               gv_a[t0:i], bv_a[t0:i],
-                               rw_a[t0:i], rm_a[t0:i]])
-        y  = rvf_a[t0:i]
+        train_end = i - h
+        if train_end - t0 < 60:
+            continue
+        X  = np.column_stack([np.ones(train_end - t0),
+                               gv_a[t0:train_end], bv_a[t0:train_end],
+                               rw_a[t0:train_end], rm_a[t0:train_end]])
+        y  = rvf_a[t0:train_end]
         ok = np.isfinite(X).all(axis=1) & np.isfinite(y)
         if ok.sum() < 60:
             continue
@@ -2897,7 +2898,8 @@ def build_equity_curve_chart(result: dict) -> go.Figure:
     eq   = result.get("equity", pd.Series(dtype=float))
     df_r = result.get("df_with_rolling", pd.DataFrame())
 
-    if eq.empty: return fig
+    if eq.empty or not np.isfinite(eq.iloc[0]) or eq.iloc[0] <= 0:
+        return fig
 
     # Normalizar a base 100
     eq_norm = eq / eq.iloc[0] * 100
@@ -2905,19 +2907,21 @@ def build_equity_curve_chart(result: dict) -> go.Figure:
     # Benchmark B&H SVXY
     if "ret_bh" in df_r.columns:
         bh_eq = (1 + df_r["ret_bh"].fillna(0)).cumprod()
-        bh_eq = bh_eq / bh_eq.iloc[0] * 100
-        fig.add_trace(go.Scatter(
-            x=df_r.index, y=bh_eq, name="SVXY Buy & Hold",
-            line=dict(color="#484F58", width=1.5, dash="dot"),
-            hovertemplate="%{x|%Y-%m-%d}<br>B&H: %{y:.0f}<extra></extra>"), row=1, col=1)
+        if len(bh_eq) and np.isfinite(bh_eq.iloc[0]) and bh_eq.iloc[0] > 0:
+            bh_eq = bh_eq / bh_eq.iloc[0] * 100
+            fig.add_trace(go.Scatter(
+                x=df_r.index, y=bh_eq, name="SVXY Buy & Hold",
+                line=dict(color="#484F58", width=1.5, dash="dot"),
+                hovertemplate="%{x|%Y-%m-%d}<br>B&H: %{y:.0f}<extra></extra>"), row=1, col=1)
 
     if "ret_spy" in df_r.columns:
         spy_eq = (1 + df_r["ret_spy"].fillna(0)).cumprod()
-        spy_eq = spy_eq / spy_eq.iloc[0] * 100
-        fig.add_trace(go.Scatter(
-            x=df_r.index, y=spy_eq, name="SPY Buy & Hold",
-            line=dict(color="#8B949E", width=1.5, dash="dot"),
-            hovertemplate="%{x|%Y-%m-%d}<br>SPY: %{y:.0f}<extra></extra>"), row=1, col=1)
+        if len(spy_eq) and np.isfinite(spy_eq.iloc[0]) and spy_eq.iloc[0] > 0:
+            spy_eq = spy_eq / spy_eq.iloc[0] * 100
+            fig.add_trace(go.Scatter(
+                x=df_r.index, y=spy_eq, name="SPY Buy & Hold",
+                line=dict(color="#8B949E", width=1.5, dash="dot"),
+                hovertemplate="%{x|%Y-%m-%d}<br>SPY: %{y:.0f}<extra></extra>"), row=1, col=1)
 
     fig.add_trace(go.Scatter(
         x=eq.index, y=eq_norm, name="Estrategia BB×CT",
