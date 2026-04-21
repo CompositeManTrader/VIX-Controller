@@ -1,0 +1,48 @@
+# ── Backups generados por el refactor ──────────────────────
+app.py.bak_*
+*.bak
+*.bak_*
+
+# ── Python ─────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+.coverage.*
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# ── Entornos virtuales ─────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── IDE / tools ────────────────────────────────────────────
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+.DS_Store
+
+# ── Streamlit ──────────────────────────────────────────────
+.streamlit/secrets.toml
+
+# ── Datos generados localmente (NO baro_history/master) ───
+# Se incluyen data/baro_history.parquet y data/master.parquet explícitamente
+data/*.tmp
+data/*.log
+*.csv.tmp
+
+# ── Logs ───────────────────────────────────────────────────
+*.log
+logs/

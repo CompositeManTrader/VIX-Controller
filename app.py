@@ -15,11 +15,21 @@ from zoneinfo import ZoneInfo
 from scipy.optimize import brentq
 from scipy.stats import norm
 from scipy.interpolate import griddata
+
+# ── Módulos quant propios (refactor) ──────────────────────────
+from vix_controller import config as cfg
+from vix_controller.rates import get_risk_free_rate, get_dividend_yield
+from vix_controller.quant.bs import (
+    bs_call as _bs_call_mod, bs_put as _bs_put_mod,
+    bs_gamma as _bs_gamma_mod, bs_iv as _bs_iv_mod,
+)
+from vix_controller.quant.svi import fit_svi_slice as _fit_svi_slice_mod
+
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 
-CDMX_TZ = ZoneInfo("America/Mexico_City")
+CDMX_TZ = cfg.CDMX_TZ
 def now_cdmx():
     return datetime.now(CDMX_TZ)
 
@@ -257,20 +267,23 @@ def scrape_cboe_futures() -> pd.DataFrame:
     return df_vx
 
 
-@st.cache_data(ttl=55)
+@st.cache_data(ttl=cfg.CACHE_TTL["yahoo_spot"])
 def fetch_vix_spot():
+    log = logging.getLogger("vix_controller")
     try:
         h = yf.Ticker("^VIX").history(period="5d")
         if not h.empty:
             c = round(float(h['Close'].iloc[-1]), 2)
             p = round(float(h['Close'].iloc[-2]), 2) if len(h) > 1 else c
             return dict(price=c, prev=p, chg=round(c - p, 2))
-    except: pass
+    except (ValueError, KeyError, ConnectionError, OSError, AttributeError) as e:
+        log.warning(f"fetch_vix_spot: {e}")
     return None
 
 
-@st.cache_data(ttl=55)
+@st.cache_data(ttl=cfg.CACHE_TTL["yahoo_spot"])
 def fetch_etps():
+    log = logging.getLogger("vix_controller")
     out = {}
     for name, sym in [("VXX","VXX"),("SVXY","SVXY"),("SVIX","SVIX"),("SPY","SPY")]:
         try:
@@ -281,7 +294,9 @@ def fetch_etps():
                     open=round(float(h['Open'].iloc[-1]), 2),
                     prev=round(float(h['Close'].iloc[-2]), 2) if len(h) > 1 else None,
                 )
-        except: continue
+        except (ValueError, KeyError, ConnectionError, OSError, AttributeError) as e:
+            log.warning(f"fetch_etps({sym}): {e}")
+            continue
     return out
 
 
@@ -393,38 +408,14 @@ def fetch_edge_extra():
 # No dependemos de la IV de yfinance (ruidosa/incorrecta).
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def _bs_call(S, X, r, T, v, q):
-    """Black-Scholes call price con dividendo continuo."""
-    if S <= 0 or X <= 0 or T <= 0: return max(S - X, 0.0)
-    if v <= 0: return max(S*np.exp(-q*T) - X*np.exp(-r*T), 0.0)
-    d1 = (np.log(S/X) + (r - q + 0.5*v**2)*T) / (v*np.sqrt(T))
-    d2 = d1 - v*np.sqrt(T)
-    return S*np.exp(-q*T)*norm.cdf(d1) - X*np.exp(-r*T)*norm.cdf(d2)
+# BS y IV → delegan a vix_controller.quant.bs (testable, sin magic numbers).
+_bs_call = _bs_call_mod
+_bs_put  = _bs_put_mod
 
-def _bs_put(S, X, r, T, v, q):
-    """Black-Scholes put price con dividendo continuo."""
-    if S <= 0 or X <= 0 or T <= 0: return max(X - S, 0.0)
-    if v <= 0: return max(X*np.exp(-r*T) - S*np.exp(-q*T), 0.0)
-    d1 = (np.log(S/X) + (r - q + 0.5*v**2)*T) / (v*np.sqrt(T))
-    d2 = d1 - v*np.sqrt(T)
-    return X*np.exp(-r*T)*norm.cdf(-d2) - S*np.exp(-q*T)*norm.cdf(-d1)
-
-def _bs_iv(S, X, r, T, price, option_type, q, tol=1e-6):
-    """IV via Brent's method. Retorna NaN si no converge o fuera de bounds."""
-    if T <= 0 or S <= 0 or X <= 0 or not np.isfinite(price) or price <= 0:
-        return np.nan
-    fn = _bs_call if option_type == "C" else _bs_put
-    # Bounds de precio
-    lo = max(S*np.exp(-q*T) - X*np.exp(-r*T), 0.0) if option_type == "C" \
-         else max(X*np.exp(-r*T) - S*np.exp(-q*T), 0.0)
-    hi = S*np.exp(-q*T) if option_type == "C" else X*np.exp(-r*T)
-    if not (lo <= price <= hi):
-        return np.nan
-    try:
-        iv = brentq(lambda v: price - fn(S, X, r, T, v, q), 1e-6, 5.0, xtol=tol)
-        return np.nan if iv <= tol else iv
-    except (ValueError, RuntimeError):
-        return np.nan
+def _bs_iv(S, X, r, T, price, option_type, q, tol=cfg.IV_TOL):
+    """IV via Brent con clamp [IV_LOWER, IV_UPPER] de config."""
+    return _bs_iv_mod(S, X, r, T, price, option_type, q,
+                      tol=tol, lo=cfg.IV_LOWER, hi=cfg.IV_UPPER)
 
 # ─── Fetch raw options (sin IV de yfinance) ─────────────────────────────────
 
@@ -684,17 +675,16 @@ def compute_bs_iv_for_chains(chains: dict, spot: float, r: float, q: float) -> d
 # Niveles negativos = dealer vende cuando S baja (acelera caída)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def _bs_gamma(S: float, X: float, r: float, T: float, v: float, q: float) -> float:
-    """Gamma Black-Scholes: ∂²C/∂S² = ∂²P/∂S² (igual para call y put)."""
-    if S <= 0 or X <= 0 or T <= 0 or v <= 0:
-        return 0.0
-    d1 = (np.log(S / X) + (r - q + 0.5 * v**2) * T) / (v * np.sqrt(T))
-    return float(np.exp(-q * T) * norm.pdf(d1) / (S * v * np.sqrt(T)))
+# Gamma → delega al módulo (misma fórmula, factorizada)
+_bs_gamma = _bs_gamma_mod
 
 
 def compute_gex_profile(chains: dict, spot: float,
-                        r: float = 0.043, q: float = 0.013,
-                        contract_mult: int = 100) -> pd.DataFrame:
+                        r: float | None = None, q: float | None = None,
+                        contract_mult: int = cfg.GEX_CONTRACT_MULT) -> pd.DataFrame:
+    # Si r/q no se pasan, cargar dinámicamente (fallback a cfg si red falla)
+    if r is None: r = get_risk_free_rate()
+    if q is None: q = get_dividend_yield("SPY")
     """
     Calcula el GEX neto de dealers por strike, sumando todos los vencimientos.
     Usa la IV calculada por BS (columna 'iv') si está disponible,
@@ -911,10 +901,12 @@ def build_gex_profile_chart(gex_df: pd.DataFrame, spot: float,
 
 
 def build_gex_by_expiry_chart(chains: dict, spot: float,
-                               r: float = 0.043, q: float = 0.013) -> go.Figure:
+                               r: float | None = None, q: float | None = None) -> go.Figure:
     """
     GEX total por vencimiento — muestra qué expiración concentra más gamma.
     """
+    if r is None: r = get_risk_free_rate()
+    if q is None: q = get_dividend_yield("SPY")
     fig = go.Figure()
     if not chains or not spot:
         return fig
@@ -972,13 +964,15 @@ def build_gex_by_expiry_chart(chains: dict, spot: float,
 
 # ─── Métricas de skew (usa columna 'iv' BS) ────────────────────────────────
 def build_gex_delta_exposure_chart(chains: dict, spot: float,
-                                    r: float = 0.043, q: float = 0.013,
+                                    r: float | None = None, q: float | None = None,
                                     strike_range_pct: float = 0.15) -> go.Figure:
     """
     DEX (Delta Exposure): muestra el delta neto de dealers por strike.
     Donde DEX cruza cero = nivel de máximo dolor (max pain).
     Complementa GEX para entender hacia dónde se mueve el precio.
     """
+    if r is None: r = get_risk_free_rate()
+    if q is None: q = get_dividend_yield("SPY")
     fig = go.Figure()
     if not chains or not spot:
         return fig
@@ -1059,7 +1053,7 @@ def build_gex_delta_exposure_chart(chains: dict, spot: float,
 
 
 def build_gex_vanna_charm_chart(chains: dict, spot: float,
-                                 r: float = 0.043, q: float = 0.013,
+                                 r: float | None = None, q: float | None = None,
                                  strike_range_pct: float = 0.15) -> go.Figure:
     """
     Vanna + Charm por strike.
@@ -1067,6 +1061,8 @@ def build_gex_vanna_charm_chart(chains: dict, spot: float,
     Charm = ∂Delta/∂t  (decaimiento del delta con el tiempo, importante en expiry weeks)
     Ambos generan flujos de hedging autónomos — críticos para predecir pinning en expiración.
     """
+    if r is None: r = get_risk_free_rate()
+    if q is None: q = get_dividend_yield("SPY")
     from scipy.stats import norm as _norm
     fig = go.Figure()
     if not chains or not spot:
@@ -1277,105 +1273,29 @@ def build_gex_expected_move_chart(gex_df: pd.DataFrame, chains: dict, spot: floa
 
 
 def fit_svi_slice(strikes: np.ndarray, ivs: np.ndarray, F: float,
-                  max_iter: int = 500) -> dict | None:
+                  T: float | None = None,
+                  max_iter: int = cfg.SVI_MAX_ITER) -> dict | None:
     """
-    ═══════════════════════════════════════════════════════════════════
-    MODELO: SVI — Stochastic Volatility Inspired Parametrization
-    Ref: Gatheral (2004) "A parsimonious arbitrage-free implied volatility
-         parameterization with application to the valuation of volatility
-         derivatives." Merrill Lynch Global Quantitative Research.
-    ═══════════════════════════════════════════════════════════════════
+    Wrapper de vix_controller.quant.svi.fit_svi_slice.
 
-    ESPECIFICACIÓN (Raw SVI):
-      w(k) = a + b·[ρ·(k-m) + √((k-m)² + σ²)]
+    Refactor clave vs. versión original:
+      - T (time-to-expiry EN AÑOS) ahora es parámetro obligatorio para
+        normalizar varianza total w = IV² · T correctamente por slice.
+      - Si T es None se asume 1.0 (compat con llamadas legacy), pero
+        emite warning: el caller debería pasar el T real.
 
-    donde:
-      k   = log-moneyness = log(K/F)
-      w   = varianza total implícita = IV² × T
-      a   = nivel general de varianza (cte)
-      b   = pendiente/curvatura total (≥0)
-      ρ   = asimetría ∈ [-1, 1]  (ρ < 0 = put skew dominante)
-      m   = centro del smile (offset de ATM)
-      σ   = suavidad del smile (curvature at-the-money)
-
-    POR QUÉ SVI ES EL MEJOR MODELO PARA ESTE PROPÓSITO:
-    ────────────────────────────────────────────────────
-    1. ARBITRAGE-FREE: Satisface condiciones de no-arbitraje butterfly
-       por construcción (Durrleman 2005) cuando b·(1+|ρ|) ≤ 2.
-
-    2. POCAS PARÁMETROS: 5 parámetros capturan toda la forma del smile
-       (nivel, pendiente, curvatura, asimetría, centrado).
-
-    3. EXTRAPOLACIÓN CORRECTA: Alcista/bajista en las colas de forma
-       consistente con modelos estocásticos de vol (Heston, SABR).
-
-    4. ESTABILIDAD: Robusto ante sparse data — interpola y extrapola
-       de forma coherente donde yfinance tiene huecos de liquidez.
-
-    5. BENCHMARK INDUSTRIA: Estándar de facto en equity vol desks
-       (Bergomi 2016, "Stochastic Volatility Modeling").
-
-    RETORNA: dict con parámetros {a, b, rho, m, sigma} + fitted_iv o None.
+    Ver vix_controller/quant/svi.py para la docstring completa (Gatheral 2004,
+    Durrleman 2005, constraints butterfly).
     """
-    if len(strikes) < 5 or len(ivs) < 5:
-        return None
-
-    log_mon = np.log(strikes / F)
-    T_proxy = 1.0   # varianza total ~ IV² (normalizamos por T en el caller)
-    w_obs   = ivs**2 * T_proxy
-
-    def svi_w(k, a, b, rho, m, sigma):
-        disc = np.maximum((k - m)**2 + sigma**2, 1e-12)
-        return a + b * (rho*(k - m) + np.sqrt(disc))
-
-    # Constraints: a>0, b>0, |rho|<1, sigma>0, b*(1+|rho|)<=2
-    from scipy.optimize import minimize
-
-    def loss(params):
-        a, b, rho, m, sigma = params
-        if b <= 0 or sigma <= 0 or abs(rho) >= 1:
-            return 1e10
-        if b * (1 + abs(rho)) > 2:
-            return 1e10
-        w_fit = svi_w(log_mon, a, b, rho, m, sigma)
-        if np.any(w_fit < 0):
-            return 1e10
-        return float(np.sum((w_obs - w_fit)**2))
-
-    # Initial guess: ATM level, moderate skew
-    a0    = float(np.median(w_obs)) * 0.8
-    b0    = 0.1
-    rho0  = -0.3
-    m0    = 0.0
-    sig0  = 0.1
-
-    try:
-        res = minimize(loss, [a0, b0, rho0, m0, sig0],
-                       method="Nelder-Mead",
-                       options={"maxiter": max_iter, "xatol": 1e-6, "fatol": 1e-8})
-        if not res.success and res.fun > 0.1:
-            return None
-        a, b, rho, m, sigma = res.x
-        if b <= 0 or sigma <= 0 or abs(rho) >= 0.99:
-            return None
-
-        # Fitted IVs
-        w_fit = svi_w(log_mon, a, b, rho, m, sigma)
-        iv_fit = np.sqrt(np.maximum(w_fit / T_proxy, 0))
-
-        return {
-            "a": float(a), "b": float(b), "rho": float(rho),
-            "m": float(m), "sigma": float(sigma),
-            "iv_fit": iv_fit,
-            "log_mon": log_mon,
-            "r2": float(1 - np.sum((w_obs - w_fit)**2) / np.sum((w_obs - w_obs.mean())**2)),
-        }
-    except Exception:
-        return None
+    if T is None:
+        logging.getLogger("vix_controller").warning(
+            "fit_svi_slice llamado sin T — usando T=1.0 (legacy)")
+        T = 1.0
+    return _fit_svi_slice_mod(strikes, ivs, F, T, max_iter=max_iter)
 
 
 def forecast_vol_surface(chains: dict, spot: float,
-                          r: float = 0.043, q: float = 0.013,
+                          r: float | None = None, q: float | None = None,
                           iv_change_pct: float = -0.15,
                           n_grid: int = 50) -> dict:
     """
@@ -1393,25 +1313,28 @@ def forecast_vol_surface(chains: dict, spot: float,
       - forecast_chains: IV forecasted surface
       - sell_candidates: top opciones con P&L esperado positivo
     """
+    if r is None: r = get_risk_free_rate()
+    if q is None: q = get_dividend_yield("SPY")
     log = logging.getLogger("vix_controller")
-    F = spot * np.exp((r - q) * 30/365)   # forward ~30d
 
     svi_fits = {}
     for exp_str, data in chains.items():
-        dte = data["dte"]; T = dte / 365.0
+        dte = data["dte"]; T = dte / cfg.CAL_DAYS_YEAR
         if T <= 0: continue
         puts_f  = data["puts"][data["puts"]["moneyness"].between(0.80, 1.02)]
         calls_f = data["calls"][data["calls"]["moneyness"].between(0.98, 1.20)]
         combo   = pd.concat([puts_f, calls_f]).drop_duplicates("strike").sort_values("strike")
         iv_col  = "iv" if "iv" in combo.columns else "impliedVolatility"
-        combo   = combo[combo[iv_col].notna() & (combo[iv_col] > 0.01)]
-        if len(combo) < 5: continue
+        combo   = combo[combo[iv_col].notna() & (combo[iv_col] > cfg.IV_LOWER)]
+        if len(combo) < cfg.SVI_MIN_POINTS: continue
 
-        fit = fit_svi_slice(combo["strike"].values, combo[iv_col].values,
-                            F * np.exp((r-q)*T))
+        # Forward al vencimiento real (no 30d fijo) → consistente con T del slice
+        F_T = spot * np.exp((r - q) * T)
+        fit = fit_svi_slice(combo["strike"].values, combo[iv_col].values, F_T, T=T)
         if fit:
             svi_fits[exp_str] = {**fit, "dte": dte, "combo": combo}
-            log.info(f"SVI {exp_str}: R²={fit['r2']:.3f} ρ={fit['rho']:.3f} b={fit['b']:.3f}")
+            log.info(f"SVI {exp_str} (T={T:.3f}y): R²={fit['r2']:.3f} "
+                     f"ρ={fit['rho']:.3f} b={fit['b']:.3f}")
 
     if not svi_fits:
         return {}
@@ -2735,12 +2658,12 @@ def fetch_today_prices():
 # WALK-FORWARD BACKTEST ENGINE
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=cfg.CACHE_TTL["backtest"])
 def run_walkforward_backtest(bt: pd.DataFrame,
                               svxy_col: str = "SVXY_Close",
                               spy_col:  str = "SPY_Close",
-                              rf_annual: float = 0.043,
-                              wf_months: int = 6) -> dict:
+                              rf_annual: float | None = None,
+                              wf_months: int = cfg.WF_WINDOW_MONTHS) -> dict:
     """
     Walk-Forward Analysis de la estrategia BB×Contango.
 
@@ -2804,7 +2727,9 @@ def run_walkforward_backtest(bt: pd.DataFrame,
     if len(df) < 60:
         return {}
 
-    rf_daily = (1 + rf_annual)**(1/252) - 1
+    if rf_annual is None:
+        rf_annual = get_risk_free_rate()
+    rf_daily = (1 + rf_annual)**(1/cfg.TRADING_DAYS_YEAR) - 1
 
     # ── 2. Función métricas de un período ─────────────────────────────────
     def _metrics(ret_series: pd.Series, rf_d: float = rf_daily) -> dict:
@@ -3622,7 +3547,7 @@ def build_vxx_operational_chart(bt: pd.DataFrame,
 #   80-100% : Vol EXTREMA  → Long VIX / hedge / short equities
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def _rolling_percentile(s: pd.Series, window: int = 252) -> pd.Series:
+def _rolling_percentile(s: pd.Series, window: int = cfg.VTS_ROLLING_WINDOW) -> pd.Series:
     """
     Percentil rolling del último valor vs la ventana histórica.
     Devuelve 0-100. Implementación vectorizada con numpy (mucho más rápida
@@ -3632,6 +3557,10 @@ def _rolling_percentile(s: pd.Series, window: int = 252) -> pd.Series:
     son <= al valor actual".
 
     Robust to NaN: valores NaN en la entrada producen NaN en la salida.
+
+    B7 fix: min_obs sube de max(30, window//5) a max(60, window//3) para
+    evitar percentiles con soporte insuficiente (antes los primeros 30 días
+    de una serie producían percentiles basados en <30 obs válidas).
     """
     if s is None or s.empty:
         return pd.Series(dtype=float)
@@ -3639,7 +3568,7 @@ def _rolling_percentile(s: pd.Series, window: int = 252) -> pd.Series:
     arr = s.to_numpy(dtype=float)
     n   = len(arr)
     out = np.full(n, np.nan, dtype=float)
-    min_obs = max(30, window // 5)
+    min_obs = max(cfg.VTS_MIN_OBS_FLOOR, int(window * cfg.VTS_MIN_OBS_RATIO))
 
     for i in range(min_obs - 1, n):
         start = max(0, i - window + 1)
@@ -5397,7 +5326,7 @@ with tab2:
         st.caption(
             f"Walk-Forward: ventanas de {wf_window}M · "
             f"Retorno vehículo: {'SVXY_Close' if 'SVXY_Close' in bt.columns else '-0.5×VXX aprox'} · "
-            f"RF: {0.043*100:.1f}% anual · Alpha vs SPY (regresión mensual)"
+            f"RF: {get_risk_free_rate()*100:.1f}% anual · Alpha vs SPY (regresión mensual)"
         )
 
 
@@ -5667,12 +5596,12 @@ with tab_skew:
                            help="Cada vencimiento tarda ~0.6-1.5s")
     with col_c3:
         skew_rfr = st.number_input("Risk-Free Rate (r)", 0.0, 0.15,
-                                   value=0.043, step=0.001, format="%.3f",
-                                   help="Tasa libre de riesgo anualizada (ej: 4.3%=0.043)")
+                                   value=float(get_risk_free_rate()), step=0.001, format="%.3f",
+                                   help="Tasa libre de riesgo (live desde ^IRX; edita si deseas)")
     with col_c4:
         skew_div = st.number_input("Dividend Yield (q)", 0.0, 0.10,
-                                   value=0.013, step=0.001, format="%.3f",
-                                   help="Yield de dividendo continuo (SPY≈1.3%)")
+                                   value=float(get_dividend_yield("SPY")), step=0.001, format="%.3f",
+                                   help="Dividend yield live (SPY TTM); edita si deseas")
 
     col_c5, col_c6, col_c7, col_c8 = st.columns([1,1,1,1])
     with col_c5:
@@ -6053,11 +5982,15 @@ with tab_gex:
                               help="Más vencimientos = GEX más completo pero más lento",
                               key="gex_n_exp")
     with col_g3:
-        gex_rfr = st.number_input("Risk-Free Rate (r)", 0.0, 0.15, 0.043,
-                                   step=0.001, format="%.3f", key="gex_rfr")
+        gex_rfr = st.number_input("Risk-Free Rate (r)", 0.0, 0.15,
+                                   float(get_risk_free_rate()),
+                                   step=0.001, format="%.3f", key="gex_rfr",
+                                   help="Live desde ^IRX; edita si deseas")
     with col_g4:
-        gex_div = st.number_input("Dividend Yield (q)", 0.0, 0.10, 0.013,
-                                   step=0.001, format="%.3f", key="gex_div")
+        gex_div = st.number_input("Dividend Yield (q)", 0.0, 0.10,
+                                   float(get_dividend_yield("SPY")),
+                                   step=0.001, format="%.3f", key="gex_div",
+                                   help="SPY TTM dividend yield live")
 
     col_g5, col_g6 = st.columns([2, 1])
     with col_g5:
