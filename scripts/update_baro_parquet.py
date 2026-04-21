@@ -176,14 +176,36 @@ def update_parquet(output_path: Path, full: bool = False) -> None:
 
     # Caso 2: parquet existe → update incremental
     log.info(f"MODO INCREMENTAL — cargando {output_path}")
-    df_old = pd.read_parquet(output_path)
+    try:
+        df_old = pd.read_parquet(output_path)
+    except Exception as e:
+        log.error(f"Parquet corrupto o ilegible ({e}) — cayendo a descarga full")
+        df_new = fetch_all_tickers(start=None)
+        if df_new.empty:
+            log.error("Descarga full vacía — abortando sin sobrescribir parquet")
+            sys.exit(1)
+        df_new.to_parquet(output_path, compression="snappy")
+        log.info(f"✅ Reconstruido {output_path} · {len(df_new):,} filas")
+        return
+
+    if df_old.empty:
+        log.error("Parquet válido pero vacío — cayendo a descarga full")
+        df_new = fetch_all_tickers(start=None)
+        if df_new.empty:
+            log.error("Descarga full vacía — abortando sin sobrescribir parquet")
+            sys.exit(1)
+        df_new.to_parquet(output_path, compression="snappy")
+        log.info(f"✅ Reconstruido {output_path} · {len(df_new):,} filas")
+        return
+
     df_old.index = pd.DatetimeIndex(df_old.index).normalize()
     df_old = df_old.sort_index()
     last_date = df_old.index.max()
     log.info(f"  Parquet actual: {len(df_old):,} filas · última fecha = {last_date.date()}")
 
-    # Descargar desde last_date - 5 días (buffer por revisiones y weekends)
-    fetch_start = (last_date - timedelta(days=5)).strftime("%Y-%m-%d")
+    # Descargar desde last_date - 10 días (buffer por revisiones tardías, weekends,
+    # holidays). 5d era marginal: si el job falla viernes, el lunes el gap es >5d.
+    fetch_start = (last_date - timedelta(days=10)).strftime("%Y-%m-%d")
     df_new = fetch_all_tickers(start=fetch_start)
 
     if df_new.empty:
