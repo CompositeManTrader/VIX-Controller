@@ -25,13 +25,17 @@ def apply_signal_returns(sig: pd.Series, vehicle_ret: pd.Series,
     return gross - cost
 
 
+_STD_EPS = 1e-12   # tolerancia para detectar series efectivamente constantes
+
+
 def sharpe(returns: pd.Series, rf_daily: float = 0.0) -> float:
     r = returns.dropna()
     if len(r) < 20:
         return float("nan")
     excess = r - rf_daily
     std = excess.std(ddof=0)
-    if std <= 0:
+    # Series constantes producen std≈1e-20 por floating-point, no 0 exacto.
+    if not np.isfinite(std) or std <= _STD_EPS:
         return float("nan")
     return float(excess.mean() / std * np.sqrt(TRADING_DAYS_YEAR))
 
@@ -45,7 +49,7 @@ def sortino(returns: pd.Series, rf_daily: float = 0.0) -> float:
     if len(downside) < 2:
         return float("nan")
     dstd = downside.std(ddof=0)
-    if dstd <= 0:
+    if not np.isfinite(dstd) or dstd <= _STD_EPS:
         return float("nan")
     return float(excess.mean() / dstd * np.sqrt(TRADING_DAYS_YEAR))
 
