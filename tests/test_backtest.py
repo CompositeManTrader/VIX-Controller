@@ -44,7 +44,11 @@ class TestSharpeSortino:
 
     def test_sortino_greater_than_sharpe_for_positive_skew(self):
         # Positive skew → downside std < total std → sortino > sharpe
-        r = pd.Series([-0.005] * 20 + [0.01] * 80)
+        # Downside con varianza real (no constante) para que dstd > 0.
+        rng = np.random.default_rng(0)
+        down = -np.abs(rng.normal(0.005, 0.002, 20))
+        up   = np.abs(rng.normal(0.010, 0.003, 80))
+        r = pd.Series(np.concatenate([down, up]))
         sh = sharpe(r)
         so = sortino(r)
         assert np.isfinite(sh) and np.isfinite(so)

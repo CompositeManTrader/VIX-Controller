@@ -7,9 +7,14 @@ import pytest
 from vix_controller.quant.svi import fit_svi_slice, svi_raw_w
 
 
-def _synthetic_smile(F=100.0, T=30/365, a=0.04*T, b=0.08, rho=-0.4,
+def _synthetic_smile(F=100.0, T=30/365, a=None, b=0.08, rho=-0.4,
                     m=-0.02, sigma=0.12, n=25, seed=0):
-    """Genera smile sintético desde parámetros SVI conocidos."""
+    """Genera smile sintético desde parámetros SVI conocidos.
+
+    `a` default = 0.04 * T (ATM variance ~ 20% vol para cualquier T).
+    """
+    if a is None:
+        a = 0.04 * T
     rng = np.random.default_rng(seed)
     k = np.linspace(-0.15, 0.15, n)
     strikes = F * np.exp(k)

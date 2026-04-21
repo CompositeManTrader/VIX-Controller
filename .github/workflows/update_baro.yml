@@ -13,6 +13,7 @@ permissions:
 jobs:
   update:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -29,6 +30,7 @@ jobs:
           pip install yfinance>=0.2.48 pandas>=2.2.0 pyarrow>=14.0.0 curl_cffi>=0.6.0
 
       - name: Run update script
+        timeout-minutes: 10
         run: python scripts/update_baro_parquet.py
         env:
           PYTHONUNBUFFERED: '1'
@@ -41,8 +43,21 @@ jobs:
 
           if git diff --staged --quiet; then
             echo "No changes — skipping commit"
-          else
-            git commit -m "Auto: update baro_history.parquet [$(date +%F)]"
-            git push
-            echo "✅ Committed and pushed"
+            exit 0
           fi
+
+          git commit -m "Auto: update baro_history.parquet [$(date +%F)]"
+
+          # Retry push con rebase si alguien pusheó mientras corría el job
+          for attempt in 1 2 3; do
+            if git push; then
+              echo "✅ Committed and pushed (intento $attempt)"
+              exit 0
+            fi
+            echo "⚠️ Push falló (intento $attempt) — reintentando con pull --rebase"
+            git pull --rebase origin main || true
+            sleep 5
+          done
+
+          echo "❌ Push falló después de 3 intentos"
+          exit 1
