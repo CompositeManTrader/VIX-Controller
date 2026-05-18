@@ -267,36 +267,109 @@ def scrape_cboe_futures() -> pd.DataFrame:
     return df_vx
 
 
+# ── Circuit breaker para yfinance rate-limit ────────────────────────────────
+# Streamlit Cloud comparte IPs con miles de apps → Yahoo aplica rate limits
+# globales (HTTP 429 → YFRateLimitError). Cuando lo detectamos, marcamos un
+# cooldown global para que TODAS las llamadas a yfinance retornen rápidamente
+# sin volver a golpear el endpoint durante N minutos.
+_YF_RATE_LIMIT_COOLDOWN_SEC = 15 * 60   # 15 min — alineado con duración típica del bloqueo
+
+
+def _yf_is_rate_limited() -> bool:
+    """True si estamos dentro de la ventana de cooldown post-rate-limit."""
+    try:
+        deadline = st.session_state.get("_yf_rl_until", 0)
+        return time.time() < deadline
+    except Exception:
+        return False
+
+
+def _yf_mark_rate_limited(reason: str = "") -> None:
+    """Marca cooldown global ante un rate-limit detectado."""
+    try:
+        st.session_state["_yf_rl_until"] = time.time() + _YF_RATE_LIMIT_COOLDOWN_SEC
+    except Exception:
+        pass
+    logging.getLogger("vix_controller").warning(
+        f"yfinance rate-limit detectado{f': {reason}' if reason else ''} — "
+        f"cooldown {_YF_RATE_LIMIT_COOLDOWN_SEC // 60} min")
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """Detecta rate-limit por tipo o por mensaje (compat con varias versiones de yfinance)."""
+    cls = type(exc).__name__
+    if cls in ("YFRateLimitError", "RateLimitError"):
+        return True
+    s = str(exc).lower()
+    return any(k in s for k in ("rate limit", "too many requests", "429", "throttle"))
+
+
+def _yf_history_safe(symbol: str, **kwargs) -> pd.DataFrame:
+    """
+    Wrapper seguro alrededor de yf.Ticker(symbol).history(**kwargs).
+
+    - Respeta el circuit breaker global: si estamos en cooldown, retorna df vacío
+      sin golpear yfinance.
+    - Captura YFRateLimitError y cualquier otra excepción → df vacío + log warning.
+    - Marca el cooldown global si detecta rate-limit.
+
+    El caller debe manejar df.empty como "no data available" y caer a fallback
+    (parquet, cached, NaN). Nunca propaga excepción.
+    """
+    log = logging.getLogger("vix_controller")
+    if _yf_is_rate_limited():
+        log.debug(f"yf({symbol}): rate-limit cooldown activo — skip")
+        return pd.DataFrame()
+    try:
+        return yf.Ticker(symbol).history(**kwargs)
+    except Exception as e:
+        if _is_rate_limit_error(e):
+            _yf_mark_rate_limited(f"{symbol}.history")
+        else:
+            log.warning(f"yf({symbol}).history failed: {e}")
+        return pd.DataFrame()
+
+
+def _yf_download_safe(symbol: str, **kwargs) -> pd.DataFrame:
+    """Mismo patrón para yf.download (usado con `auto_adjust`, `threads`, etc)."""
+    log = logging.getLogger("vix_controller")
+    if _yf_is_rate_limited():
+        return pd.DataFrame()
+    try:
+        h = yf.download(symbol, progress=False, **kwargs)
+        if isinstance(h.columns, pd.MultiIndex):
+            h.columns = h.columns.get_level_values(0)
+        return h
+    except Exception as e:
+        if _is_rate_limit_error(e):
+            _yf_mark_rate_limited(f"download({symbol})")
+        else:
+            log.warning(f"yf.download({symbol}) failed: {e}")
+        return pd.DataFrame()
+
+
 @st.cache_data(ttl=cfg.CACHE_TTL["yahoo_spot"])
 def fetch_vix_spot():
-    log = logging.getLogger("vix_controller")
-    try:
-        h = yf.Ticker("^VIX").history(period="5d")
-        if not h.empty:
-            c = round(float(h['Close'].iloc[-1]), 2)
-            p = round(float(h['Close'].iloc[-2]), 2) if len(h) > 1 else c
-            return dict(price=c, prev=p, chg=round(c - p, 2))
-    except (ValueError, KeyError, ConnectionError, OSError, AttributeError) as e:
-        log.warning(f"fetch_vix_spot: {e}")
-    return None
+    h = _yf_history_safe("^VIX", period="5d")
+    if h is None or h.empty or "Close" not in h.columns:
+        return None
+    c = round(float(h['Close'].iloc[-1]), 2)
+    p = round(float(h['Close'].iloc[-2]), 2) if len(h) > 1 else c
+    return dict(price=c, prev=p, chg=round(c - p, 2))
 
 
 @st.cache_data(ttl=cfg.CACHE_TTL["yahoo_spot"])
 def fetch_etps():
-    log = logging.getLogger("vix_controller")
     out = {}
     for name, sym in [("VXX","VXX"),("SVXY","SVXY"),("SVIX","SVIX"),("SPY","SPY")]:
-        try:
-            h = yf.Ticker(sym).history(period="5d")
-            if not h.empty:
-                out[name] = dict(
-                    close=round(float(h['Close'].iloc[-1]), 2),
-                    open=round(float(h['Open'].iloc[-1]), 2),
-                    prev=round(float(h['Close'].iloc[-2]), 2) if len(h) > 1 else None,
-                )
-        except (ValueError, KeyError, ConnectionError, OSError, AttributeError) as e:
-            log.warning(f"fetch_etps({sym}): {e}")
+        h = _yf_history_safe(sym, period="5d")
+        if h is None or h.empty or "Close" not in h.columns:
             continue
+        out[name] = dict(
+            close=round(float(h['Close'].iloc[-1]), 2),
+            open=round(float(h['Open'].iloc[-1]), 2) if "Open" in h.columns else None,
+            prev=round(float(h['Close'].iloc[-2]), 2) if len(h) > 1 else None,
+        )
     return out
 
 
@@ -351,13 +424,10 @@ def fetch_edge_extra():
         for name, sym in tickers:
             if name not in parquet_tickers:
                 continue
+            h = _yf_download_safe(sym, period="5d", auto_adjust=True, threads=False)
+            if h is None or h.empty or 'Close' not in h.columns:
+                continue
             try:
-                h = yf.download(sym, period="5d", progress=False,
-                                auto_adjust=True, threads=False)
-                if isinstance(h.columns, pd.MultiIndex):
-                    h.columns = h.columns.get_level_values(0)
-                if h.empty or 'Close' not in h.columns:
-                    continue
                 if hasattr(h.index, "tz") and h.index.tz is not None:
                     h.index = h.index.tz_localize(None)
                 h.index = pd.DatetimeIndex(h.index).normalize()
@@ -369,7 +439,7 @@ def fetch_edge_extra():
                 merged = merged[~merged.index.duplicated(keep='last')].sort_index()
                 out[name] = merged
             except Exception as ex:
-                log.debug(f"top-up {sym} failed (parquet lo cubre): {ex}")
+                log.debug(f"top-up {sym} merge failed: {ex}")
                 continue
 
     # ── Paso 3: fallback total a yfinance si el parquet no existe ──
@@ -383,18 +453,16 @@ def fetch_edge_extra():
         for name, sym in tickers:
             if name in out:
                 continue
+            h = _yf_download_safe(sym, period="max", auto_adjust=True, threads=False)
+            if h is None or h.empty:
+                continue
             try:
-                h = yf.download(sym, period="max", progress=False,
-                                auto_adjust=True, threads=False)
-                if isinstance(h.columns, pd.MultiIndex):
-                    h.columns = h.columns.get_level_values(0)
-                if not h.empty:
-                    if hasattr(h.index, "tz") and h.index.tz is not None:
-                        h.index = h.index.tz_localize(None)
-                    h.index = pd.DatetimeIndex(h.index).normalize()
-                    out[name] = h
+                if hasattr(h.index, "tz") and h.index.tz is not None:
+                    h.index = h.index.tz_localize(None)
+                h.index = pd.DatetimeIndex(h.index).normalize()
+                out[name] = h
             except Exception as ex:
-                log.warning(f"fetch_edge_extra {sym}: {ex}")
+                log.warning(f"fetch_edge_extra {sym} merge: {ex}")
                 continue
 
     log.info(f"fetch_edge_extra: {len(out)} tickers cargados")
@@ -571,6 +639,9 @@ def fetch_options_chains(ticker: str = "SPY", n_exp: int = 4) -> tuple:
                 continue
 
     # ── Fallback: yfinance con backoff ─────────────────────────────────────
+    if _yf_is_rate_limited():
+        log.warning(f"Options {ticker}: cooldown global activo — skip yfinance")
+        return {}, None
     log.info(f"Options {ticker}: yfinance fallback")
     try:
         t = yf.Ticker(ticker)
@@ -578,11 +649,13 @@ def fetch_options_chains(ticker: str = "SPY", n_exp: int = 4) -> tuple:
             for i in range(n):
                 try: return fn()
                 except Exception as ex:
-                    if any(k in str(ex).lower() for k in
-                           ["rate limit","too many","429","throttle"]) and i < n-1:
+                    if _is_rate_limit_error(ex) and i < n-1:
                         w = 2**(i+1)
                         log.warning(f"{label} RL→wait {w}s")
                         time.sleep(w)
+                    elif _is_rate_limit_error(ex):
+                        _yf_mark_rate_limited(label)
+                        raise
                     else: raise
             return None
         exps = _bo(lambda: t.options, f"{ticker}.options")
@@ -1870,17 +1943,17 @@ def fetch_live_spy_vix() -> pd.DataFrame:
     frames = {}
     for col, sym in [("SPY_Close", "SPY"), ("VIX_Close", "^VIX"),
                      ("VVIX_Live", "^VVIX")]:
+        h = _yf_history_safe(sym, period="45d")
+        if h is None or h.empty or "Close" not in h.columns:
+            continue
         try:
-            h = yf.Ticker(sym).history(period="45d")
-            if h.empty:
-                continue
             s = h["Close"].copy()
             if hasattr(s.index, "tz") and s.index.tz is not None:
                 s.index = s.index.tz_localize(None)
             s.index = pd.DatetimeIndex(s.index).normalize()
             frames[col] = s
         except Exception as ex:
-            log.warning(f"fetch_live_spy_vix {sym}: {ex}")
+            log.warning(f"fetch_live_spy_vix {sym} normalize: {ex}")
     if "SPY_Close" in frames and "VIX_Close" in frames:
         df = pd.DataFrame(frames)
         log.info(f"Live extension: {len(df)} rows, last={df.index[-1].date()}")
@@ -2645,16 +2718,14 @@ def fetch_today_prices():
     out = {}
     for name, sym in [("VXX","VXX"),("SVXY","SVXY"),("SVIX","SVIX"),
                        ("VIX","^VIX"),("SPY","SPY")]:
-        try:
-            h = yf.Ticker(sym).history(period="5d")
-            if not h.empty:
-                out[name] = dict(
-                    close=round(float(h['Close'].iloc[-1]), 2),
-                    prev =round(float(h['Close'].iloc[-2]), 2) if len(h) > 1 else None,
-                    date =h.index[-1].date(),
-                )
-        except:
+        h = _yf_history_safe(sym, period="5d")
+        if h is None or h.empty or "Close" not in h.columns:
             continue
+        out[name] = dict(
+            close=round(float(h['Close'].iloc[-1]), 2),
+            prev =round(float(h['Close'].iloc[-2]), 2) if len(h) > 1 else None,
+            date =h.index[-1].date(),
+        )
     return out
 
 
@@ -3679,33 +3750,35 @@ def compute_vts_barometer(
     elif vix_parquet is not None and vix_parquet.notna().sum() > 60:
         vix = vix_parquet
     else:
-        # Fallback: descargar en caliente
+        # Fallback: descargar en caliente (vía wrapper safe → respeta circuit breaker)
         vix = None
-        try:
-            import yfinance as yf
-            vh = yf.Ticker("^VIX").history(period="max")
-            if not vh.empty:
+        vh = _yf_history_safe("^VIX", period="max")
+        if vh is not None and not vh.empty and "Close" in vh.columns:
+            try:
                 vh.index = pd.DatetimeIndex(vh.index).tz_localize(None).normalize()
                 vix = vh['Close'].reindex(df.index).ffill()
                 df['VIX_Close'] = vix
                 log.info(f"BARO: VIX descargado fresh ({vix.notna().sum():,} filas)")
-        except Exception as e:
-            log.warning(f"BARO: fallback VIX failed: {e}")
+            except Exception as e:
+                log.warning(f"BARO: VIX post-process failed: {e}")
+        else:
+            log.warning("BARO: VIX no disponible (yfinance vacío o rate-limit)")
 
     # SPY con historia completa también (para RV20)
     spy_yf = None  # yfinance no está en edge_extra por defecto, mantenemos parquet
     spy = df.get('SPY_Close')
     if spy is None or spy.notna().sum() < 100:
-        try:
-            import yfinance as yf
-            sh = yf.Ticker("SPY").history(period="max")
-            if not sh.empty:
+        sh = _yf_history_safe("SPY", period="max")
+        if sh is not None and not sh.empty and "Close" in sh.columns:
+            try:
                 sh.index = pd.DatetimeIndex(sh.index).tz_localize(None).normalize()
                 spy = sh['Close'].reindex(df.index).ffill()
                 df['SPY_Close'] = spy
                 log.info(f"BARO: SPY descargado ({spy.notna().sum():,} filas)")
-        except Exception as e:
-            log.warning(f"BARO: fallback SPY failed: {e}")
+            except Exception as e:
+                log.warning(f"BARO: SPY post-process failed: {e}")
+        else:
+            log.warning("BARO: SPY no disponible (yfinance vacío o rate-limit)")
 
     vvix_s  = _get_series('VVIX')
     if vvix_s is None and 'VVIX_Live' in df.columns:

@@ -40,6 +40,9 @@ def get_risk_free_rate(ttl: int = None) -> float:
     """
     Lee ^IRX (13-week T-Bill yield, cotizado en % anualizado).
     Retorna decimal (0.045 = 4.5%). Fallback: FALLBACK_RF_ANNUAL.
+
+    Captura cualquier excepción de yfinance (incluye YFRateLimitError) y
+    cae al fallback — nunca propaga.
     """
     ttl = ttl or CACHE_TTL["rates"]
     cached = _ttl_get("rf", ttl)
@@ -52,7 +55,7 @@ def get_risk_free_rate(ttl: int = None) -> float:
             if 0.0 <= val <= 0.20:
                 _ttl_set("rf", val)
                 return val
-    except (ValueError, KeyError, ConnectionError, OSError) as e:
+    except Exception as e:   # incluye YFRateLimitError, OSError, etc.
         log.warning("get_risk_free_rate: fallback por %s", e)
     _ttl_set("rf", FALLBACK_RF_ANNUAL)
     return FALLBACK_RF_ANNUAL
@@ -63,6 +66,9 @@ def get_dividend_yield(ticker: str = "SPY", ttl: int = None) -> float:
     Dividend yield TTM para el ticker dado (decimal).
     Usa yfinance .info.trailingAnnualDividendYield cuando está disponible;
     si no, calcula TTM como sum(dividends últimos 365d) / price.
+
+    Captura cualquier excepción de yfinance (incluye YFRateLimitError) y
+    cae al fallback — nunca propaga.
     """
     ttl = ttl or CACHE_TTL["rates"]
     key = f"div_{ticker}"
@@ -88,7 +94,7 @@ def get_dividend_yield(ticker: str = "SPY", ttl: int = None) -> float:
                 if 0.0 <= y <= 0.15:
                     _ttl_set(key, y)
                     return y
-    except (ValueError, KeyError, ConnectionError, OSError, AttributeError) as e:
+    except Exception as e:   # incluye YFRateLimitError
         log.warning("get_dividend_yield(%s): fallback por %s", ticker, e)
     _ttl_set(key, FALLBACK_DIV_YIELD)
     return FALLBACK_DIV_YIELD
