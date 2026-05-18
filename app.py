@@ -1326,7 +1326,8 @@ def forecast_vol_surface(chains: dict, spot: float,
         F_T = spot * np.exp((r - q) * T)
         fit = fit_svi_slice(combo["strike"].values, combo[iv_col].values, F_T, T=T)
         if fit:
-            svi_fits[exp_str] = {**fit, "dte": dte, "combo": combo}
+            # F_T se guarda por slice: cada vencimiento tiene su propio forward.
+            svi_fits[exp_str] = {**fit, "dte": dte, "combo": combo, "F_T": F_T}
             log.info(f"SVI {exp_str} (T={T:.3f}y): R²={fit['r2']:.3f} "
                      f"ρ={fit['rho']:.3f} b={fit['b']:.3f}")
 
@@ -1370,13 +1371,14 @@ def forecast_vol_surface(chains: dict, spot: float,
             df = df[df[iv_col].notna() & (df["strike"].between(spot*0.82, spot*1.18))]
             if df.empty: continue
 
+            F_T = spot * np.exp((r - q) * T)   # forward al vencimiento del slice
             for _, row in df.iterrows():
                 K   = row["strike"]; iv_c = float(row.get(iv_col, 0) or 0)
                 oi  = row["openInterest"]; mid = row.get("midPrice", 0)
                 if K <= 0 or iv_c <= 0 or mid <= 0: continue
                 if not (0.82 <= K/spot <= 1.18): continue  # ±18% max
 
-                k_  = np.log(K / (F * np.exp((r-q)*T)))
+                k_  = np.log(K / F_T)
                 disc_ = np.maximum((k_ - fit["m"])**2 + fit["sigma"]**2, 1e-12)
                 w_fc  = fit["a"]*(1+iv_change_pct) + fit["b"]*(fit["rho"]*(k_-fit["m"]) + np.sqrt(disc_))
                 iv_fc = float(np.sqrt(max(w_fc, 0)))
@@ -1420,7 +1422,7 @@ def forecast_vol_surface(chains: dict, spot: float,
         "forecast_data": forecast_data,
         "sell_df":       sell_df,
         "iv_change_pct": iv_change_pct,
-        "F":             F,
+        "spot":          spot,
     }
 
 
@@ -1440,11 +1442,12 @@ def build_svi_smile_chart(forecast_result: dict, exp_str: str,
     iv_change_pct = forecast_result.get("iv_change_pct", -0.15)
     dte = fc["dte"]
 
-    # Puntos observados
+    # Puntos observados — log-moneyness vs forward del slice (F_T), no spot.
     combo = fit.get("combo", pd.DataFrame())
     iv_col = "iv" if "iv" in combo.columns else "impliedVolatility"
+    F_T = fit.get("F_T", spot)   # fallback a spot si fit antiguo no lo guardó
     if not combo.empty and iv_col in combo.columns:
-        obs_k   = np.log(combo["strike"].values / forecast_result["F"]) * 100
+        obs_k   = np.log(combo["strike"].values / F_T) * 100
         obs_iv  = combo[iv_col].values * 100
         fig.add_trace(go.Scatter(
             x=obs_k, y=obs_iv, mode="markers",
