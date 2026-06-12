@@ -7,6 +7,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import yfinance as yf
 from datetime import datetime, timedelta, date
 from io import StringIO
@@ -25,6 +26,9 @@ from vix_controller.quant.bs import (
     bs_gamma_vec as _bs_gamma_vec,
 )
 from vix_controller.quant.svi import fit_svi_slice as _fit_svi_slice_mod
+from vix_controller.quant.vrp import compute_vrp_tracker
+from vix_controller.quant.regime import fit_volatility_regime
+from vix_controller.quant.cross_asset import compute_stress_signals
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO,
@@ -420,6 +424,10 @@ def fetch_edge_extra():
         ("VIX6M",  "^VIX6M"),
         ("VIX1Y",  "^VIX1Y"),
         ("VIX",    "^VIX"),
+        # Cross-asset early warning
+        ("MOVE",   "^MOVE"),
+        ("LQD",    "LQD"),
+        ("DXY",    "DX-Y.NYB"),
     ]
 
     # ── Paso 1: intentar cargar del parquet ──────────────────
@@ -4236,6 +4244,103 @@ def compute_vts_barometer(
 
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TIER 1 — HMM RÉGIMEN + CROSS-ASSET EARLY WARNING (helpers)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _ee_close(ee: dict, key: str) -> pd.Series | None:
+    """Extrae la serie Close de un dict edge_extra, o None si falta."""
+    if ee and key in ee and not ee[key].empty and 'Close' in ee[key].columns:
+        return ee[key]['Close']
+    return None
+
+
+@st.cache_data(ttl=cfg.CACHE_TTL["har_rv"])   # 1h — el régimen se mueve a escala diaria
+def compute_regime_cached(spy_close: pd.Series) -> dict:
+    """
+    HMM de régimen sobre retornos log del SPY (probabilidades filtradas).
+    Limitado a ~20 años (5000 obs): suficiente para estimar los 3 estados
+    (incluye 2008, 2018, 2020, 2022) y mantiene el fit en ~3-4s.
+    """
+    rets = np.log(spy_close / spy_close.shift(1)).dropna().tail(5000)
+    return fit_volatility_regime(rets)
+
+
+REGIME_DISPLAY = {
+    "calm":       ("CALMA",      "var(--g)", "Cosecha de prima — short vol funciona"),
+    "transition": ("TRANSICIÓN", "var(--y)", "Whipsaws — reducir tamaño, no agregar riesgo"),
+    "panic":      ("PÁNICO",     "var(--r)", "Clusters de vol — short vol muere aquí; hedge/cash"),
+}
+
+_LIGHT_DOT = {"green": "🟢", "yellow": "🟡", "red": "🔴"}
+
+
+def build_regime_probs_chart(probs: pd.DataFrame, days: int = 504) -> go.Figure:
+    """Área apilada de probabilidades filtradas calm/transition/panic."""
+    p = probs.tail(days)
+    fig = go.Figure()
+    colors = {"calm": "rgba(63,185,80,0.75)",
+              "transition": "rgba(210,153,34,0.75)",
+              "panic": "rgba(248,81,73,0.80)"}
+    names = {"calm": "Calma", "transition": "Transición", "panic": "Pánico"}
+    for col in ["calm", "transition", "panic"]:
+        if col not in p.columns:
+            continue
+        fig.add_trace(go.Scatter(
+            x=p.index, y=p[col], name=names[col],
+            mode="lines", stackgroup="one", line=dict(width=0.5),
+            fillcolor=colors[col],
+            hovertemplate=f"{names[col]}: %{{y:.0%}}<extra></extra>"))
+    fig.update_layout(
+        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+        height=260, margin=dict(l=50, r=20, t=30, b=35),
+        hovermode="x unified", showlegend=True,
+        legend=dict(orientation="h", y=1.12, x=0, font=dict(size=10)),
+        yaxis=dict(tickformat=".0%", range=[0, 1], gridcolor="#21262D",
+                   title=dict(text="P(régimen)", font=dict(size=10, color="#A0A8B0"))),
+        xaxis=dict(gridcolor="#21262D"),
+        title=dict(text="<b>Probabilidad filtrada de régimen (sin look-ahead)</b>",
+                   font=dict(size=12, color="#A0A8B0"), x=0.01))
+    return fig
+
+
+def build_vrp_chart(vrp_df: pd.DataFrame, days: int = 756) -> go.Figure:
+    """VRP (vol points) con zona negativa resaltada + percentil rolling."""
+    p = vrp_df.tail(days)
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        row_heights=[0.65, 0.35], vertical_spacing=0.06,
+                        subplot_titles=("<b>VRP = VIX − RV20 (vol points)</b>",
+                                        "<b>Percentil rolling del VRP en varianza</b>"))
+    vrp_clr = ['#3FB950' if v >= 0 else '#F85149' for v in p['vrp_vol']]
+    fig.add_trace(go.Bar(x=p.index, y=p['vrp_vol'], marker_color=vrp_clr,
+                         opacity=0.75, name='VRP', showlegend=False,
+                         hovertemplate='%{x|%Y-%m-%d}<br>VRP: %{y:+.2f} pts<extra></extra>'),
+                  row=1, col=1)
+    fig.add_hline(y=0, line_color='#484F58', line_width=1, row=1, col=1)
+
+    fig.add_trace(go.Scatter(x=p.index, y=p['vrp_pct'], mode='lines',
+                             line=dict(color='#39D2C0', width=1.8),
+                             name='Percentil', showlegend=False,
+                             hovertemplate='%{x|%Y-%m-%d}<br>Percentil: %{y:.0f}<extra></extra>'),
+                  row=2, col=1)
+    fig.add_hrect(y0=0, y1=20, fillcolor='rgba(248,81,73,0.08)', line_width=0, row=2, col=1)
+    fig.add_hrect(y0=80, y1=100, fillcolor='rgba(63,185,80,0.08)', line_width=0, row=2, col=1)
+
+    fig.update_layout(
+        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
+        height=420, margin=dict(l=55, r=20, t=40, b=35),
+        hovermode='x unified', bargap=0)
+    for ann in fig['layout']['annotations'][:2]:
+        ann['font'] = dict(size=11, color='#A0A8B0', family='Inter')
+        ann['xanchor'] = 'left'; ann['x'] = 0.01
+    fig.update_xaxes(gridcolor='#21262D',
+                     tickfont=dict(size=9.5, color='#A0A8B0', family='JetBrains Mono'))
+    fig.update_yaxes(gridcolor='#21262D',
+                     tickfont=dict(size=9.5, color='#A0A8B0', family='JetBrains Mono'))
+    fig.update_yaxes(range=[0, 100], row=2, col=1)
+    return fig
+
+
 def build_vts_barometer_gauge(score: float, regime: str,
                                date_str: str = "") -> go.Figure:
     """
@@ -5526,6 +5631,41 @@ with tab_edge:
                 {ecard("VIX", f"{last_e['VIX_Close']:.1f}", "spot", "nt")}
             </div>""", unsafe_allow_html=True)
 
+            # ═══════════════════════════════════════════════════════
+            # VRP TRACKER — ¿la prima que cosechas está cara o barata?
+            # ═══════════════════════════════════════════════════════
+            vrp_track = compute_vrp_tracker(ebt['VIX_Close'], ebt['RV20'])
+            if vrp_track:
+                _vt = vrp_track
+                _reg_clr = {"COMPRIMIDA": "var(--y)", "NORMAL": "var(--b)",
+                            "RICA": "var(--g)", "NEGATIVA": "var(--r)"}[_vt['regime']]
+                _reg_desc = {
+                    "COMPRIMIDA": "Prima en p<20 — mala compensación para asumir riesgo de varianza",
+                    "NORMAL":     "Prima en rango histórico normal",
+                    "RICA":       "Prima en p>80 — entorno generoso para cosechar short vol",
+                    "NEGATIVA":   "RV > VIX — el short vol está PAGANDO por perder (stress agudo)",
+                }[_vt['regime']]
+                st.markdown(f"""<div class="icard" style="border-left:3px solid {_reg_clr}">
+                    <div class="ic-title">💰 VRP Tracker
+                        <span style="color:{_reg_clr};font-size:0.9rem;margin-left:0.5rem">{_vt['regime']}</span></div>
+                    <div class="ic-row"><span class="ic-label">VRP hoy (VIX − RV20)</span>
+                        <span class="ic-val">{_vt['vrp_vol']:+.2f} vol pts</span></div>
+                    <div class="ic-row"><span class="ic-label">VRP en varianza (VIX²−RV20²)/100 · Carr-Wu</span>
+                        <span class="ic-val">{_vt['vrp_var']:+.2f} · percentil <b>{_vt['percentile']:.0f}</b></span></div>
+                    <div class="ic-row"><span class="ic-label">Cosecha típica 1 año / % días negativos</span>
+                        <span class="ic-val">{_vt['mean_1y']:+.2f} pts · {_vt['pct_negative_1y']:.0f}% neg</span></div>
+                    <div class="ic-row"><span class="ic-label">Lectura</span>
+                        <span class="ic-val" style="color:{_reg_clr}">{_reg_desc}</span></div>
+                </div>""", unsafe_allow_html=True)
+                with st.expander("📊 VRP histórico (3 años)", expanded=False):
+                    st.plotly_chart(build_vrp_chart(_vt['df']), width="stretch",
+                                    config=dict(displayModeBar=False))
+                    st.caption(
+                        "Panel superior: VRP diario en vol points (verde = cosechando, rojo = pagando). "
+                        "Panel inferior: percentil rolling del VRP en unidades de varianza — "
+                        "la métrica de Carr-Wu castiga más los episodios de alta vol. "
+                        "Zona roja (p<20) = prima comprimida; zona verde (p>80) = prima rica.")
+
             # ── Expander: HAR model diagnostics ─────────────────────
             har_beta = edge.get('har_beta', {})
             if har_beta or use_har:
@@ -6465,6 +6605,80 @@ with tab_baro:
     if not baro:
         st.warning("⚠️ No se pudo calcular el barómetro — revisa el diagnóstico arriba")
         st.stop()
+
+    # ═══════════════════════════════════════════════════════════════
+    # CROSS-ASSET EARLY WARNING — el bond market huele el stress antes
+    # ═══════════════════════════════════════════════════════════════
+    stress = compute_stress_signals(
+        move=_ee_close(edge_extra_baro, 'MOVE'),
+        hyg=_ee_close(edge_extra_baro, 'HYG'),
+        lqd=_ee_close(edge_extra_baro, 'LQD'),
+        ief=_ee_close(edge_extra_baro, 'IEF'),
+        dxy=_ee_close(edge_extra_baro, 'DXY'),
+    )
+    if stress:
+        comp_dot = _LIGHT_DOT[stress['light']]
+        comp_clr = {'green': 'var(--g)', 'yellow': 'var(--y)',
+                    'red': 'var(--r)'}[stress['light']]
+        sig_pills = "".join(
+            f'<div class="mpill"><div class="ml">{_LIGHT_DOT[s["light"]]} {s["name"]}</div>'
+            f'<div class="mv nt" style="font-size:0.95rem">{s["value"]}</div>'
+            f'<div style="font-size:0.6rem;color:var(--dim)">stress p{s["stress_pct"]:.0f}</div></div>'
+            for s in stress['signals'])
+        st.markdown(f"""<div class="icard">
+            <div class="ic-title">{comp_dot} Cross-Asset Early Warning
+                <span style="color:{comp_clr};font-size:0.75rem;margin-left:0.5rem">
+                composite p{stress['composite']:.0f}</span></div>
+            <div class="mrow" style="margin-bottom:0">{sig_pills}</div>
+        </div>""", unsafe_allow_html=True)
+        if stress['light'] == 'red':
+            st.warning("🔴 Señal cross-asset en zona de stress — el mercado de bonos/divisas "
+                       "está pagando un riesgo que el VIX todavía no registra. "
+                       "Considera reducir el short vol aunque el barómetro esté verde.")
+
+    # ═══════════════════════════════════════════════════════════════
+    # RÉGIMEN HMM — calm / transition / panic (probabilidad filtrada)
+    # ═══════════════════════════════════════════════════════════════
+    regime_hmm = {}
+    if 'SPY_Close' in bt_baro.columns and bt_baro['SPY_Close'].notna().sum() > 500:
+        with st.spinner("🧠 Ajustando HMM de régimen..."):
+            try:
+                regime_hmm = compute_regime_cached(bt_baro['SPY_Close'].dropna())
+            except Exception as e:
+                logging.getLogger("vix_controller").warning(f"HMM régimen: {e}")
+
+    if regime_hmm:
+        lbl, clr, desc = REGIME_DISPLAY[regime_hmm['state']]
+        cur = regime_hmm['current']
+        sig_ann = regime_hmm['sigmas_ann']
+        dur = regime_hmm['durations']
+        probs_html = " · ".join(
+            f"{REGIME_DISPLAY[k][0].title()}: <b>{v:.0%}</b>"
+            for k, v in cur.items())
+        st.markdown(f"""<div class="icard" style="border-left:3px solid {clr}">
+            <div class="ic-title">🧠 Régimen de Volatilidad (HMM 3 estados)
+                <span style="color:{clr};font-size:0.9rem;margin-left:0.5rem">{lbl}</span></div>
+            <div class="ic-row"><span class="ic-label">Probabilidades hoy (filtradas, sin look-ahead)</span>
+                <span class="ic-val">{probs_html}</span></div>
+            <div class="ic-row"><span class="ic-label">σ anualizada por estado</span>
+                <span class="ic-val">{sig_ann[0]:.0f}% / {sig_ann[1]:.0f}% / {sig_ann[2]:.0f}%</span></div>
+            <div class="ic-row"><span class="ic-label">Duración esperada</span>
+                <span class="ic-val">{dur[0]:.0f}d / {dur[1]:.0f}d / {dur[2]:.0f}d</span></div>
+            <div class="ic-row"><span class="ic-label">Lectura</span>
+                <span class="ic-val" style="color:{clr}">{desc}</span></div>
+        </div>""", unsafe_allow_html=True)
+        if regime_hmm['state'] == 'panic' or cur.get('panic', 0) > 0.30:
+            st.error("🚨 P(pánico) > 30% — históricamente el peor entorno para short vol. "
+                     "La señal BB×Contango NO debería operarse hasta que el régimen se normalice.")
+        with st.expander("📈 Historia de probabilidades de régimen (2 años)"):
+            st.plotly_chart(build_regime_probs_chart(regime_hmm['probs']),
+                            width="stretch", config=dict(displayModeBar=False))
+            st.caption("Probabilidades FILTRADAS P(estado | datos hasta t) — son las honestas "
+                       "para decidir en t, sin usar información futura. "
+                       "Matriz de transición diaria:")
+            st.dataframe(regime_hmm['transmat'].style.format("{:.1%}"))
+
+    st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
 
     # ═══════════════════════════════════════════════════════════════
     # SUB-TABS: Actual vs Histórico

@@ -73,6 +73,10 @@ TICKERS = {
     "IEF":   "IEF",
     "VXX":   "VXX",
     "SVXY":  "SVXY",
+    # Cross-asset early warning (MOVE = bond vol, LQD = crédito IG, DXY = dólar)
+    "MOVE":  "^MOVE",
+    "LQD":   "LQD",
+    "DXY":   "DX-Y.NYB",
 }
 
 DEFAULT_OUTPUT = Path("data/baro_history.parquet")
