@@ -116,9 +116,23 @@ st.markdown("""
 .icard .ic-row{display:flex;justify-content:space-between;padding:0.2rem 0;font-family:'JetBrains Mono',monospace;font-size:0.8rem;}
 .icard .ic-label{color:var(--dim);}.icard .ic-val{color:var(--t);font-weight:500;}
 .stTabs [data-baseweb="tab-list"]{gap:0;border-bottom:1px solid var(--border);}
-.stTabs [data-baseweb="tab"]{font-family:'Inter',sans-serif;font-weight:600;font-size:0.82rem;color:var(--dim);padding:0.5rem 1.5rem;}
+.stTabs [data-baseweb="tab"]{font-family:'Inter',sans-serif;font-weight:600;font-size:0.82rem;color:var(--dim);padding:0.5rem 1.5rem;transition:color .15s ease;}
+.stTabs [data-baseweb="tab"]:hover{color:var(--t);}
 .stTabs [aria-selected="true"]{color:var(--accent) !important;border-bottom:2px solid var(--accent) !important;}
 [data-testid="stSidebar"]{background:var(--card);}
+/* ── Widgets nativos alineados al design system ───────────── */
+.stButton>button{background:var(--card);border:1px solid var(--border);color:var(--t);font-family:'Inter',sans-serif;font-weight:600;font-size:0.8rem;border-radius:6px;transition:all .15s ease;}
+.stButton>button:hover{border-color:var(--accent);color:var(--accent);background:rgba(247,147,26,0.06);}
+[data-testid="stExpander"]{background:var(--card);border:1px solid var(--border);border-radius:6px;}
+[data-testid="stExpander"] summary{font-family:'Inter',sans-serif;font-weight:600;}
+[data-testid="stMetric"]{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:0.6rem 0.8rem;}
+[data-testid="stMetricLabel"]{font-family:'JetBrains Mono',monospace;font-size:0.7rem;color:var(--dim);text-transform:uppercase;letter-spacing:0.5px;}
+[data-testid="stMetricValue"]{font-family:'Inter',sans-serif;font-weight:700;}
+[data-testid="stAlert"]{border-radius:6px;}
+::-webkit-scrollbar{width:10px;height:10px;}
+::-webkit-scrollbar-track{background:var(--bg);}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:5px;}
+::-webkit-scrollbar-thumb:hover{background:var(--zero);}
 </style>
 """, unsafe_allow_html=True)
 
@@ -3292,7 +3306,7 @@ def build_strategy_cached(df: pd.DataFrame) -> pd.DataFrame:
 def build_vxx_operational_chart(bt: pd.DataFrame,
                                  vxx_today: float,
                                  final_sig_today: int,
-                                 ct_today: float | None) -> go.Figure:
+                                 ct_today: float | None) -> tuple[go.Figure, dict]:
     """
     Gráfica operativa VXX — versión mejorada v2.
 
@@ -3535,7 +3549,6 @@ def build_vxx_operational_chart(bt: pd.DataFrame,
         x=bt.index, y=equity,
         mode='lines', name='Estrategia BB × CT',
         line=dict(color='#39D2C0', width=2.2),
-        fill='tozeroy', fillcolor='rgba(57,210,192,0.08)',
         hovertemplate='<b>%{x|%Y-%m-%d}</b><br>Equity: %{y:.3f}x<extra></extra>',
     ), row=3, col=1)
     fig.add_hline(y=1.0, line_color='#484F58', line_width=1,
@@ -3561,39 +3574,33 @@ def build_vxx_operational_chart(bt: pd.DataFrame,
 
     # ══════════════════════════════════════════════════════
     # LAYOUT
+    # Las stats (trades, win rate, retorno) se devuelven al caller para
+    # renderizarse como pills HTML encima del chart — el título de 2 líneas
+    # dentro de Plotly chocaba con la leyenda (y=1.04) y el rangeselector
+    # (y=1.12), encimándose todo en la misma franja.
     # ══════════════════════════════════════════════════════
-    title_html = (
-        f"<b>VXX — Monitor Operativo · BB(20, 2σ) × Contango Rule</b>"
-        f"<br><span style='font-size:0.7rem;color:#8B949E;font-family:JetBrains Mono'>"
-        f"Trades: <b style='color:#58A6FF'>{trades}</b> · "
-        f"Win Rate: <b style='color:{'#3FB950' if win_rate>=50 else '#D29922'}'>{win_rate:.0f}%</b> · "
-        f"Días LONG: <b style='color:#3FB950'>{pct_long:.0f}%</b> · "
-        f"Retorno estrategia: <b style='color:{'#3FB950' if total_ret>=0 else '#F85149'}'>{total_ret:+.0f}%</b> · "
-        f"vs B&H SVXY: <b style='color:#F0F6FC'>{(bh_eq-1)*100:+.0f}%</b>"
-        f"</span>"
-    )
-
     fig.update_layout(
-        title=dict(text=title_html, font=dict(size=14, color='#F0F6FC',
-                    family='Inter'), x=0.5, xanchor='center'),
         template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
-        height=720, margin=dict(l=60, r=30, t=95, b=45),
+        height=740, margin=dict(l=60, r=30, t=48, b=70),
         hovermode='x unified', dragmode='zoom', bargap=0,
-        legend=dict(orientation='h', yanchor='bottom', y=1.04, x=0.5, xanchor='center',
-                    bgcolor='rgba(0,0,0,0)',
-                    font=dict(size=9.5, color='#C9D1D9', family='JetBrains Mono')),
+        # Leyenda horizontal DEBAJO del chart (estilo Bloomberg) — nunca
+        # colisiona con título/rangeselector y deja limpio el panel superior.
+        legend=dict(orientation='h', yanchor='top', y=-0.045,
+                    x=0.5, xanchor='center',
+                    bgcolor='rgba(0,0,0,0)', itemwidth=30,
+                    font=dict(size=10, color='#C9D1D9', family='JetBrains Mono')),
     )
 
-    # Subplot titles (las subtítulos generados por make_subplots)
+    # Subplot titles (generados por make_subplots) — small caps a la izquierda
     for annotation in fig['layout']['annotations'][:3]:
-        annotation['font'] = dict(size=11, color='#8B949E', family='Inter')
+        annotation['font'] = dict(size=11, color='#A0A8B0', family='Inter')
         annotation['xanchor'] = 'left'
         annotation['x'] = 0.01
 
     # Axes
     fig.update_xaxes(
         gridcolor='#21262D', showgrid=True,
-        tickfont=dict(size=10, color='#8B949E', family='JetBrains Mono'),
+        tickfont=dict(size=10, color='#A0A8B0', family='JetBrains Mono'),
     )
     fig.update_xaxes(
         row=1, col=1,
@@ -3608,19 +3615,32 @@ def build_vxx_operational_chart(bt: pd.DataFrame,
             ],
             bgcolor='#161B22', activecolor='#F7931A', bordercolor='#30363D',
             font=dict(size=9, color='#C9D1D9', family='JetBrains Mono'),
-            y=1.12,
+            x=0.0, xanchor='left', y=1.06, yanchor='bottom',
         ),
     )
     fig.update_yaxes(gridcolor='#21262D',
-                     tickfont=dict(size=9.5, color='#8B949E', family='JetBrains Mono'))
-    fig.update_yaxes(title=dict(text="VXX ($)", font=dict(size=10, color='#8B949E')),
-                     row=1, col=1)
-    fig.update_yaxes(title=dict(text="CT (%)", font=dict(size=10, color='#8B949E')),
+                     tickfont=dict(size=9.5, color='#A0A8B0', family='JetBrains Mono'))
+    # ESCALA LOG en el panel VXX: el precio back-adjusted (reverse splits 1:4
+    # acumulados) va de ~4000 (2018) a ~50 (hoy) — en escala lineal la serie
+    # reciente queda aplastada e invisible contra el borde inferior. Log es
+    # la representación canónica para un activo con decay exponencial.
+    # Los offsets de los markers (×0.94 / ×1.06) son multiplicativos → se
+    # ven idénticos en log.
+    fig.update_yaxes(title=dict(text="VXX ($, log)", font=dict(size=10, color='#A0A8B0')),
+                     type="log", row=1, col=1)
+    fig.update_yaxes(title=dict(text="CT (%)", font=dict(size=10, color='#A0A8B0')),
                      zeroline=True, zerolinecolor='#30363D', row=2, col=1)
-    fig.update_yaxes(title=dict(text="Equity ($1 → x)", font=dict(size=10, color='#8B949E')),
+    fig.update_yaxes(title=dict(text="Equity ($1 → x)", font=dict(size=10, color='#A0A8B0')),
                      row=3, col=1)
 
-    return fig
+    stats = {
+        "trades":    trades,
+        "win_rate":  win_rate,
+        "pct_long":  pct_long,
+        "total_ret": total_ret,
+        "bh_ret":    (bh_eq - 1) * 100,
+    }
+    return fig, stats
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -5218,12 +5238,29 @@ with tab2:
     # ═══════════════════════════════════════════
     # SECCIÓN 2 — GRÁFICA VXX OPERATIVA
     # ═══════════════════════════════════════════
-    fig_mon = build_vxx_operational_chart(
+    fig_mon, mon_stats = build_vxx_operational_chart(
         bt=bt,
         vxx_today=vxx_today,
         final_sig_today=final_sig_today,
         ct_today=ct_today,
     )
+
+    # Stats del backtest como pills (antes vivían en el título del chart,
+    # encimadas con la leyenda y el rangeselector)
+    _wr = mon_stats["win_rate"]; _tr = mon_stats["total_ret"]
+    st.markdown(f"""<div class="mrow">
+        <div class="mpill"><div class="ml">Trades</div>
+            <div class="mv nt">{mon_stats['trades']}</div></div>
+        <div class="mpill"><div class="ml">Win Rate</div>
+            <div class="mv {'up' if _wr >= 50 else 'dn'}">{_wr:.0f}%</div></div>
+        <div class="mpill"><div class="ml">Días en LONG</div>
+            <div class="mv nt">{mon_stats['pct_long']:.0f}%</div></div>
+        <div class="mpill"><div class="ml">Retorno Estrategia</div>
+            <div class="mv {'up' if _tr >= 0 else 'dn'}">{_tr:+.0f}%</div></div>
+        <div class="mpill"><div class="ml">Buy &amp; Hold SVXY</div>
+            <div class="mv nt">{mon_stats['bh_ret']:+.0f}%</div></div>
+    </div>""", unsafe_allow_html=True)
+
     st.plotly_chart(fig_mon, width="stretch",
                     config=dict(displayModeBar=True, displaylogo=False,
                                 scrollZoom=False,
