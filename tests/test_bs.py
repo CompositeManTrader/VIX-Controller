@@ -7,7 +7,7 @@ import math
 import numpy as np
 import pytest
 
-from vix_controller.quant.bs import bs_call, bs_put, bs_gamma, bs_iv
+from vix_controller.quant.bs import bs_call, bs_put, bs_gamma, bs_gamma_vec, bs_iv
 
 
 # ─────────────────────────────────────────────────────────────
@@ -110,3 +110,30 @@ class TestBSImpliedVol:
         assert math.isnan(bs_iv(100, 100, 0.04, 0, 5, "C", 0.01))
         assert math.isnan(bs_iv(100, 100, 0.04, 0.5, 0, "C", 0.01))
         assert math.isnan(bs_iv(100, 100, 0.04, 0.5, float("nan"), "C", 0.01))
+
+
+# ─────────────────────────────────────────────────────────────
+# Gamma vectorizada — paridad con la versión escalar
+# ─────────────────────────────────────────────────────────────
+class TestGammaVec:
+    def test_matches_scalar_elementwise(self):
+        S, r, T, q = 590.0, 0.043, 30 / 365, 0.012
+        strikes = np.linspace(480, 700, 50)
+        ivs = np.linspace(0.12, 0.45, 50)
+        vec = bs_gamma_vec(S, strikes, r, T, ivs, q)
+        scalar = np.array([bs_gamma(S, k, r, T, v, q)
+                           for k, v in zip(strikes, ivs)])
+        np.testing.assert_allclose(vec, scalar, rtol=1e-12)
+
+    def test_invalid_entries_give_zero(self):
+        S, r, T, q = 100.0, 0.04, 0.1, 0.01
+        strikes = np.array([100.0, -5.0, np.nan, 110.0])
+        ivs = np.array([0.2, 0.2, 0.2, -0.1])
+        vec = bs_gamma_vec(S, strikes, r, T, ivs, q)
+        assert vec[1] == 0.0 and vec[2] == 0.0 and vec[3] == 0.0
+        assert vec[0] > 0
+
+    def test_degenerate_S_or_T(self):
+        strikes = np.array([100.0]); ivs = np.array([0.2])
+        assert bs_gamma_vec(0.0, strikes, 0.04, 0.1, ivs, 0.01)[0] == 0.0
+        assert bs_gamma_vec(100.0, strikes, 0.04, 0.0, ivs, 0.01)[0] == 0.0

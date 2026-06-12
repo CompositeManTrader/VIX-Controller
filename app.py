@@ -22,6 +22,7 @@ from vix_controller.rates import get_risk_free_rate, get_dividend_yield
 from vix_controller.quant.bs import (
     bs_call as _bs_call_mod, bs_put as _bs_put_mod,
     bs_gamma as _bs_gamma_mod, bs_iv as _bs_iv_mod,
+    bs_gamma_vec as _bs_gamma_vec,
 )
 from vix_controller.quant.svi import fit_svi_slice as _fit_svi_slice_mod
 
@@ -78,28 +79,29 @@ pw_ready = check_playwright_installed()
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Inter:wght@400;500;600;700;800&display=swap');
-:root{--bg:#0D1117;--card:#161B22;--border:#30363D;--g:#3FB950;--r:#F85149;--y:#D29922;--b:#58A6FF;--c:#39D2C0;--t:#C9D1D9;--dim:#8B949E;--w:#F0F6FC;--gbg:#0B2E13;--rbg:#3B1218;}
+:root{--bg:#0D1117;--card:#161B22;--border:#30363D;--g:#3FB950;--r:#F85149;--y:#D29922;--b:#58A6FF;--c:#39D2C0;--t:#C9D1D9;--dim:#A0A8B0;--w:#F0F6FC;--gbg:#0B2E13;--rbg:#3B1218;--thead:#1C2128;--grid:#21262D;--zero:#484F58;--accent:#F7931A;--accent2:#FF6B35;--purple:#BC8CFF;}
 .stApp{background:var(--bg);}
 #MainMenu,footer,header{visibility:hidden;}
 .block-container{padding:0.5rem 1.5rem;max-width:1400px;}
+.hr{border-top:1px solid var(--border);margin:0.8rem 0;}
 .hdr{display:flex;align-items:center;padding:0.6rem 0;border-bottom:2px solid var(--border);margin-bottom:0.8rem;gap:1rem;}
 .hdr .logo-box{display:flex;align-items:center;gap:0.6rem;}
-.hdr .logo-icon{width:32px;height:32px;background:linear-gradient(135deg,#F7931A,#FF6B35);border-radius:4px;display:flex;align-items:center;justify-content:center;font-weight:900;font-size:14px;color:#0D1117;font-family:'Inter',sans-serif;letter-spacing:-0.5px;}
+.hdr .logo-icon{width:32px;height:32px;background:linear-gradient(135deg,var(--accent),var(--accent2));border-radius:4px;display:flex;align-items:center;justify-content:center;font-weight:900;font-size:14px;color:#0D1117;font-family:'Inter',sans-serif;letter-spacing:-0.5px;}
 .hdr .logo-text{font-family:'Inter',sans-serif;font-weight:800;font-size:1.1rem;color:#F0F6FC;letter-spacing:0.8px;}
-.hdr .logo-tag{font-family:'JetBrains Mono',monospace;font-size:0.55rem;color:#F7931A;letter-spacing:1.5px;text-transform:uppercase;margin-top:1px;}
-.hdr .sub{font-family:'JetBrains Mono',monospace;font-size:0.65rem;color:var(--dim);margin-left:auto;text-align:right;line-height:1.4;}
+.hdr .logo-tag{font-family:'JetBrains Mono',monospace;font-size:0.6rem;color:var(--accent);letter-spacing:1.5px;text-transform:uppercase;margin-top:1px;}
+.hdr .sub{font-family:'JetBrains Mono',monospace;font-size:0.7rem;color:var(--dim);margin-left:auto;text-align:right;line-height:1.4;}
 .mrow{display:flex;gap:4px;margin-bottom:0.6rem;flex-wrap:wrap;}
 .mpill{background:var(--card);border:1px solid var(--border);border-radius:4px;padding:0.4rem 0.7rem;flex:1;min-width:120px;text-align:center;}
-.mpill .ml{font-family:'JetBrains Mono',monospace;font-size:0.58rem;color:var(--dim);text-transform:uppercase;letter-spacing:0.6px;}
+.mpill .ml{font-family:'JetBrains Mono',monospace;font-size:0.65rem;color:var(--dim);text-transform:uppercase;letter-spacing:0.6px;}
 .mpill .mv{font-family:'Inter',sans-serif;font-weight:700;font-size:1.15rem;}
 .mv.up{color:var(--g);}.mv.dn{color:var(--r);}.mv.nt{color:var(--b);}
 .ctx{width:100%;border-collapse:collapse;font-family:'JetBrains Mono',monospace;font-size:0.78rem;margin:0.4rem 0;}
 .ctx td,.ctx th{padding:0.35rem 0.5rem;text-align:center;border:1px solid var(--border);}
-.ctx th{background:#1C2128;color:var(--dim);font-weight:500;font-size:0.65rem;text-transform:uppercase;}
+.ctx th{background:var(--thead);color:var(--dim);font-weight:500;font-size:0.72rem;text-transform:uppercase;}
 .ctx .pos{color:var(--g);}.ctx .neg{color:var(--r);}
 .ctx .hdr-cell{background:var(--card);color:var(--t);font-weight:600;text-align:left;width:120px;}
 .dtbl{width:100%;border-collapse:collapse;font-family:'JetBrains Mono',monospace;font-size:0.75rem;margin-top:0.5rem;}
-.dtbl th{color:var(--b);font-weight:500;padding:0.4rem 0.6rem;border-bottom:1px solid var(--border);font-size:0.62rem;text-transform:uppercase;letter-spacing:0.5px;text-align:center;}
+.dtbl th{color:var(--b);font-weight:500;padding:0.4rem 0.6rem;border-bottom:1px solid var(--border);font-size:0.72rem;text-transform:uppercase;letter-spacing:0.5px;text-align:center;}
 .dtbl td{padding:0.35rem 0.6rem;text-align:center;color:var(--t);border-bottom:1px solid rgba(255,255,255,0.03);}
 .dtbl tr:hover td{background:rgba(88,166,255,0.04);}
 .sig-box{border-radius:6px;padding:1rem;text-align:center;border-width:2px;border-style:solid;}
@@ -115,7 +117,7 @@ st.markdown("""
 .icard .ic-label{color:var(--dim);}.icard .ic-val{color:var(--t);font-weight:500;}
 .stTabs [data-baseweb="tab-list"]{gap:0;border-bottom:1px solid var(--border);}
 .stTabs [data-baseweb="tab"]{font-family:'Inter',sans-serif;font-weight:600;font-size:0.82rem;color:var(--dim);padding:0.5rem 1.5rem;}
-.stTabs [aria-selected="true"]{color:#F7931A !important;border-bottom:2px solid #F7931A !important;}
+.stTabs [aria-selected="true"]{color:var(--accent) !important;border-bottom:2px solid var(--accent) !important;}
 [data-testid="stSidebar"]{background:var(--card);}
 </style>
 """, unsafe_allow_html=True)
@@ -134,7 +136,7 @@ MN = {1:'Jan',2:'Feb',3:'Mar',4:'Apr',5:'May',6:'Jun',7:'Jul',8:'Aug',9:'Sep',10
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # DATA LAYER — PLAYWRIGHT (browser abre y cierra en el mismo thread)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-@st.cache_data(ttl=55)
+@st.cache_data(ttl=cfg.CACHE_TTL["cboe_scrape"])
 def scrape_cboe_futures() -> pd.DataFrame:
     """
     Lanza Chromium, scrapea, cierra — todo en el mismo thread.
@@ -377,7 +379,7 @@ def fetch_etps():
 # EDGE ANALYTICS — DATA LAYER
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=cfg.CACHE_TTL["edge_extra"])
 def fetch_edge_extra():
     """
     Fetches VVIX, SKEW, HYG, IEF, y toda la familia VIX para barómetro.
@@ -506,7 +508,7 @@ def _get_cffi_session():
 def _yahoo_options_session():
     return _get_cffi_session()
 
-@st.cache_data(ttl=3600)   # 1h — rate-limits de Yahoo suelen durar 15-60 min
+@st.cache_data(ttl=cfg.CACHE_TTL["yahoo_options"])   # 1h — rate-limits de Yahoo suelen durar 15-60 min
 def fetch_options_chains(ticker: str = "SPY", n_exp: int = 4) -> tuple:
     """
     Descarga opciones con triple estrategia anti-rate-limit:
@@ -755,18 +757,23 @@ _bs_gamma = _bs_gamma_mod
 def compute_gex_profile(chains: dict, spot: float,
                         r: float | None = None, q: float | None = None,
                         contract_mult: int = cfg.GEX_CONTRACT_MULT) -> pd.DataFrame:
-    # Si r/q no se pasan, cargar dinámicamente (fallback a cfg si red falla)
-    if r is None: r = get_risk_free_rate()
-    if q is None: q = get_dividend_yield("SPY")
     """
     Calcula el GEX neto de dealers por strike, sumando todos los vencimientos.
     Usa la IV calculada por BS (columna 'iv') si está disponible,
     sino reintenta con la IV de yfinance como fallback.
 
+    Vectorizado: gamma se computa con numpy sobre el array completo de
+    strikes (antes: .apply fila a fila + .iterrows → ~10× más lento con
+    chains grandes).
+
     Retorna DataFrame con:
       strike, calls_gex, puts_gex, net_gex (todo en USD millones)
     """
-    rows = []
+    # Si r/q no se pasan, cargar dinámicamente (fallback a cfg si red falla)
+    if r is None: r = get_risk_free_rate()
+    if q is None: q = get_dividend_yield("SPY")
+
+    frames = []
     for exp_str, data in chains.items():
         dte = data["dte"]
         T   = dte / 365.0
@@ -774,7 +781,7 @@ def compute_gex_profile(chains: dict, spot: float,
             continue
 
         for side, sign in [("calls", -1), ("puts", +1)]:
-            df = data[side].copy()
+            df = data[side]
             if df.empty:
                 continue
             # Usar IV BS si disponible, si no yfinance impliedVolatility
@@ -789,33 +796,23 @@ def compute_gex_profile(chains: dict, spot: float,
             if df.empty:
                 continue
 
-            df["gamma"] = df.apply(
-                lambda row: _bs_gamma(spot, row["strike"], r, T,
-                                      row[iv_col], q),
-                axis=1
-            )
+            gamma = _bs_gamma_vec(spot, df["strike"].values, r, T,
+                                  df[iv_col].values, q)
             # GEX en dólares: OI × Gamma × S² × multiplier × 1% move
-            df["gex_usd"] = (
-                sign
-                * df["openInterest"]
-                * df["gamma"]
-                * (spot ** 2)
-                * contract_mult
-                * 0.01   # 1% move
-            )
-            for _, row in df.iterrows():
-                rows.append({
-                    "strike":   row["strike"],
-                    "side":     side,
-                    "dte":      dte,
-                    "gex_usd":  row["gex_usd"],
-                    "oi":       row["openInterest"],
-                })
+            gex_usd = (sign * df["openInterest"].values * gamma
+                       * (spot ** 2) * contract_mult * 0.01)
+            frames.append(pd.DataFrame({
+                "strike":  df["strike"].values,
+                "side":    side,
+                "dte":     dte,
+                "gex_usd": gex_usd,
+                "oi":      df["openInterest"].values,
+            }))
 
-    if not rows:
+    if not frames:
         return pd.DataFrame()
 
-    df_all = pd.DataFrame(rows)
+    df_all = pd.concat(frames, ignore_index=True)
     # Agrupar por strike
     gex_by_strike = (
         df_all.groupby(["strike", "side"])["gex_usd"]
@@ -1441,7 +1438,9 @@ def forecast_vol_surface(chains: dict, spot: float,
             df = data[side].copy()
             if df.empty: continue
             iv_col = "iv" if "iv" in df.columns else "impliedVolatility"
-            df = df[df[iv_col].notna() & (df["strike"].between(spot*0.82, spot*1.18))]
+            df = df[df[iv_col].notna()
+                    & (df["strike"].between(spot * cfg.SELL_MONEYNESS_LO,
+                                            spot * cfg.SELL_MONEYNESS_HI))]
             if df.empty: continue
 
             F_T = spot * np.exp((r - q) * T)   # forward al vencimiento del slice
@@ -1449,7 +1448,8 @@ def forecast_vol_surface(chains: dict, spot: float,
                 K   = row["strike"]; iv_c = float(row.get(iv_col, 0) or 0)
                 oi  = row["openInterest"]; mid = row.get("midPrice", 0)
                 if K <= 0 or iv_c <= 0 or mid <= 0: continue
-                if not (0.82 <= K/spot <= 1.18): continue  # ±18% max
+                if not (cfg.SELL_MONEYNESS_LO <= K/spot <= cfg.SELL_MONEYNESS_HI):
+                    continue  # ±18% max — fuera de ahí la IV es ruido
 
                 k_  = np.log(K / F_T)
                 disc_ = np.maximum((k_ - fit["m"])**2 + fit["sigma"]**2, 1e-12)
@@ -1698,12 +1698,19 @@ SKEW_PALETTE = [
 
 def build_skew_curves(chains: dict, spot: float,
                       moneyness_range=(0.75, 1.25),
-                      y_mode: str = "moneyness") -> go.Figure:
+                      y_mode: str = "moneyness",
+                      r: float | None = None,
+                      q: float | None = None) -> go.Figure:
     """
     Curvas IV (BS) vs Moneyness o log-moneyness por vencimiento.
     y_mode: 'moneyness' → % vs spot | 'log' → ln(K/F)
     Usa columna 'iv' (BS calculado), no yfinance.
+
+    r, q: para el forward F = S·exp((r-q)·T) del eje log-moneyness.
+    Si None, se obtienen de rates (cached).
     """
+    if r is None: r = get_risk_free_rate()
+    if q is None: q = get_dividend_yield("SPY")
     fig = go.Figure()
     if not chains or not spot: return fig
     lo, hi = moneyness_range
@@ -1719,9 +1726,12 @@ def build_skew_curves(chains: dict, spot: float,
         iv_smooth = combined["iv"].rolling(3, min_periods=1, center=True).mean()
 
         if y_mode == "log":
-            F = spot * np.exp(0 * T)   # r, q are baked into iv already
-            x_vals = np.log(combined["strike"].values / spot)  # approx log-moneyness
-            x_label = "Log-moneyness  ln(K/S)"
+            # Forward real del slice: F = S·exp((r-q)·T). Antes se usaba S directo
+            # (y una F calculada con exp(0·T) que ni se usaba) → log-moneyness
+            # sesgado ~(r-q)·T en strikes OTM, peor en vencimientos largos.
+            F = spot * np.exp((r - q) * T)
+            x_vals = np.log(combined["strike"].values / F)
+            x_label = "Log-moneyness  ln(K/F)"
             x_suffix = ""
         else:
             x_vals  = combined["moneyness"].values * 100 - 100
@@ -1932,7 +1942,7 @@ def build_iv_heatmap(chains: dict, spot: float,
 # LIVE EXTENSION — SPY + VIX desde yfinance
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-@st.cache_data(ttl=55)
+@st.cache_data(ttl=cfg.CACHE_TTL["yahoo_spot"])
 def fetch_live_spy_vix() -> pd.DataFrame:
     """
     Extiende el parquet con datos SPY y VIX de los últimos 45 días.
@@ -1961,7 +1971,7 @@ def fetch_live_spy_vix() -> pd.DataFrame:
     return pd.DataFrame()
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=cfg.CACHE_TTL["har_rv"])
 def _compute_har_rv_asymmetric(spy_close: pd.Series, vix_close: pd.Series,
                                 window: int = 252, h: int = 22) -> dict:
     """
@@ -2196,7 +2206,9 @@ def compute_edge_analytics(df, edge_extra):
 
     if 'M1_Price' in bt.columns and 'M1_DTE' in bt.columns:
         m1 = bt['M1_Price']; dte = bt['M1_DTE']; spot = bt['VIX_Close']
-        valid = (m1 > 0) & (dte > 0) & m1.notna() & dte.notna() & spot.notna()
+        # dte >= 1: con DTE fraccional (día de expiración) la anualización
+        # 365/dte explota (p.ej. 730× con dte=0.5) y mete spikes absurdos.
+        valid = (m1 > 0) & (dte >= 1) & m1.notna() & dte.notna() & spot.notna()
         bt['Roll_Yield'] = np.where(valid, (m1 - spot) / m1 * (365 / dte) * 100, np.nan)
 
     # ── VVIX live desde yfinance ────────────────────────────────────
@@ -2666,7 +2678,7 @@ def build_credit_chart(bt, window=252):
 PARQUET_PATH      = "data/master.parquet"
 BARO_PARQUET_PATH = "data/baro_history.parquet"
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=cfg.CACHE_TTL["parquet"])
 def load_baro_parquet() -> pd.DataFrame:
     """
     Lee el parquet histórico del Barómetro VTS.
@@ -2692,7 +2704,7 @@ def load_baro_parquet() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=cfg.CACHE_TTL["parquet"])
 def load_master_parquet() -> pd.DataFrame:
     """
     Lee el histórico desde data/master.parquet (repo de GitHub).
@@ -2712,7 +2724,7 @@ def load_master_parquet() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=55)
+@st.cache_data(ttl=cfg.CACHE_TTL["yahoo_spot"])
 def fetch_today_prices():
     """Precios del día: VXX, SVXY, SVIX, VIX, SPY."""
     out = {}
@@ -3237,7 +3249,7 @@ def build_trades_chart(trades_df: pd.DataFrame) -> go.Figure:
     return fig
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=cfg.CACHE_TTL["strategy"])
 def build_strategy_cached(df: pd.DataFrame) -> pd.DataFrame:
     """
     Aplica BB(20, 2σ) + Contango Rule sobre el histórico completo.
@@ -3664,7 +3676,7 @@ def _rolling_percentile(s: pd.Series, window: int = cfg.VTS_ROLLING_WINDOW) -> p
     return pd.Series(out, index=s.index)
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=cfg.CACHE_TTL["barometer"])
 def compute_vts_barometer(
     bt: pd.DataFrame,
     edge_extra: dict,
@@ -3765,7 +3777,6 @@ def compute_vts_barometer(
             log.warning("BARO: VIX no disponible (yfinance vacío o rate-limit)")
 
     # SPY con historia completa también (para RV20)
-    spy_yf = None  # yfinance no está en edge_extra por defecto, mantenemos parquet
     spy = df.get('SPY_Close')
     if spy is None or spy.notna().sum() < 100:
         sh = _yf_history_safe("SPY", period="max")
@@ -3836,7 +3847,7 @@ def compute_vts_barometer(
             'name': 'M1:M2 VIX FUTURES',
             'value': f"{m1m2.iloc[-1]:.3f}" if pd.notna(m1m2.iloc[-1]) else '—',
             'percentile': m1m2_pct.iloc[-1] if pd.notna(m1m2_pct.iloc[-1]) else 50,
-            'weight': 1.2,
+            'weight': cfg.VTS_WEIGHTS["m1_m2"],
             'interpretation': 'Ratio M1/M2 — >1 indica backwardation (stress)',
             'series': m1m2_pct,
         })
@@ -3851,7 +3862,7 @@ def compute_vts_barometer(
             'name': 'M4-M7 VIX FUTURES',
             'value': f"{m4m7.iloc[-1]:.3f}" if pd.notna(m4m7.iloc[-1]) else '—',
             'percentile': m4m7_pct.iloc[-1] if pd.notna(m4m7_pct.iloc[-1]) else 50,
-            'weight': 0.9,
+            'weight': cfg.VTS_WEIGHTS["m4_m7"],
             'interpretation': 'Ratio M4/M7 — inversión en curva larga = stress estructural',
             'series': m4m7_pct,
         })
@@ -3869,7 +3880,7 @@ def compute_vts_barometer(
             'name': 'VX30:VIX ROLL YIELD',
             'value': f"{roll_y.iloc[-1]:+.2f}%" if pd.notna(roll_y.iloc[-1]) else '—',
             'percentile': inv_ry.iloc[-1] if pd.notna(inv_ry.iloc[-1]) else 50,
-            'weight': 1.3,  # el más importante según VTS
+            'weight': cfg.VTS_WEIGHTS["vx30_vix_roll"],
             'interpretation': 'Roll yield constant-maturity 30d · Alto = vol baja',
             'series': inv_ry,
         })
@@ -3903,7 +3914,7 @@ def compute_vts_barometer(
             'value': (f"V={vix.iloc[-1]:.1f}" if vix is not None else '') +
                      (f" VV={vvix_s.iloc[-1]:.0f}" if vvix_s is not None and pd.notna(vvix_s.iloc[-1]) else ''),
             'percentile': trio_val,
-            'weight': 1.0,
+            'weight': cfg.VTS_WEIGHTS["vix_vvix_voli"],
             'interpretation': 'Composite nivel: VIX + VVIX + VOLI proxy (RV20)',
             'series': trio_hist,
         })
@@ -3938,7 +3949,7 @@ def compute_vts_barometer(
             'name': 'CASH VIX OSCILLATOR',
             'value': f"{cvo.iloc[-1]:.3f}" if pd.notna(cvo.iloc[-1]) else '—',
             'percentile': cvo_pct.iloc[-1] if pd.notna(cvo_pct.iloc[-1]) else 50,
-            'weight': 1.1,
+            'weight': cfg.VTS_WEIGHTS["cvo"],
             'interpretation': 'Promedio ratios VIX term structure · Alto = curva invertida',
             'series': cvo_pct,
         })
@@ -3956,7 +3967,7 @@ def compute_vts_barometer(
             'name': 'VIX - VOLI RESIDUAL',
             'value': f"{residual.iloc[-1]:+.2f}" if pd.notna(residual.iloc[-1]) else '—',
             'percentile': inv_res.iloc[-1] if pd.notna(inv_res.iloc[-1]) else 50,
-            'weight': 0.9,
+            'weight': cfg.VTS_WEIGHTS["vix_voli_resid"],
             'interpretation': 'VIX menos VOLI (RV20 proxy) · Bajo = mercado exige prima',
             'series': inv_res,
         })
@@ -3980,7 +3991,7 @@ def compute_vts_barometer(
             'name': 'TRADERS VRP',
             'value': f"{traders_vrp.iloc[-1]:+.2f}" if pd.notna(traders_vrp.iloc[-1]) else '—',
             'percentile': inv_tvrp.iloc[-1] if pd.notna(inv_tvrp.iloc[-1]) else 50,
-            'weight': 1.0,
+            'weight': cfg.VTS_WEIGHTS["traders_vrp"],
             'interpretation': 'WMA(VX30 - HV5) · Bajo = prima comprimida (stress)',
             'series': inv_tvrp,
         })
@@ -3996,7 +4007,7 @@ def compute_vts_barometer(
             'name': 'SDEX / TDEX / SKEW',
             'value': f"{skew_s.iloc[-1]:.1f}" if pd.notna(skew_s.iloc[-1]) else '—',
             'percentile': skew_pct.iloc[-1] if pd.notna(skew_pct.iloc[-1]) else 50,
-            'weight': 0.9,
+            'weight': cfg.VTS_WEIGHTS["skew"],
             'interpretation': 'CBOE SKEW Index · Alto = demanda de puts OTM (cola izq)',
             'series': skew_pct,
         })
@@ -4013,7 +4024,7 @@ def compute_vts_barometer(
                 'name': 'VIX:VIX3M MEDIUM',
                 'value': f"{vv3m.iloc[-1]:.3f}" if pd.notna(vv3m.iloc[-1]) else '—',
                 'percentile': vv3m_pct.iloc[-1] if pd.notna(vv3m_pct.iloc[-1]) else 50,
-                'weight': 1.1,
+                'weight': cfg.VTS_WEIGHTS["vix_vix3m"],
                 'interpretation': 'VIX/VIX3M · >1 = backwardation medio plazo',
                 'series': vv3m_pct,
             })
@@ -4032,7 +4043,7 @@ def compute_vts_barometer(
             'name': 'EXTREME PUT/CALL RATIO',
             'value': f"{last_val:.1f}" if pd.notna(last_val) else '—',
             'percentile': skew_level_pct.iloc[-1] if pd.notna(skew_level_pct.iloc[-1]) else 50,
-            'weight': 0.7,
+            'weight': cfg.VTS_WEIGHTS["extreme_pc"],
             'interpretation': 'SKEW suavizado 10d · Alto = demanda de puts elevada',
             'series': skew_level_pct,
         })
@@ -4049,7 +4060,7 @@ def compute_vts_barometer(
                 'name': 'VIX9D:VIX FAST',
                 'value': f"{fast.iloc[-1]:.3f}" if pd.notna(fast.iloc[-1]) else '—',
                 'percentile': fast_pct.iloc[-1] if pd.notna(fast_pct.iloc[-1]) else 50,
-                'weight': 1.0,
+                'weight': cfg.VTS_WEIGHTS["vix9d_vix"],
                 'interpretation': 'VIX9D/VIX · >1 = cola corta caliente (stress inmediato)',
                 'series': fast_pct,
             })
@@ -4116,7 +4127,7 @@ def compute_vts_barometer(
             'name': 'VOLPOCALYPSE THRESHOLD',
             'value': f"VIX={last_vix:.1f} · M1/M2={m1m2_last:.3f}",
             'percentile': vix_score,
-            'weight': 0.9,
+            'weight': cfg.VTS_WEIGHTS["volpocalypse"],
             'interpretation': 'Trigger compuesto · VIX + backwardation + momentum',
             'series': hist_scores,
         })
@@ -4131,7 +4142,7 @@ def compute_vts_barometer(
             'name': 'VIX LEVEL (core)',
             'value': f"{vix.iloc[-1]:.2f}",
             'percentile': vix_pct.iloc[-1] if pd.notna(vix_pct.iloc[-1]) else 50,
-            'weight': 1.2,
+            'weight': cfg.VTS_WEIGHTS["vix_level"],
             'interpretation': 'Nivel absoluto del VIX · Ancla del barómetro',
             'series': vix_pct,
         })
@@ -4871,18 +4882,19 @@ with st.sidebar:
 with st.spinner("🌐 Scraping CBOE delayed quotes…"):
     df_vx = scrape_cboe_futures()
 
-# Mostrar diagnóstico en sidebar siempre
+# Diagnóstico en sidebar — colapsado en expander para no saturar.
+# Solo se expande automáticamente si hay un error real (❌).
 with st.sidebar:
     debug_msg = st.session_state.get("scrape_debug", "")
-    if debug_msg:
-        if debug_msg.startswith("❌"):
-            st.error(debug_msg)
-        else:
-            st.info(f"🔍 {debug_msg}")
     html_sample = st.session_state.get("scrape_html_sample", "")
-    if html_sample:
-        st.warning("⚠️ No se encontró tabla VX — fragmento HTML:")
-        st.code(html_sample[:600], language="html")
+    if debug_msg or html_sample:
+        has_error = debug_msg.startswith("❌") or bool(html_sample)
+        with st.expander("🔍 Diagnóstico de datos", expanded=has_error):
+            if debug_msg:
+                (st.error if debug_msg.startswith("❌") else st.info)(debug_msg)
+            if html_sample:
+                st.warning("⚠️ No se encontró tabla VX — fragmento HTML:")
+                st.code(html_sample[:600], language="html")
 
 vix_spot = fetch_vix_spot()
 etps = fetch_etps()
@@ -5201,8 +5213,7 @@ with tab2:
     if not in_ct_today and bb_sig_today == 1:
         st.warning("⚠️ BB dice LONG pero hay backwardation — CASH por Contango Rule")
 
-    st.markdown("<div style='border-top:1px solid #30363D;margin:0.8rem 0'></div>",
-                unsafe_allow_html=True)
+    st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
 
     # ═══════════════════════════════════════════
     # SECCIÓN 2 — GRÁFICA VXX OPERATIVA
@@ -5341,8 +5352,7 @@ with tab2:
         </div>
         """, unsafe_allow_html=True)
 
-        st.markdown("<div style='border-top:1px solid #30363D;margin:0.5rem 0'></div>",
-                    unsafe_allow_html=True)
+        st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
 
         # ── Equity curve + Sharpe rolling ────────────────────
         try:
@@ -5554,8 +5564,7 @@ E[RV_futura] = β₀ + β₁·RV_diaria + β₂·RV_semanal(5d) + β₃·RV_mens
             for w in warnings_e:
                 st.warning(w)
 
-            st.markdown("<div style='border-top:1px solid #30363D;margin:0.6rem 0'></div>",
-                        unsafe_allow_html=True)
+            st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
 
             # ── Última fecha disponible ──────────────────────────────
             last_date_ebt = ebt.index[-1].date()
@@ -5780,8 +5789,7 @@ with tab_skew:
         with st.expander("📊 Lectura del Skew", expanded=True):
             for l in interp_parts: st.markdown(l)
 
-    st.markdown("<div style='border-top:1px solid #30363D;margin:0.5rem 0'></div>",
-                unsafe_allow_html=True)
+    st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
 
     # ── Skew Curves + ATM Term Structure ─────────────────────
     col_sk, col_atm = st.columns([1.6, 1])
@@ -5789,7 +5797,8 @@ with tab_skew:
         try:
             fig_sk = build_skew_curves(opt_chains, opt_spot,
                                        moneyness_range=(mon_lo, mon_hi),
-                                       y_mode=y_mode)
+                                       y_mode=y_mode,
+                                       r=skew_rfr, q=skew_div)
             if fig_sk.data:
                 st.plotly_chart(fig_sk, width="stretch",
                                 config=dict(displayModeBar=True,
@@ -5805,8 +5814,7 @@ with tab_skew:
             else: st.info("No hay datos ATM.")
         except Exception as e: st.error(f"Error ATM TS: {e}")
 
-    st.markdown("<div style='border-top:1px solid #30363D;margin:0.5rem 0'></div>",
-                unsafe_allow_html=True)
+    st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
 
     # ── IV Surface ────────────────────────────────────────────
     if view_mode == "🌐 3D Surface":
@@ -6192,8 +6200,7 @@ with tab_gex:
 - 🟡 **Gamma Flip**: punto donde el régimen cambia de positivo a negativo
         """)
 
-    st.markdown("<div style='border-top:1px solid #30363D;margin:0.5rem 0'></div>",
-                unsafe_allow_html=True)
+    st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
 
     # ── Chart 1: GEX Profile (principal) ────────────────────
     try:
@@ -6496,16 +6503,14 @@ with tab_baro:
             </div>
             """, unsafe_allow_html=True)
 
-        st.markdown("<div style='border-top:1px solid #30363D;margin:0.8rem 0'></div>",
-                    unsafe_allow_html=True)
+        st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
 
         # ── Timeline del score (últimos N días) ──────────────
         if baro['history'] is not None and not baro['history'].empty:
             hist_fig = build_vts_history_chart(baro['history'], window=baro_window)
             st.plotly_chart(hist_fig, width="stretch", config=dict(displayModeBar=False))
 
-        st.markdown("<div style='border-top:1px solid #30363D;margin:0.8rem 0'></div>",
-                    unsafe_allow_html=True)
+        st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
 
         # ── Desglose de métricas (toggle: orden VTS vs stress) ───
         col_mode1, col_mode2 = st.columns([3, 1])
@@ -6689,8 +6694,7 @@ La utilidad principal es como **filtro de régimen** complementario al Monitor O
                 unsafe_allow_html=True,
             )
 
-        st.markdown("<div style='border-top:1px solid #30363D;margin:0.8rem 0'></div>",
-                    unsafe_allow_html=True)
+        st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
 
         # ── Gráfico histórico completo ───────────────────────
         st.markdown("### 📈 Serie histórica completa")
@@ -6699,8 +6703,7 @@ La utilidad principal es como **filtro de régimen** complementario al Monitor O
                         config=dict(displayModeBar=True, displaylogo=False,
                                     modeBarButtonsToRemove=['select2d', 'lasso2d']))
 
-        st.markdown("<div style='border-top:1px solid #30363D;margin:0.8rem 0'></div>",
-                    unsafe_allow_html=True)
+        st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
 
         # ── Heatmap + Distribución ────────────────────────────
         col_hm, col_dist = st.columns([1.3, 1])
@@ -6723,8 +6726,7 @@ La utilidad principal es como **filtro de régimen** complementario al Monitor O
                     f"({dominant[1]['pct']:.1f}% del tiempo · {dominant[1]['days']:,} días)"
                 )
 
-        st.markdown("<div style='border-top:1px solid #30363D;margin:0.8rem 0'></div>",
-                    unsafe_allow_html=True)
+        st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
 
         # ── Estadísticas generales + tabla de datos ──────────
         st.markdown("### 📋 Estadísticas del barómetro histórico")

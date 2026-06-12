@@ -47,6 +47,24 @@ def bs_gamma(S: float, X: float, r: float, T: float, v: float, q: float) -> floa
     return np.exp(-q * T) * norm.pdf(d1) / (S * v * np.sqrt(T))
 
 
+def bs_gamma_vec(S: float, X: np.ndarray, r: float, T: float,
+                 v: np.ndarray, q: float) -> np.ndarray:
+    """
+    Gamma vectorizada sobre arrays de strikes/IVs (misma fórmula que bs_gamma).
+    Entradas inválidas (X<=0, v<=0, NaN) producen gamma 0 en esa posición.
+    """
+    X = np.asarray(X, dtype=float)
+    v = np.asarray(v, dtype=float)
+    out = np.zeros_like(X)
+    ok = (X > 0) & (v > 0) & np.isfinite(X) & np.isfinite(v)
+    if S <= 0 or T <= 0 or not ok.any():
+        return out
+    sqrtT = np.sqrt(T)
+    d1 = (np.log(S / X[ok]) + (r - q + 0.5 * v[ok] ** 2) * T) / (v[ok] * sqrtT)
+    out[ok] = np.exp(-q * T) * norm.pdf(d1) / (S * v[ok] * sqrtT)
+    return out
+
+
 def bs_iv(S: float, X: float, r: float, T: float, price: float,
           option_type: str, q: float, tol: float = IV_TOL,
           lo: float = IV_LOWER, hi: float = IV_UPPER) -> float:
