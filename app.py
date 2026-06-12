@@ -3433,10 +3433,6 @@ def build_vxx_operational_chart(bt: pd.DataFrame,
     if in_block:
         long_blocks.append((block_start, sig.index[-1]))
 
-    for start, end in long_blocks:
-        fig.add_vrect(x0=start, x1=end, row=1, col=1,
-                      fillcolor='rgba(63,185,80,0.08)', line_width=0, layer='below')
-
     # ── Shading por bloques BACKWARDATION (sig_bb=1 pero ct=0) ─
     bkwd_mask = (sig_bb == 1) & (ct == 0)
     in_block = False
@@ -3449,37 +3445,59 @@ def build_vxx_operational_chart(bt: pd.DataFrame,
             bkwd_blocks.append((block_start, dt)); in_block = False
     if in_block:
         bkwd_blocks.append((block_start, bkwd_mask.index[-1]))
-    for start, end in bkwd_blocks:
-        fig.add_vrect(x0=start, x1=end, row=1, col=1,
-                      fillcolor='rgba(248,81,73,0.07)', line_width=0, layer='below')
 
-    # Proxy traces para aparecer en la leyenda (shading no genera entries)
-    fig.add_trace(go.Scatter(x=[None], y=[None], mode='markers',
+    # NOTA: los add_vrect de shading se aplican DESPUÉS de agregar los
+    # traces del panel (ver abajo). En plotly >= 6, add_vrect(row=1) es un
+    # NO-OP SILENCIOSO si el subplot aún no tiene traces — el shading
+    # llevaba muerto desde el upgrade.
+
+    # Proxy traces para aparecer en la leyenda (shading no genera entries).
+    # CRÍTICO: x debe ser una FECHA VÁLIDA, no None. plotly.js >= 3 clasifica
+    # el tipo del eje con el PRIMER trace: con x=[None] el eje X quedaba
+    # 'linear' y TODOS los traces con fechas del panel calculaban undefined
+    # → panel completamente vacío (el bug reportado). Con x=fecha + y=None
+    # el eje se tipa como 'date' y el punto no se dibuja (y nulo), pero el
+    # item sí aparece en la leyenda.
+    _x0 = bt.index[0]
+    fig.add_trace(go.Scatter(x=[_x0], y=[None], mode='markers',
         marker=dict(size=10, color='rgba(63,185,80,0.35)', symbol='square'),
-        name='Zona LONG', showlegend=True), row=1, col=1)
-    fig.add_trace(go.Scatter(x=[None], y=[None], mode='markers',
+        name='Zona LONG', showlegend=True, hoverinfo='skip'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=[_x0], y=[None], mode='markers',
         marker=dict(size=10, color='rgba(248,81,73,0.35)', symbol='square'),
-        name='Backwardation', showlegend=True), row=1, col=1)
+        name='Backwardation', showlegend=True, hoverinfo='skip'), row=1, col=1)
 
     # ── BB band (fill entre upper y lower) ────────────────
-    fig.add_trace(go.Scatter(x=bt.index, y=bt['BB_Upper'],
+    # IMPORTANTE: .tolist() en las y del panel log. plotly.py >= 6 serializa
+    # numpy/Series como typed arrays binarios ({dtype, bdata b64}); el
+    # plotly.js embebido en Streamlit NO los soporta en ejes LOG → el panel
+    # renderizaba 0 puntos y el eje X colapsaba a [-1, 6]. Con listas
+    # nativas la serialización es JSON plano y el render funciona.
+    fig.add_trace(go.Scatter(x=bt.index, y=bt['BB_Upper'].tolist(),
         mode='lines', name='BB 2σ Upper',
         line=dict(color='#F85149', width=1, dash='dot'),
         hoverinfo='skip'), row=1, col=1)
-    fig.add_trace(go.Scatter(x=bt.index, y=bt['BB_Lower'],
+    fig.add_trace(go.Scatter(x=bt.index, y=bt['BB_Lower'].tolist(),
         mode='lines', name='BB 2σ Lower', showlegend=False,
         line=dict(color='#F85149', width=0.7, dash='dot'),
         fill='tonexty', fillcolor='rgba(248,81,73,0.04)',
         hoverinfo='skip'), row=1, col=1)
-    fig.add_trace(go.Scatter(x=bt.index, y=bt['BB_SMA20'],
+    fig.add_trace(go.Scatter(x=bt.index, y=bt['BB_SMA20'].tolist(),
         mode='lines', name='SMA(20)',
         line=dict(color='#58A6FF', width=1.5, dash='dash'),
         hovertemplate='%{x|%Y-%m-%d} · SMA: $%{y:.2f}<extra></extra>'), row=1, col=1)
-    fig.add_trace(go.Scatter(x=bt.index, y=vxx,
+    fig.add_trace(go.Scatter(x=bt.index, y=vxx.tolist(),
         mode='lines', name='VXX',
         line=dict(color='#F0F6FC', width=2.2),
         hovertemplate='<b>%{x|%Y-%m-%d}</b><br>VXX: <b>$%{y:.2f}</b><extra></extra>'),
         row=1, col=1)
+
+    # ── Shading de zonas (DESPUÉS de los traces — ver nota arriba) ──
+    for start, end in long_blocks:
+        fig.add_vrect(x0=start, x1=end, row=1, col=1,
+                      fillcolor='rgba(63,185,80,0.08)', line_width=0, layer='below')
+    for start, end in bkwd_blocks:
+        fig.add_vrect(x0=start, x1=end, row=1, col=1,
+                      fillcolor='rgba(248,81,73,0.07)', line_width=0, layer='below')
 
     # ── Flechas como SCATTER MARKERS (visibles) ──────────
     entry_dates, entry_prices = [], []
@@ -3578,7 +3596,7 @@ def build_vxx_operational_chart(bt: pd.DataFrame,
         ct_hist  = bt['Contango_pct'].fillna(0)
         bar_clrs = ['#3FB950' if v > 0 else '#F85149' for v in ct_hist]
         fig.add_trace(go.Bar(
-            x=bt.index, y=ct_hist,
+            x=bt.index, y=ct_hist.tolist(),
             name='Contango % hist', marker_color=bar_clrs, opacity=0.75,
             hovertemplate='<b>%{x|%Y-%m-%d}</b><br>Contango: %{y:+.2f}%<extra></extra>',
             showlegend=False,
@@ -3610,13 +3628,13 @@ def build_vxx_operational_chart(bt: pd.DataFrame,
     bh_equity = (1.0 + bh_ret).cumprod()
 
     fig.add_trace(go.Scatter(
-        x=bt.index, y=bh_equity,
+        x=bt.index, y=bh_equity.tolist(),
         mode='lines', name='Buy & Hold SVXY',
         line=dict(color='#8B949E', width=1.2, dash='dash'),
         hovertemplate='B&H: %{y:.3f}x<extra></extra>',
     ), row=3, col=1)
     fig.add_trace(go.Scatter(
-        x=bt.index, y=equity,
+        x=bt.index, y=equity.tolist(),
         mode='lines', name='Estrategia BB × CT',
         line=dict(color='#39D2C0', width=2.2),
         hovertemplate='<b>%{x|%Y-%m-%d}</b><br>Equity: %{y:.3f}x<extra></extra>',
