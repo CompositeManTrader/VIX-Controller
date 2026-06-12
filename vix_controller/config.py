@@ -50,20 +50,24 @@ VTS_MIN_OBS_RATIO = 1 / 3        # min_obs = max(60, window // 3)
 VTS_MIN_OBS_FLOOR = 60
 
 # Pesos ponderados del score (normalizados al final). Todos > 0.
+# NOTA: estos valores reflejan los pesos de PRODUCCIÓN que app.py usaba
+# inline. La primera transcripción de este dict divergía en 8 de 13
+# indicadores y nunca se conectó — ahora app.py lee de aquí (single
+# source of truth real). Si quieres recalibrar, este es el único lugar.
 VTS_WEIGHTS = {
     "m1_m2":           1.2,
-    "m4_m7":           1.0,
-    "vx30_vix_roll":   1.3,
+    "m4_m7":           0.9,
+    "vx30_vix_roll":   1.3,   # el más importante según VTS
     "vix_vvix_voli":   1.0,
-    "cvo":             1.0,
-    "vix_voli_resid":  0.8,
+    "cvo":             1.1,
+    "vix_voli_resid":  0.9,
     "traders_vrp":     1.0,
-    "skew":            0.8,
-    "vix_vix3m":       1.2,
-    "extreme_pc":      0.8,
-    "vix9d_vix":       1.1,
-    "volpocalypse":    1.5,
-    "vix_level":       0.7,
+    "skew":            0.9,
+    "vix_vix3m":       1.1,
+    "extreme_pc":      0.7,
+    "vix9d_vix":       1.0,
+    "volpocalypse":    0.9,
+    "vix_level":       1.2,
 }
 
 # ──────────────────────────────────────────────────────────────
@@ -77,6 +81,11 @@ CACHE_TTL = {
     "barometer":     300,
     "backtest":      3600,
     "rates":         3600,
+    "har_rv":        3600,
+    "parquet":       300,    # antes 3600: el workflow actualiza diario, pero el
+                             # barómetro (TTL 300) lo consume — TTLs alineados
+                             # evitan servir parquet stale dentro de un score fresco
+    "strategy":      3600,
 }
 
 # ──────────────────────────────────────────────────────────────
@@ -105,3 +114,8 @@ HAR_HORIZONS = (1, 5, 22)        # daily, weekly, monthly
 SVI_MAX_ITER = 500
 SVI_MIN_POINTS = 5
 SVI_RHO_MAX = 0.99               # rechaza fits con |rho| >= 0.99
+
+# Rango de moneyness K/S para candidatos de venta (forecast_vol_surface).
+# Fuera de ±18% el OI/liquidez de SPY cae y la IV es ruido.
+SELL_MONEYNESS_LO = 0.82
+SELL_MONEYNESS_HI = 1.18
