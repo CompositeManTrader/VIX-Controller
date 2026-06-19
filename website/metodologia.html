@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Metodología — VOLTERRA</title>
+<meta name="description" content="La metodología de VOLTERRA: tres instrumentos de precisión (prima de riesgo de volatilidad, regímenes de mercado y alerta cross-asset) y un proceso auditable del dato a la decisión.">
+<meta property="og:title" content="Metodología — VOLTERRA">
+<meta property="og:description" content="Tres instrumentos de precisión. Un proceso auditable.">
+<meta property="og:type" content="website">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%2307080A'/%3E%3Ctext x='32' y='45' font-family='Arial,sans-serif' font-weight='700' font-size='38' fill='%23C9A35C' text-anchor='middle'%3EV%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@300;400;500&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+
+<div class="grain" aria-hidden="true"></div>
+<div class="halo" id="halo" aria-hidden="true"></div>
+<div class="progress" aria-hidden="true"><span id="progressBar"></span></div>
+
+<header class="nav" id="nav">
+  <a class="brand" href="index.html" aria-label="VOLTERRA — inicio">VOLTERRA</a>
+  <nav class="nav-links" id="navLinks" aria-label="Páginas">
+    <a href="metodologia.html" class="active" aria-current="page"><span>I</span>Metodología</a>
+    <a href="modelos.html"><span>II</span>Modelos</a>
+    <a href="contacto.html"><span>III</span>Contacto</a>
+    <a class="nav-links-cta" href="contacto.html#acceso"><span>·</span>Acceso</a>
+  </nav>
+  <a class="nav-cta" href="contacto.html#acceso">Acceso</a>
+  <button class="nav-burger" id="navBurger" type="button" aria-label="Abrir menú" aria-expanded="false" aria-controls="navLinks">
+    <span></span><span></span><span></span>
+  </button>
+</header>
+
+<main>
+
+<!-- ============ PAGE HEAD ============ -->
+<header class="page-head">
+  <p class="eyebrow reveal">METODOLOGÍA</p>
+  <h1 class="reveal" style="--d:60ms">Tres instrumentos de <em>precisión</em></h1>
+  <p class="lead reveal" style="--d:140ms">No predecimos el mercado: medimos su régimen. Nuestra investigación se apoya en tres
+    sistemas complementarios y en un proceso auditable que convierte el dato en decisión sin discrecionalidad.</p>
+</header>
+
+<!-- ============ METODOLOGÍA ============ -->
+<section class="section section--tight" id="metodologia">
+  <div class="vitrinas">
+    <article class="vitrina reveal" style="--d:0ms">
+      <div class="vit-head"><span class="roman">I</span><span class="code">VRP-01</span></div>
+      <svg class="vit-icon" viewBox="0 0 48 48" aria-hidden="true">
+        <path d="M4 36c8-2 10-14 20-14s12 10 20 8"/>
+        <path d="M4 30c8-2 10-12 20-12s12 8 20 6" opacity=".55"/>
+        <path d="M4 42c8-2 10-10 20-10s12 6 20 4" opacity=".3"/>
+      </svg>
+      <h3>Prima de riesgo de volatilidad</h3>
+      <p>Medición continua del diferencial entre volatilidad implícita y realizada: dónde, cuánto y bajo qué régimen resulta cosechable.</p>
+      <div class="vit-viz"><canvas id="spark1" aria-hidden="true"></canvas></div>
+      <p class="vit-state">ESTADO · <b data-decode>MONITORIZANDO</b></p>
+    </article>
+    <article class="vitrina reveal" style="--d:120ms">
+      <div class="vit-head"><span class="roman">II</span><span class="code">RGM-02</span></div>
+      <svg class="vit-icon" viewBox="0 0 48 48" aria-hidden="true">
+        <circle cx="10" cy="24" r="5"/><circle cx="28" cy="11" r="5"/><circle cx="36" cy="34" r="5"/>
+        <path d="M14 21l9-7M32 15l3 14M14 27l17 6" opacity=".6"/>
+      </svg>
+      <h3>Regímenes de mercado</h3>
+      <p>Clasificación del estado del mercado mediante modelos ocultos de Markov: calma, transición y estrés, leídos antes de que sean titulares.</p>
+      <div class="vit-viz"><div class="band" id="band2" aria-hidden="true"></div></div>
+      <p class="vit-state">RÉGIMEN VIGENTE · <b data-decode>CALMA</b></p>
+    </article>
+    <article class="vitrina reveal" style="--d:240ms">
+      <div class="vit-head"><span class="roman">III</span><span class="code">XAS-03</span></div>
+      <svg class="vit-icon" viewBox="0 0 48 48" aria-hidden="true">
+        <circle cx="24" cy="24" r="4"/><circle cx="8" cy="10" r="3"/><circle cx="40" cy="10" r="3"/>
+        <circle cx="8" cy="38" r="3"/><circle cx="40" cy="38" r="3"/>
+        <path d="M21 21l-10-8M27 21l10-8M21 27l-10 8M27 27l10 8" opacity=".6"/>
+      </svg>
+      <h3>Alerta temprana cross-asset</h3>
+      <p>Divergencias anticipatorias entre crédito, divisas, tipos y volatilidad de renta variable. Cuando hablan a la vez, escuchamos primero.</p>
+      <div class="vit-viz">
+        <svg id="net3" viewBox="0 0 220 58" aria-hidden="true">
+          <g stroke="rgba(201,163,92,.3)" fill="none">
+            <path class="edge" d="M110 29L30 12"/><path class="edge" d="M110 29L70 48"/>
+            <path class="edge" d="M110 29L150 10"/><path class="edge" d="M110 29L190 44"/>
+          </g>
+          <g font-family="JetBrains Mono,monospace" font-size="8" fill="#79808C" text-anchor="middle">
+            <circle class="node hub" cx="110" cy="29" r="4" fill="#C9A35C"/>
+            <circle class="node" cx="30" cy="12" r="3" fill="rgba(201,163,92,.5)"/><text x="30" y="25">CRÉDITO</text>
+            <circle class="node" cx="70" cy="48" r="3" fill="rgba(201,163,92,.5)"/><text x="70" y="42">FX</text>
+            <circle class="node" cx="150" cy="10" r="3" fill="rgba(201,163,92,.5)"/><text x="150" y="23">TIPOS</text>
+            <circle class="node" cx="190" cy="44" r="3" fill="rgba(201,163,92,.5)"/><text x="190" y="38">VOL</text>
+          </g>
+        </svg>
+      </div>
+      <p class="vit-state">SEÑALES ACTIVAS · <b data-decode>0 / 4</b></p>
+    </article>
+  </div>
+</section>
+
+<!-- ============ PROCESO ============ -->
+<section class="section" id="proceso">
+  <header class="sec-head reveal">
+    <p class="eyebrow"><span class="dim">PROCESO Y GOBERNANZA /</span> DUE DILIGENCE</p>
+    <h2>Del dato a la <em>decisión</em></h2>
+  </header>
+  <div class="pipe reveal">
+    <div class="pipe-rail" aria-hidden="true"></div>
+    <div class="pipe-fill" aria-hidden="true"></div>
+    <div class="stations">
+      <div class="station"><span class="dot" style="--d:0ms"></span><h3>INGESTA</h3><p>Series de estructura temporal, superficies de volatilidad y datos cross-asset, depurados a diario.</p></div>
+      <div class="station"><span class="dot" style="--d:260ms"></span><h3>HIPÓTESIS</h3><p>Toda señal nace de una hipótesis económica falsable y documentada.</p></div>
+      <div class="station"><span class="dot" style="--d:520ms"></span><h3>VALIDACIÓN</h3><p>Backtest robusto, verificación out-of-sample y walk-forward.</p></div>
+      <div class="station"><span class="dot" style="--d:780ms"></span><h3>RÉGIMEN</h3><p>Clasificación del estado de mercado mediante modelos ocultos de Markov.</p></div>
+      <div class="station"><span class="dot" style="--d:1040ms"></span><h3>SEÑAL</h3><p>Generación sistemática, sin discrecionalidad en la ejecución.</p></div>
+      <div class="station"><span class="dot" style="--d:1300ms"></span><h3>CONTROL DE RIESGO</h3><p>Límites predefinidos y dimensionamiento por volatilidad objetivo.</p></div>
+    </div>
+  </div>
+  <div class="gov-grid">
+    <div class="gov reveal" style="--d:0ms">
+      <h3>Disciplina</h3>
+      <ul><li>Walk-forward continuo</li><li>Control de sobreajuste</li><li>Hipótesis falsables documentadas</li></ul>
+    </div>
+    <div class="gov reveal" style="--d:120ms">
+      <h3>Riesgo</h3>
+      <ul><li>Límites por estrategia</li><li>Volatilidad objetivo</li><li>Escenarios de cola</li></ul>
+    </div>
+    <div class="gov reveal" style="--d:240ms">
+      <h3>Transparencia</h3>
+      <ul><li>Metodología documentada</li><li>Revisión continua de supuestos</li><li>Informes periódicos</li></ul>
+    </div>
+  </div>
+  <div class="seal-row reveal">
+    <svg class="seal" role="img" viewBox="0 0 138 138" aria-label="Sello: sistemático, replicable, auditado">
+      <defs><path id="sealCirc" d="M69 69 m-52 0 a52 52 0 1 1 104 0 a52 52 0 1 1 -104 0"/></defs>
+      <circle cx="69" cy="69" r="64" fill="none" stroke="rgba(201,163,92,.3)" stroke-width="1"/>
+      <circle cx="69" cy="69" r="38" fill="none" stroke="rgba(201,163,92,.3)" stroke-width="1"/>
+      <text><textPath href="#sealCirc">SISTEMÁTICO · REPLICABLE · AUDITADO ·</textPath></text>
+      <text class="vmark" x="69" y="81" text-anchor="middle">V</text>
+    </svg>
+  </div>
+</section>
+
+<!-- ============ CIFRAS ============ -->
+<section class="section" id="cifras" aria-label="Rigor en cifras">
+  <header class="sec-head reveal">
+    <p class="eyebrow"><span class="dim">RIGOR EN CIFRAS /</span> SIN PROMESAS</p>
+    <h2>No prometemos. <em>Constatamos.</em></h2>
+  </header>
+  <div class="cifras-grid">
+    <div class="cifra reveal" style="--d:0ms"><div class="num"><span data-count="15">15</span><small>+</small></div><p>años de datos de term structure</p></div>
+    <div class="cifra reveal" style="--d:120ms"><div class="num"><span data-count="12">12</span></div><p>vencimientos monitorizados en continuo</p></div>
+    <div class="cifra reveal" style="--d:240ms"><div class="num"><span data-count="3">3</span></div><p>modelos de régimen en producción</p></div>
+    <div class="cifra reveal" style="--d:360ms"><div class="num"><span data-count="40">40</span><small>+</small></div><p>series cross-asset bajo vigilancia</p></div>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="foot-grid">
+    <p class="mono" style="font-size:10px;letter-spacing:.2em;color:var(--muted)">VOLTERRA · INVESTIGACIÓN CUANTITATIVA</p>
+    <nav class="foot-nav" aria-label="Pie de página">
+      <a href="index.html">Inicio</a>
+      <a href="metodologia.html">Metodología</a>
+      <a href="modelos.html">Modelos</a>
+      <a href="contacto.html">Contacto</a>
+    </nav>
+  </div>
+  <p class="foot-brand">VOLTERRA</p>
+  <p class="foot-year">MMXXVI</p>
+  <div class="foot-legal">
+    <p>VOLTERRA es una marca de investigación cuantitativa y posicionamiento. El contenido de este sitio tiene carácter
+    exclusivamente informativo y de presentación de marca: no constituye asesoramiento financiero, recomendación de
+    inversión, oferta ni solicitud de compra o venta de instrumento financiero alguno. Las métricas, los paneles y las
+    series de este sitio tienen carácter ilustrativo y están estilizados con fines de diseño.</p>
+    <p>La operativa con derivados de volatilidad implica riesgos significativos, incluida la pérdida del capital
+    invertido, y no resulta adecuada para todos los inversores. Rentabilidades pasadas no garantizan resultados
+    futuros. La información de este sitio se dirige exclusivamente a inversores profesionales y contrapartes
+    elegibles, conforme a la normativa aplicable.</p>
+  </div>
+  <p class="foot-tick" aria-hidden="true">
+    VIX <b data-tel="vix2">16.42</b> · VVIX <b data-tel="vvix2">91.78</b> · M1–M2 <b data-tel="slope3">+0.84</b>
+  </p>
+</footer>
+
+<script src="assets/app.js"></script>
+</body>
+</html>
