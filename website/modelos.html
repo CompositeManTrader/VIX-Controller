@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Modelos — VOLTERRA</title>
+<meta name="description" content="El monitor de VOLTERRA: estructura temporal del VIX, percentil de la prima de riesgo de volatilidad, correlaciones cross-asset y la hoja de ruta de modelos en desarrollo.">
+<meta property="og:title" content="Modelos — VOLTERRA">
+<meta property="og:description" content="La sala de máquinas: el sistema de monitorización de volatilidad.">
+<meta property="og:type" content="website">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%2307080A'/%3E%3Ctext x='32' y='45' font-family='Arial,sans-serif' font-weight='700' font-size='38' fill='%23C9A35C' text-anchor='middle'%3EV%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@300;400;500&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+
+<div class="grain" aria-hidden="true"></div>
+<div class="halo" id="halo" aria-hidden="true"></div>
+<div class="progress" aria-hidden="true"><span id="progressBar"></span></div>
+
+<header class="nav" id="nav">
+  <a class="brand" href="index.html" aria-label="VOLTERRA — inicio">VOLTERRA</a>
+  <nav class="nav-links" id="navLinks" aria-label="Páginas">
+    <a href="metodologia.html"><span>I</span>Metodología</a>
+    <a href="modelos.html" class="active" aria-current="page"><span>II</span>Modelos</a>
+    <a href="contacto.html"><span>III</span>Contacto</a>
+    <a class="nav-links-cta" href="contacto.html#acceso"><span>·</span>Acceso</a>
+  </nav>
+  <a class="nav-cta" href="contacto.html#acceso">Acceso</a>
+  <button class="nav-burger" id="navBurger" type="button" aria-label="Abrir menú" aria-expanded="false" aria-controls="navLinks">
+    <span></span><span></span><span></span>
+  </button>
+</header>
+
+<main>
+
+<!-- ============ PAGE HEAD ============ -->
+<header class="page-head">
+  <p class="eyebrow reveal">MODELOS</p>
+  <h1 class="reveal" style="--d:60ms">La sala de <em>máquinas</em></h1>
+  <p class="lead reveal" style="--d:140ms">El panel interno que sostiene la investigación, replicado aquí de forma ilustrativa:
+    estructura temporal del VIX, percentil de la prima de riesgo de volatilidad, correlaciones cross-asset y un registro
+    de eventos en vivo. La integración de datos de mercado con licencia está en hoja de ruta.</p>
+</header>
+
+<!-- ============ MONITOR ============ -->
+<section class="section section--tight" id="monitor">
+  <div class="monitor reveal">
+    <span class="bk bk1" aria-hidden="true"></span><span class="bk bk2" aria-hidden="true"></span>
+    <span class="bk bk3" aria-hidden="true"></span><span class="bk bk4" aria-hidden="true"></span>
+    <div class="mon-top">
+      <div class="mon-tabs" aria-hidden="true">
+        <span class="on">TERM STRUCTURE</span><span>VRP</span><span>CORRELACIÓN</span><span>REGISTRO</span>
+      </div>
+      <div class="mon-status"><span class="dot-jade" aria-hidden="true"></span><span data-clock>—:—:— UTC</span></div>
+    </div>
+    <div class="mon-grid">
+      <div class="mon-cell">
+        <h3>Estructura temporal VIX <b id="tsState">CONTANGO</b></h3>
+        <div class="fill"><canvas id="tsCanvas" aria-label="Curva de futuros del VIX, ilustrativa"></canvas></div>
+      </div>
+      <div class="mon-cell">
+        <h3>Percentil VRP · ventana 1 año</h3>
+        <div class="fill gauge-wrap">
+          <svg viewBox="0 0 200 118" aria-hidden="true">
+            <path d="M20 106 A80 80 0 0 1 180 106" fill="none" stroke="rgba(201,163,92,.25)" stroke-width="1"/>
+            <g id="gaugeTicks" stroke="rgba(201,163,92,.4)" stroke-width="1"></g>
+            <line id="gaugeNeedle" x1="100" y1="106" x2="100" y2="36" stroke="#66E0C2" stroke-width="1.4"/>
+            <circle cx="100" cy="106" r="3" fill="#C9A35C"/>
+          </svg>
+          <div class="gauge-val"><span id="gaugeVal">42</span> <small>PCTL</small></div>
+        </div>
+      </div>
+      <div class="mon-cell">
+        <h3>Correlaciones cross-asset</h3>
+        <div class="fill"><canvas id="matrixCanvas" aria-label="Matriz de correlaciones, ilustrativa"></canvas></div>
+      </div>
+      <div class="mon-cell">
+        <h3>Registro de eventos</h3>
+        <ul id="logList"></ul>
+      </div>
+    </div>
+    <p class="mon-note">PANEL ILUSTRATIVO CON DATOS ESTILIZADOS · NO CONSTITUYE RECOMENDACIÓN DE INVERSIÓN</p>
+  </div>
+</section>
+
+<!-- ============ ROADMAP ============ -->
+<section class="section" id="roadmap">
+  <header class="sec-head reveal">
+    <p class="eyebrow"><span class="dim">HOJA DE RUTA /</span> MODELOS</p>
+    <h2>En producción y en <em>desarrollo</em></h2>
+  </header>
+  <div class="roadmap">
+    <div class="rm reveal" style="--d:0ms">
+      <span class="code">VRP-01</span>
+      <h3>Prima de riesgo de volatilidad</h3>
+      <p>Diferencial implícita-realizada y percentil histórico.</p>
+      <span class="badge live">En producción</span>
+    </div>
+    <div class="rm reveal" style="--d:90ms">
+      <span class="code">RGM-02</span>
+      <h3>Regímenes de mercado</h3>
+      <p>Clasificación calma / transición / estrés por HMM.</p>
+      <span class="badge live">En producción</span>
+    </div>
+    <div class="rm reveal" style="--d:180ms">
+      <span class="code">XAS-03</span>
+      <h3>Cross-asset</h3>
+      <p>Divergencias entre crédito, divisas, tipos y vol.</p>
+      <span class="badge live">En producción</span>
+    </div>
+    <div class="rm reveal" style="--d:270ms">
+      <span class="code">GEX-04</span>
+      <h3>Gamma Exposure</h3>
+      <p>Exposición gamma de dealers por strike y nivel.</p>
+      <span class="badge">En desarrollo</span>
+    </div>
+    <div class="rm reveal" style="--d:0ms">
+      <span class="code">SKW-05</span>
+      <h3>Superficie de skew</h3>
+      <p>Pendiente y curvatura de la sonrisa de volatilidad.</p>
+      <span class="badge">En desarrollo</span>
+    </div>
+    <div class="rm reveal" style="--d:90ms">
+      <span class="code">DSP-06</span>
+      <h3>Dispersión</h3>
+      <p>Volatilidad del índice frente a la de sus componentes.</p>
+      <span class="badge">En desarrollo</span>
+    </div>
+    <div class="rm reveal" style="--d:180ms">
+      <span class="code">FLW-07</span>
+      <h3>Flujos de opciones</h3>
+      <p>Posicionamiento agregado y presión de cobertura.</p>
+      <span class="badge">En estudio</span>
+    </div>
+    <div class="rm reveal" style="--d:270ms">
+      <span class="code">TLR-08</span>
+      <h3>Riesgo de cola</h3>
+      <p>Indicadores de estrés y probabilidad de eventos extremos.</p>
+      <span class="badge">En estudio</span>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="foot-grid">
+    <p class="mono" style="font-size:10px;letter-spacing:.2em;color:var(--muted)">VOLTERRA · INVESTIGACIÓN CUANTITATIVA</p>
+    <nav class="foot-nav" aria-label="Pie de página">
+      <a href="index.html">Inicio</a>
+      <a href="metodologia.html">Metodología</a>
+      <a href="modelos.html">Modelos</a>
+      <a href="contacto.html">Contacto</a>
+    </nav>
+  </div>
+  <p class="foot-brand">VOLTERRA</p>
+  <p class="foot-year">MMXXVI</p>
+  <div class="foot-legal">
+    <p>VOLTERRA es una marca de investigación cuantitativa y posicionamiento. El contenido de este sitio tiene carácter
+    exclusivamente informativo y de presentación de marca: no constituye asesoramiento financiero, recomendación de
+    inversión, oferta ni solicitud de compra o venta de instrumento financiero alguno. Las métricas, los paneles y las
+    series de este sitio tienen carácter ilustrativo y están estilizados con fines de diseño.</p>
+    <p>La operativa con derivados de volatilidad implica riesgos significativos, incluida la pérdida del capital
+    invertido, y no resulta adecuada para todos los inversores. Rentabilidades pasadas no garantizan resultados
+    futuros. La información de este sitio se dirige exclusivamente a inversores profesionales y contrapartes
+    elegibles, conforme a la normativa aplicable.</p>
+  </div>
+  <p class="foot-tick" aria-hidden="true">
+    VIX <b data-tel="vix2">16.42</b> · VVIX <b data-tel="vvix2">91.78</b> · M1–M2 <b data-tel="slope3">+0.84</b>
+  </p>
+</footer>
+
+<script src="assets/app.js"></script>
+</body>
+</html>

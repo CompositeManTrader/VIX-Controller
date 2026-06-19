@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VOLTERRA — Investigación cuantitativa de volatilidad</title>
+<meta name="description" content="VOLTERRA. Investigación cuantitativa propietaria sobre la prima de riesgo de volatilidad, regímenes de mercado y señales cross-asset. Criterio sistemático, evidencia falsable, ejecución silenciosa.">
+<meta property="og:title" content="VOLTERRA — Investigación cuantitativa de volatilidad">
+<meta property="og:description" content="La volatilidad no es ruido. Es estructura.">
+<meta property="og:type" content="website">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%2307080A'/%3E%3Ctext x='32' y='45' font-family='Arial,sans-serif' font-weight='700' font-size='38' fill='%23C9A35C' text-anchor='middle'%3EV%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@300;400;500&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+
+<div class="grain" aria-hidden="true"></div>
+<div class="halo" id="halo" aria-hidden="true"></div>
+<div class="progress" aria-hidden="true"><span id="progressBar"></span></div>
+
+<header class="nav" id="nav">
+  <a class="brand" href="index.html" aria-label="VOLTERRA — inicio">VOLTERRA</a>
+  <nav class="nav-links" id="navLinks" aria-label="Páginas">
+    <a href="metodologia.html"><span>I</span>Metodología</a>
+    <a href="modelos.html"><span>II</span>Modelos</a>
+    <a href="contacto.html"><span>III</span>Contacto</a>
+    <a class="nav-links-cta" href="contacto.html#acceso"><span>·</span>Acceso</a>
+  </nav>
+  <a class="nav-cta" href="contacto.html#acceso">Acceso</a>
+  <button class="nav-burger" id="navBurger" type="button" aria-label="Abrir menú" aria-expanded="false" aria-controls="navLinks">
+    <span></span><span></span><span></span>
+  </button>
+</header>
+
+<main>
+
+<!-- ============ HERO ============ -->
+<section class="hero" id="inicio">
+  <canvas id="meshCanvas" aria-hidden="true"></canvas>
+  <div class="hero-fog" aria-hidden="true"></div>
+  <div class="hero-inner">
+    <p class="eyebrow"><i></i>Investigación cuantitativa de volatilidad<i></i></p>
+    <h1 class="foil">La volatilidad no es ruido.<br><em>Es estructura.</em></h1>
+    <p class="hero-sub">Investigación cuantitativa propietaria sobre la prima de riesgo de volatilidad,
+      regímenes de mercado y señales cross-asset. Criterio sistemático, evidencia falsable, ejecución silenciosa.</p>
+    <div>
+      <a class="btn" href="contacto.html#acceso">Solicitar dosier institucional</a>
+      <a class="btn-quiet" href="metodologia.html">Conocer la metodología</a>
+    </div>
+  </div>
+  <div class="hero-data" aria-hidden="true">
+    <span>VIX <b data-tel="vix">16.42</b></span>
+    <span>VVIX <b data-tel="vvix">91.78</b></span>
+    <span>VRP <b data-tel="vrp">+3.42</b></span>
+    <span>M1–M2 <b data-tel="slope">+0.84</b></span>
+    <span>RÉGIMEN <b class="jade pulse">CALMA</b></span>
+    <span class="mono" data-clock>—:—:— UTC</span>
+  </div>
+</section>
+
+<!-- ============ TELEMETRÍA ============ -->
+<section class="telemetry" aria-label="Telemetría del sistema">
+  <div class="telemetry-track">
+    <span>VRP ACTUAL <b data-tel="vrp2">+3.42 pts</b></span>
+    <span>PERCENTIL VIX <b data-tel="pct">P 42</b></span>
+    <span>RÉGIMEN <b class="pulse">CALMA</b></span>
+    <span>PENDIENTE M1–M2 <b data-tel="slope2">+0.84</b></span>
+    <span>CORR CROSS-ASSET <b data-tel="corr">0.31</b></span>
+  </div>
+  <p class="telemetry-note">DATOS ILUSTRATIVOS · NO CONSTITUYEN RECOMENDACIÓN DE INVERSIÓN</p>
+</section>
+
+<!-- ============ TESIS ============ -->
+<section class="section" id="tesis">
+  <header class="sec-head reveal">
+    <p class="eyebrow"><span class="dim">SEC 01 /</span> TESIS</p>
+    <h2>El precio del <em>miedo</em></h2>
+  </header>
+  <div class="tesis-grid">
+    <div class="manifiesto reveal">
+      <p>La prima de riesgo de volatilidad es una de las anomalías más <em>persistentes</em> y documentadas de los mercados modernos.</p>
+      <p>Es la renta más antigua del mercado: quien vende protección contra el miedo cobra una prima <em>estructural</em>. La estudiamos con disciplina, no con audacia.</p>
+      <div class="principios">
+        <div><span class="roman">I</span><p><b>Proceso</b>sobre predicción</p></div>
+        <div><span class="roman">II</span><p><b>Convexidad</b>sobre apalancamiento</p></div>
+        <div><span class="roman">III</span><p><b>Evidencia</b>sobre narrativa</p></div>
+      </div>
+    </div>
+    <figure class="chart-fig reveal" style="--d:120ms">
+      <svg id="vrpChart" viewBox="0 0 560 300" role="img" aria-label="Volatilidad implícita frente a realizada, serie estilizada"></svg>
+      <figcaption class="chart-cap">
+        <span>PRIMA DE RIESGO DE VOLATILIDAD · SERIE ESTILIZADA</span>
+        <span class="k"><i style="background:var(--gold)"></i>IMPLÍCITA <i style="background:var(--ivory);opacity:.7;margin-left:1em"></i>REALIZADA</span>
+      </figcaption>
+    </figure>
+  </div>
+</section>
+
+<!-- ============ HUB ============ -->
+<section class="section section--tight" id="explorar">
+  <header class="sec-head reveal">
+    <p class="eyebrow"><span class="dim">SEC 02 /</span> EXPLORAR</p>
+    <h2>Tres formas de <em>entrar</em></h2>
+  </header>
+  <div class="hub">
+    <a href="metodologia.html" class="reveal" style="--d:0ms">
+      <span class="n">I — METODOLOGÍA</span>
+      <h3>Cómo investigamos</h3>
+      <p>Los tres instrumentos del sistema —VRP, regímenes y cross-asset— y el proceso auditable que va del dato a la decisión.</p>
+      <span class="go">Ver metodología <svg viewBox="0 0 18 8" aria-hidden="true"><path d="M0 4h16M13 1l3 3-3 3" stroke="currentColor" fill="none"/></svg></span>
+    </a>
+    <a href="modelos.html" class="reveal" style="--d:120ms">
+      <span class="n">II — MODELOS</span>
+      <h3>La sala de máquinas</h3>
+      <p>El monitor en vivo: estructura temporal del VIX, percentil de VRP, correlaciones cross-asset y la hoja de ruta de modelos.</p>
+      <span class="go">Ver modelos <svg viewBox="0 0 18 8" aria-hidden="true"><path d="M0 4h16M13 1l3 3-3 3" stroke="currentColor" fill="none"/></svg></span>
+    </a>
+    <a href="contacto.html" class="reveal" style="--d:240ms">
+      <span class="n">III — CONTACTO</span>
+      <h3>El especialista</h3>
+      <p>Quién está detrás del sistema y cómo iniciar una conversación institucional. El acceso se concede, no se anuncia.</p>
+      <span class="go">Solicitar acceso <svg viewBox="0 0 18 8" aria-hidden="true"><path d="M0 4h16M13 1l3 3-3 3" stroke="currentColor" fill="none"/></svg></span>
+    </a>
+  </div>
+</section>
+
+</main>
+
+<!-- ============ COLOFÓN ============ -->
+<footer>
+  <div class="foot-grid">
+    <p class="mono" style="font-size:10px;letter-spacing:.2em;color:var(--muted)">VOLTERRA · INVESTIGACIÓN CUANTITATIVA</p>
+    <nav class="foot-nav" aria-label="Pie de página">
+      <a href="index.html">Inicio</a>
+      <a href="metodologia.html">Metodología</a>
+      <a href="modelos.html">Modelos</a>
+      <a href="contacto.html">Contacto</a>
+    </nav>
+  </div>
+  <p class="foot-brand">VOLTERRA</p>
+  <p class="foot-year">MMXXVI</p>
+  <div class="foot-legal">
+    <p>VOLTERRA es una marca de investigación cuantitativa y posicionamiento. El contenido de este sitio tiene carácter
+    exclusivamente informativo y de presentación de marca: no constituye asesoramiento financiero, recomendación de
+    inversión, oferta ni solicitud de compra o venta de instrumento financiero alguno. Las métricas, los paneles y las
+    series de este sitio tienen carácter ilustrativo y están estilizados con fines de diseño.</p>
+    <p>La operativa con derivados de volatilidad implica riesgos significativos, incluida la pérdida del capital
+    invertido, y no resulta adecuada para todos los inversores. Rentabilidades pasadas no garantizan resultados
+    futuros. La información de este sitio se dirige exclusivamente a inversores profesionales y contrapartes
+    elegibles, conforme a la normativa aplicable.</p>
+  </div>
+  <p class="foot-tick" aria-hidden="true">
+    VIX <b data-tel="vix2">16.42</b> · VVIX <b data-tel="vvix2">91.78</b> · M1–M2 <b data-tel="slope3">+0.84</b>
+  </p>
+</footer>
+
+<script src="assets/app.js"></script>
+</body>
+</html>
