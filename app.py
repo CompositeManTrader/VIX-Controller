@@ -5204,9 +5204,187 @@ with tab1:
     </div>
     """, unsafe_allow_html=True)
 
+    # ═══════════════════════════════════════════════════════════
+    # PANEL DE DECISIÓN — ¿la curva favorece LONG VOL o SHORT VOL?
+    # Traduce la term structure a métricas operables:
+    #   · Percentil histórico del contango (¿el carry de hoy es rico o pobre?)
+    #   · Roll yield anualizado del M1 (el carry que cobra el short / paga el long)
+    #   · Basis VIX→M1 (descuento = el mercado espera vol YA)
+    #   · Checklist transparente → señal compuesta
+    # ═══════════════════════════════════════════════════════════
+    _dfh = load_master_parquet()
+
+    # Percentil del contango M1→M2 vs últimos 5 años
+    ct_pctile = None
+    if (front_ct is not None and not _dfh.empty
+            and 'Contango_pct' in _dfh.columns):
+        _hist_ct = _dfh['Contango_pct'].dropna().tail(1260)
+        if len(_hist_ct) > 200:
+            ct_pctile = float((_hist_ct < front_ct).mean() * 100)
+
+    # Roll yield anualizado del ETP: VXX/SVXY rollean DIARIAMENTE de M1 a M2,
+    # así que su carry es el contango M1→M2 normalizado por los días entre
+    # vencimientos (Simon & Campasano 2014). No usamos (M1−VIX)/DTE_M1
+    # porque con DTE chico la anualización explota (+300%/año a 6 días
+    # de expiración) y no representa el carry real del vehículo.
+    roll_ann = None
+    try:
+        _dte1 = float(m1_dte)
+        _dte2 = float(df_vx['DTE'].iloc[1]) if len(df_vx) > 1 else None
+        if front_ct is not None and _dte2 and _dte2 > _dte1:
+            roll_ann = front_ct * (365.0 / (_dte2 - _dte1))
+    except (TypeError, ValueError, KeyError, IndexError):
+        pass
+
+    # ── Checklist → señal compuesta ────────────────────────────
+    checks = []
+    if front_ct is not None:
+        checks.append(("Contango M1→M2 positivo", front_ct > 0,
+                       f"{front_ct:+.2f}%"))
+    if spot_m1 is not None:
+        checks.append(("Prima M1 sobre VIX (basis > 0)", spot_m1 > 0,
+                       f"{spot_m1:+.2f}%"))
+    if ct_pctile is not None:
+        checks.append(("Contango NO comprimido (percentil > 25)", ct_pctile > 25,
+                       f"p{ct_pctile:.0f} de 5 años"))
+    if vix_p is not None:
+        checks.append(("VIX bajo control (< 22)", vix_p < 22, f"{vix_p:.1f}"))
+
+    n_ok = sum(1 for _, ok, _ in checks if ok)
+    inverted = (front_ct is not None and front_ct < 0) or \
+               (spot_m1 is not None and spot_m1 < 0)
+
+    if inverted:
+        ts_sig, ts_clr = "LONG VOL", "var(--r)"
+        ts_desc = ("Curva invertida/estresada — el mercado paga por vol inmediata. "
+                   "El viento de cola del roll favorece VXX/UVXY; el short vol PIERDE el carry.")
+    elif len(checks) >= 3 and n_ok == len(checks):
+        ts_sig, ts_clr = "SHORT VOL", "var(--g)"
+        ts_desc = ("Contango sano con prima sobre spot — la convergencia del futuro "
+                   "hacia el VIX paga el carry al short vol (SVXY/SVIX).")
+    elif ct_pctile is not None and ct_pctile < 15:
+        ts_sig, ts_clr = "NEUTRAL", "var(--y)"
+        ts_desc = ("Contango comprimido (p<15) — el carry no compensa el riesgo de spike. "
+                   "Esperar mejor entrada o reducir tamaño.")
+    else:
+        ts_sig, ts_clr = "NEUTRAL", "var(--y)"
+        ts_desc = "Señales mixtas — sin edge claro de curva. Revisa Barómetro y VRP."
+
+    chk_html = "".join(
+        f'<div class="chk"><span class="{"ok" if ok else "no"}">'
+        f'{"✓" if ok else "✗"}</span> {name} '
+        f'<span style="margin-left:auto;color:var(--dim)">{val}</span></div>'
+        for name, ok, val in checks)
+
+    roll_html = ""
+    if roll_ann is not None:
+        _rc = "var(--g)" if roll_ann > 0 else "var(--r)"
+        roll_html = (f'<div class="ic-row"><span class="ic-label">Roll yield del ETP '
+                     f'(M1→M2 anualizado) — el carry que decae VXX</span>'
+                     f'<span class="ic-val" style="color:{_rc};font-weight:700">'
+                     f'{roll_ann:+.1f}%/año</span></div>')
+
+    pct_html = ""
+    if ct_pctile is not None:
+        _pc = "var(--g)" if 25 <= ct_pctile <= 90 else "var(--y)"
+        pct_html = (f'<div class="ic-row"><span class="ic-label">Percentil del contango '
+                    f'vs 5 años</span><span class="ic-val" style="color:{_pc}">'
+                    f'p{ct_pctile:.0f}</span></div>')
+
+    col_sig, col_chk = st.columns([1, 1.6])
+    with col_sig:
+        st.markdown(f"""<div class="icard" style="border-left:3px solid {ts_clr}">
+            <div class="ic-title">🧭 Lectura de la curva</div>
+            <div style="font-family:'Inter',sans-serif;font-weight:900;font-size:1.7rem;
+                        color:{ts_clr};text-align:center;padding:0.3rem 0">{ts_sig}</div>
+            <div style="font-family:'JetBrains Mono',monospace;font-size:0.7rem;
+                        color:var(--dim);line-height:1.5">{ts_desc}</div>
+        </div>""", unsafe_allow_html=True)
+    with col_chk:
+        st.markdown(f"""<div class="icard">
+            <div class="ic-title">✅ Checklist de curva ({n_ok}/{len(checks)})</div>
+            {chk_html}{roll_html}{pct_html}
+        </div>""", unsafe_allow_html=True)
+
+    # ── Curva de índices spot (VIX9D → VIX1Y) ──────────────────
+    # Complementa los futuros: las inversiones VIX9D/VIX aparecen ANTES
+    # de que la curva de futuros se invierta.
+    _ee_ts = fetch_edge_extra()
+    _spot_curve = []
+    for _k in ("VIX9D", "VIX", "VIX3M", "VIX6M", "VIX1Y"):
+        _s = _ee_ts.get(_k)
+        if _k == "VIX" and vix_p:
+            _spot_curve.append((_k, float(vix_p)))
+        elif _s is not None and not _s.empty and 'Close' in _s.columns \
+                and _s['Close'].notna().any():
+            _spot_curve.append((_k, float(_s['Close'].dropna().iloc[-1])))
+    if len(_spot_curve) >= 3:
+        _vals = dict(_spot_curve)
+        _r9d = _vals.get("VIX9D", np.nan) / _vals.get("VIX", np.nan) \
+            if _vals.get("VIX") else np.nan
+        _r3m = _vals.get("VIX", np.nan) / _vals.get("VIX3M", np.nan) \
+            if _vals.get("VIX3M") else np.nan
+        _pills = "".join(
+            f'<div class="mpill"><div class="ml">{k}</div>'
+            f'<div class="mv nt" style="font-size:1.05rem">{v:.2f}</div></div>'
+            for k, v in _spot_curve)
+        _c9 = "dn" if pd.notna(_r9d) and _r9d > 1 else "up"
+        _c3 = "dn" if pd.notna(_r3m) and _r3m > 1 else "up"
+        _pills += (f'<div class="mpill"><div class="ml">VIX9D/VIX · >1 = stress</div>'
+                   f'<div class="mv {_c9}" style="font-size:1.05rem">{_r9d:.3f}</div></div>'
+                   if pd.notna(_r9d) else "")
+        _pills += (f'<div class="mpill"><div class="ml">VIX/VIX3M · >1 = inversión</div>'
+                   f'<div class="mv {_c3}" style="font-size:1.05rem">{_r3m:.3f}</div></div>'
+                   if pd.notna(_r3m) else "")
+        st.markdown(f'<div class="mrow">{_pills}</div>', unsafe_allow_html=True)
+
     # Chart
     fig = build_term_chart(vix_spot, df_vx, show_prev=SHOW_PREV)
     st.plotly_chart(fig, width="stretch", config=dict(displayModeBar=True, displaylogo=False))
+
+    # ── Contexto histórico del contango (percentiles visuales) ──
+    if not _dfh.empty and 'Contango_pct' in _dfh.columns:
+        with st.expander("📊 Contango M1→M2 — contexto histórico (últimos 6 meses vs bandas de 5 años)"):
+            _cth = _dfh['Contango_pct'].dropna()
+            if len(_cth) > 300:
+                _win = _cth.tail(1260)
+                _p20, _p50, _p80 = _win.quantile([0.20, 0.50, 0.80])
+                _recent = _cth.tail(126)
+                _fig_ct = go.Figure()
+                _fig_ct.add_hrect(y0=float(_win.min()) - 1, y1=float(_p20),
+                                  fillcolor='rgba(248,81,73,0.07)', line_width=0)
+                _fig_ct.add_hrect(y0=float(_p80), y1=float(_win.max()) + 1,
+                                  fillcolor='rgba(63,185,80,0.07)', line_width=0)
+                for _lv, _nm in [(_p20, "p20"), (_p50, "p50"), (_p80, "p80")]:
+                    _fig_ct.add_hline(y=float(_lv), line_dash='dot',
+                                      line_color='#484F58', line_width=1,
+                                      annotation_text=_nm,
+                                      annotation_font=dict(size=9, color='#A0A8B0'))
+                _bar_clrs = ['#3FB950' if v > 0 else '#F85149' for v in _recent]
+                _fig_ct.add_trace(go.Bar(x=_recent.index, y=_recent.tolist(),
+                                         marker_color=_bar_clrs, opacity=0.8,
+                                         hovertemplate='%{x|%Y-%m-%d}<br>%{y:+.2f}%<extra></extra>'))
+                if front_ct is not None:
+                    _fig_ct.add_trace(go.Scatter(
+                        x=[_recent.index[-1]], y=[front_ct], mode='markers',
+                        marker=dict(size=13, color='#F7931A', symbol='diamond',
+                                    line=dict(width=2, color='white')),
+                        hovertemplate=f'HOY (CBOE live): {front_ct:+.2f}%<extra></extra>'))
+                _fig_ct.update_layout(
+                    template='plotly_dark', paper_bgcolor='#0D1117',
+                    plot_bgcolor='#161B22', height=280, showlegend=False,
+                    margin=dict(l=50, r=20, t=20, b=35), bargap=0,
+                    yaxis=dict(title=dict(text="Contango %",
+                               font=dict(size=10, color='#A0A8B0')),
+                               gridcolor='#21262D', ticksuffix='%'),
+                    xaxis=dict(gridcolor='#21262D'))
+                st.plotly_chart(_fig_ct, width="stretch",
+                                config=dict(displayModeBar=False))
+                st.caption(
+                    "Bandas p20/p50/p80 de los últimos 5 años. Contango sobre p80 = "
+                    "carry rico (entorno generoso para short vol) · bajo p20 = "
+                    "comprimido (el carry no paga el riesgo) · negativo = backwardation "
+                    "(terreno de long vol). 💎 = contango live de CBOE.")
 
     # Contango & Difference table (VIXCentral style)
     if len(df_vx) >= 2:
