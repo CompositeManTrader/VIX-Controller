@@ -119,3 +119,14 @@ SVI_RHO_MAX = 0.99               # rechaza fits con |rho| >= 0.99
 # Fuera de ±18% el OI/liquidez de SPY cae y la IV es ruido.
 SELL_MONEYNESS_LO = 0.82
 SELL_MONEYNESS_HI = 1.18
+
+# ──────────────────────────────────────────────────────────────
+# MODELO VIX INVERSE (externo, congelado 2026-08-03)
+# Vive en la Plataforma de Backtesting; esta app SOLO LO LEE.
+# ──────────────────────────────────────────────────────────────
+PLATAFORMA_RAIZ = (
+    r"C:\Users\PCB_FRONT\Desktop\Plataforma Backtesting Institucional - Alpha Vantage"
+)
+VIX_INVERSE_CURATED = PLATAFORMA_RAIZ + r"\data\curated"
+VIX_INVERSE_MODELO = PLATAFORMA_RAIZ + r"\modelos\vix_inverse"
+VIX_INVERSE_SCRIPT_REFRESCO = PLATAFORMA_RAIZ + r"\scripts\descargar_cboe_vix.py"

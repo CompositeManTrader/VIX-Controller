@@ -11,7 +11,7 @@ from plotly.subplots import make_subplots
 import yfinance as yf
 from datetime import datetime, timedelta, date
 from io import StringIO
-import re, time, warnings, logging, os
+import re, sys, time, warnings, logging, os
 from zoneinfo import ZoneInfo
 from scipy.optimize import brentq
 from scipy.stats import norm
@@ -29,6 +29,7 @@ from vix_controller.quant.svi import fit_svi_slice as _fit_svi_slice_mod
 from vix_controller.quant.vrp import compute_vrp_tracker
 from vix_controller.quant.regime import fit_volatility_regime
 from vix_controller.quant.cross_asset import compute_stress_signals
+from vix_controller.quant import vix_inverse as vinv
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO,
@@ -4421,6 +4422,108 @@ def build_vrp_chart(vrp_df: pd.DataFrame, days: int = 756) -> go.Figure:
     return fig
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# VIX INVERSE — gráficos del panel de seguimiento (modelo congelado)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@st.cache_data(ttl=cfg.CACHE_TTL["parquet"])
+def cargar_vix_inverse(raiz: str, peso: float) -> dict:
+    """Ejecuta el seguimiento del modelo congelado. Solo lectura."""
+    return vinv.ejecutar(raiz, peso=peso)
+
+
+def build_vinv_capital_chart(series: pd.DataFrame, k: float) -> go.Figure:
+    """
+    Curva de capital + underwater de las tres series.
+
+    La tercera —SPY apalancado a igual volatilidad— es la comparación
+    honesta: contra el SPY a secas el panel mentiría por omisión, porque
+    el sleeve toma más riesgo y cobrarse eso como mérito es trampa.
+    """
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True, row_heights=[0.62, 0.38],
+        vertical_spacing=0.06,
+        subplot_titles=("<b>Capital acumulado (base 1)</b>",
+                        "<b>Caída desde máximos</b>"))
+
+    estilos = [
+        ("cartera", f"Cartera con sleeve", "#39D2C0", 2.4),
+        ("spy_apalancado", f"SPY apalancado {vinv.num_es(k, 2)}x (misma volatilidad)",
+         "#F7931A", 1.9),
+        ("spy", "SPY a secas", "#8B949E", 1.4),
+    ]
+    for col, nombre, color, ancho in estilos:
+        eq = vinv.curva_capital(series[col])
+        fig.add_trace(go.Scatter(
+            x=eq.index, y=eq.tolist(), name=nombre, mode="lines",
+            line=dict(color=color, width=ancho,
+                      dash="dash" if col == "spy" else "solid"),
+            hovertemplate="%{x|%Y-%m-%d}<br>" + nombre + ": %{y:.3f}x<extra></extra>",
+        ), row=1, col=1)
+
+        uw = vinv.underwater(series[col]) * 100
+        fig.add_trace(go.Scatter(
+            x=uw.index, y=uw.tolist(), name=nombre, mode="lines",
+            showlegend=False,
+            line=dict(color=color, width=ancho * 0.7,
+                      dash="dash" if col == "spy" else "solid"),
+            hovertemplate="%{x|%Y-%m-%d}<br>" + nombre + ": %{y:.1f} %<extra></extra>",
+        ), row=2, col=1)
+
+    fig.add_hline(y=1.0, line_dash="dot", line_color="#484F58",
+                  line_width=1, row=1, col=1)
+    fig.add_hline(y=0.0, line_color="#484F58", line_width=1, row=2, col=1)
+
+    fig.update_layout(
+        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+        height=620, margin=dict(l=60, r=25, t=45, b=60), hovermode="x unified",
+        legend=dict(orientation="h", yanchor="top", y=-0.06, x=0.5,
+                    xanchor="center", bgcolor="rgba(0,0,0,0)",
+                    font=dict(size=10, color="#C9D1D9", family="JetBrains Mono")))
+    for ann in fig["layout"]["annotations"][:2]:
+        ann["font"] = dict(size=11, color="#A0A8B0", family="Inter")
+        ann["xanchor"] = "left"; ann["x"] = 0.01
+    fig.update_xaxes(gridcolor="#21262D",
+                     tickfont=dict(size=10, color="#A0A8B0", family="JetBrains Mono"))
+    fig.update_yaxes(gridcolor="#21262D",
+                     tickfont=dict(size=9.5, color="#A0A8B0", family="JetBrains Mono"))
+    # Log en el capital: 13 años de compuesto aplastan el tramo inicial en lineal
+    fig.update_yaxes(type="log", title=dict(text="capital (log)",
+                     font=dict(size=10, color="#A0A8B0")), row=1, col=1)
+    fig.update_yaxes(ticksuffix=" %", title=dict(text="caída",
+                     font=dict(size=10, color="#A0A8B0")), row=2, col=1)
+    return fig
+
+
+def build_vinv_ratios_chart(df: pd.DataFrame, dias: int = 180) -> go.Figure:
+    """Las dos medidas contra su umbral de 1,00 — es lo que avisa."""
+    p = df.tail(dias)
+    fig = go.Figure()
+    fig.add_hrect(y0=0.80, y1=1.0, fillcolor="rgba(248,81,73,0.07)", line_width=0)
+    for col, nombre, color in (("ratio_m2m1", "M2/M1 (futuros)", "#58A6FF"),
+                               ("ratio_vix3m", "VIX3M/VIX (índices)", "#BC8CFF")):
+        fig.add_trace(go.Scatter(
+            x=p.index, y=p[col].tolist(), name=nombre, mode="lines",
+            connectgaps=False,          # un hueco es un hueco: no se interpola
+            line=dict(color=color, width=2),
+            hovertemplate="%{x|%Y-%m-%d}<br>" + nombre + ": %{y:.4f}<extra></extra>"))
+    fig.add_hline(y=1.0, line_color="#F85149", line_width=1.5, line_dash="dash",
+                  annotation_text="  1,00 — por debajo, invertida",
+                  annotation_font=dict(size=10, color="#F85149"))
+    fig.update_layout(
+        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+        height=300, margin=dict(l=55, r=25, t=30, b=50), hovermode="x unified",
+        legend=dict(orientation="h", yanchor="top", y=-0.12, x=0.5,
+                    xanchor="center", bgcolor="rgba(0,0,0,0)",
+                    font=dict(size=10, color="#C9D1D9", family="JetBrains Mono")),
+        yaxis=dict(gridcolor="#21262D", title=dict(text="ratio",
+                   font=dict(size=10, color="#A0A8B0")),
+                   tickfont=dict(size=9.5, color="#A0A8B0")),
+        xaxis=dict(gridcolor="#21262D",
+                   tickfont=dict(size=10, color="#A0A8B0")))
+    return fig
+
+
 def build_vts_barometer_gauge(score: float, regime: str,
                                date_str: str = "") -> go.Figure:
     """
@@ -5160,9 +5263,11 @@ def fp(v):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # TABS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-tab1, tab2, tab_baro, tab_edge, tab_skew, tab_gex, tab3, tab4 = st.tabs([
+(tab1, tab2, tab_vinv, tab_baro, tab_edge, tab_skew, tab_gex,
+ tab3, tab4) = st.tabs([
     "📈  Term Structure",
     "🎯  Monitor Operativo",
+    "🔒  VIX Inverse",
     "🌡️  Barómetro VTS",
     "🔬  Edge Analytics",
     "📐  Vol Skew & Surface",
@@ -6755,6 +6860,428 @@ with tab_gex:
         f"Max Pain = mínima pérdida agregada de holders · "
         f"r={gex_rfr:.1%} q={gex_div:.1%} · {now_cdmx().strftime('%H:%M:%S')} CDMX"
     )
+
+
+# ━━━━━━━━━━━━━━━━━ TAB: VIX INVERSE (modelo congelado) ━━━━━━
+with tab_vinv:
+    _ne, _pe = vinv.num_es, vinv.pct_es
+
+    st.markdown(f"""<div style="font-family:'JetBrains Mono',monospace;
+        font-size:0.72rem;color:var(--dim);padding:0.4rem 0 0.8rem;">
+    <b>VIX Inverse</b> · modelo <b style="color:var(--accent)">CONGELADO</b> el
+    {vinv.FECHA_CONGELACION} · corto estático de VXX mientras haya contango,
+    fuera cuando <b>las dos</b> medidas se inviertan, ejecución en la
+    <b>apertura</b> del día siguiente · sleeve
+    {_ne(vinv.BANDA_PESO[0]*100, 0)}-{_ne(vinv.BANDA_PESO[1]*100, 0)} % de la
+    cartera, el resto SPY · este panel <b>sólo lo vigila</b>: no reoptimiza
+    nada.
+    </div>""", unsafe_allow_html=True)
+
+    _peso_vinv = st.select_slider(
+        "Peso del sleeve", options=[0.15, 0.16, 0.17, 0.18, 0.19, 0.20],
+        value=vinv.PESO_SLEEVE,
+        format_func=lambda x: f"{_ne(x*100, 0)} %"
+        + (" (cifras publicadas)" if x == 0.20 else "")
+        + (" (medio Kelly)" if x == 0.16 else ""),
+        help="La banda 15-20 % está fijada en el protocolo y resulta ser medio "
+             "Kelly. Las cifras publicadas del modelo se miden al 20 %.")
+
+    try:
+        _vres = cargar_vix_inverse(cfg.VIX_INVERSE_CURATED, _peso_vinv)
+        _vdiag = _vres["diagnostico"]
+        _vok = True
+    except vinv.DatosVixInverse as _e:
+        _vok = False
+        st.error(f"❌ **No se pudieron leer los datos del modelo.** {_e}")
+        st.info(f"Ruta esperada: `{cfg.VIX_INVERSE_CURATED}`")
+    except AssertionError as _e:
+        _vok = False
+        st.error(f"🚨 **FALLO DE ANTICIPACIÓN — el panel se detiene.** {_e}")
+
+    if _vok:
+        _est = _vres["estado"]
+        _mv, _msp = _vres["metricas_vivas"], _vres["metricas_spy"]
+        _mlev = _vres["metricas_apalancado"]
+
+        # ══════════════════════════════════════════════════════
+        # 1 · ESTADO DE HOY
+        # ══════════════════════════════════════════════════════
+        if _vdiag.obsoleto:
+            st.error(
+                f"⚠️ **DATO OBSOLETO — no operes con esta pantalla.** El último "
+                f"dato de curva es del **{_vdiag.ultima_fecha.strftime('%d/%m/%Y')}**, "
+                f"con **{_ne(_vdiag.dias_habiles_retraso, 0)} días hábiles** de "
+                f"retraso. La señal mostrada es la que correspondía a esa fecha.")
+        for _a in _vdiag.avisos:
+            st.warning(f"⚠️ {_a}")
+
+        _dentro = _est["dentro"]
+        _cls = "sig-long" if _dentro else "sig-cash"
+        _clr = "var(--g)" if _dentro else "var(--r)"
+        _txt = "DENTRO" if _dentro else "FUERA"
+        _sub = "corto de VXX" if _dentro else "sin posición"
+
+        _c1, _c2, _c3 = st.columns([1, 1.35, 1.35])
+        with _c1:
+            st.markdown(f"""<div class="sig-box {_cls}">
+                <div class="sl" style="color:{_clr}">{_txt}</div>
+                <div class="sd">{_sub}</div>
+                <div class="sd">dato del {_est['fecha_dato'].strftime('%d/%m/%Y')}</div>
+                <div class="sd">ejecutado en la apertura del
+                    {_est['fecha_ejecucion'].strftime('%d/%m/%Y')}</div>
+                <div class="sd" style="margin-top:6px;color:var(--t)">
+                    {_ne(_est['racha'], 0)} sesiones en esta posición</div>
+            </div>""", unsafe_allow_html=True)
+
+        with _c2:
+            # La distancia al 1,00 es lo que avisa: el 02/08/2024 el M2/M1
+            # seguía en 1,006 con el VIX3M/VIX ya en 0,998.
+            def _fila_ratio(nombre, val, dist, fuente):
+                if not np.isfinite(val):
+                    return (f'<div class="ic-row"><span class="ic-label">{nombre}'
+                            f'</span><span class="ic-val" style="color:var(--r)">'
+                            f'SIN DATO</span></div>')
+                _c = "var(--g)" if val > 1 else "var(--r)"
+                _e2 = "contango" if val > 1 else "INVERTIDA"
+                return (f'<div class="ic-row"><span class="ic-label">{nombre} '
+                        f'<span style="opacity:.6">· {fuente}</span></span>'
+                        f'<span class="ic-val"><b style="color:{_c}">{_ne(val, 4)}</b>'
+                        f' <span style="color:var(--dim)">({_ne(dist, 4, True)})</span>'
+                        f' <span style="color:{_c};font-size:0.7rem">{_e2}</span>'
+                        f'</span></div>')
+
+            st.markdown(f"""<div class="icard">
+                <div class="ic-title">📏 Las dos medidas y su distancia al 1,00</div>
+                {_fila_ratio("M2/M1", _est['ratio_m2m1'], _est['dist_m2m1'], "futuros")}
+                {_fila_ratio("VIX3M/VIX", _est['ratio_vix3m'], _est['dist_vix3m'], "índices")}
+                <div class="ic-row" style="margin-top:6px;border-top:1px solid var(--border);
+                    padding-top:6px"><span class="ic-label">Regla de salida</span>
+                    <span class="ic-val">fuera sólo si <b>las dos</b> &lt; 1,00</span></div>
+            </div>""", unsafe_allow_html=True)
+
+        with _c3:
+            _pd_ = _est["prox_dentro"]
+            _pc = "var(--y)" if _est["cambio_pendiente"] else "var(--dim)"
+            _ptxt = ("⚠️ CAMBIO PENDIENTE" if _est["cambio_pendiente"]
+                     else "sin cambios")
+            st.markdown(f"""<div class="icard"
+                style="border-left:3px solid {_pc}">
+                <div class="ic-title">⏭️ Próxima apertura</div>
+                <div class="ic-row"><span class="ic-label">Con el cierre del
+                    {_est['prox_fecha_dato'].strftime('%d/%m/%Y')}</span>
+                    <span class="ic-val" style="color:{'var(--g)' if _pd_ else 'var(--r)'};
+                    font-weight:700">{'DENTRO' if _pd_ else 'FUERA'}</span></div>
+                <div class="ic-row"><span class="ic-label">M2/M1</span>
+                    <span class="ic-val">{_ne(_est['prox_ratio_m2m1'], 4)}</span></div>
+                <div class="ic-row"><span class="ic-label">VIX3M/VIX</span>
+                    <span class="ic-val">{_ne(_est['prox_ratio_vix3m'], 4)}</span></div>
+                <div class="ic-row" style="margin-top:6px;border-top:1px solid var(--border);
+                    padding-top:6px"><span class="ic-label">Acción</span>
+                    <span class="ic-val" style="color:{_pc};font-weight:700">{_ptxt}</span></div>
+            </div>""", unsafe_allow_html=True)
+
+        st.plotly_chart(build_vinv_ratios_chart(_vres["df"]), width="stretch",
+                        config=dict(displayModeBar=False))
+
+        _c_fresh, _c_btn = st.columns([3, 1])
+        with _c_fresh:
+            _icono = "🔴" if _vdiag.obsoleto else "🟢"
+            st.caption(
+                f"{_icono} Último dato **{_vdiag.ultima_fecha.strftime('%d/%m/%Y')}** · "
+                f"{_ne(_vdiag.dias_habiles_retraso, 0)} días hábiles de retraso · "
+                f"{_ne(_vdiag.n_sesiones, 0)} sesiones desde "
+                f"{_vres['df'].index[0].strftime('%d/%m/%Y')} · "
+                f"origen: `data/curated` de la Plataforma (sólo lectura)")
+        with _c_btn:
+            if st.button("🔄 Descargar curva CBOE", key="btn_vinv_refresh",
+                         help="Ejecuta scripts/descargar_cboe_vix.py en la Plataforma"):
+                import subprocess
+                with st.spinner("Descargando de CBOE…"):
+                    try:
+                        _p = subprocess.run(
+                            [sys.executable, cfg.VIX_INVERSE_SCRIPT_REFRESCO],
+                            cwd=cfg.PLATAFORMA_RAIZ, capture_output=True,
+                            text=True, timeout=600)
+                        if _p.returncode == 0:
+                            st.success("✅ Curva actualizada.")
+                            cargar_vix_inverse.clear()
+                            st.rerun()
+                        else:
+                            st.error(f"El script falló (código {_p.returncode}).")
+                            st.code((_p.stderr or _p.stdout)[-1500:])
+                    except Exception as _ex:
+                        st.error(f"No se pudo ejecutar el script: {_ex}")
+
+        st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
+
+        # ══════════════════════════════════════════════════════
+        # 2 · CURVA DE CAPITAL
+        # ══════════════════════════════════════════════════════
+        st.markdown("#### 📈 Curva de capital y caídas")
+        st.markdown(f"""<div style="font-family:'JetBrains Mono',monospace;
+            font-size:0.72rem;color:var(--dim);padding:0 0 0.5rem;">
+        La comparación que importa es contra el <b style="color:var(--accent)">SPY
+        apalancado a la misma volatilidad</b> ({_ne(_vres['k'], 2)}x), no contra el
+        SPY a secas: el sleeve toma más riesgo, y apuntarse esa rentabilidad extra
+        como mérito sería mentir por omisión. La ventaja real es la
+        <b>asimetría</b> — a igual volatilidad, cae menos.
+        </div>""", unsafe_allow_html=True)
+
+        st.plotly_chart(build_vinv_capital_chart(_vres["series"], _vres["k"]),
+                        width="stretch",
+                        config=dict(displayModeBar=True, displaylogo=False))
+
+        # Ventaja = cuántos puntos MENOS cae la cartera que el SPY apalancado.
+        # Las caídas son negativas, así que se comparan en valor absoluto:
+        # positivo = la cartera cae menos = ventaja.
+        _vent = abs(_mlev["dd"]) - abs(_mv["dd"])
+        st.markdown(f"""<div class="mrow">
+            <div class="mpill"><div class="ml">Cartera · CAGR</div>
+                <div class="mv up">{_pe(_mv['cagr'])}</div></div>
+            <div class="mpill"><div class="ml">SPY {_ne(_vres['k'],2)}x · CAGR</div>
+                <div class="mv nt">{_pe(_mlev['cagr'])}</div></div>
+            <div class="mpill"><div class="ml">Cartera · peor caída</div>
+                <div class="mv up">{_pe(_mv['dd'])}</div></div>
+            <div class="mpill"><div class="ml">SPY {_ne(_vres['k'],2)}x · peor caída</div>
+                <div class="mv dn">{_pe(_mlev['dd'])}</div></div>
+            <div class="mpill"><div class="ml">Ventaja en caída</div>
+                <div class="mv {'up' if _vent > 0 else 'dn'}">
+                {_ne(_vent, 1, True)} pp<span style="font-size:0.6rem;
+                color:var(--dim);display:block">
+                {'cae menos' if _vent > 0 else 'cae más'}</span></div></div>
+        </div>""", unsafe_allow_html=True)
+
+        st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
+
+        # ══════════════════════════════════════════════════════
+        # 3 · REFERENCIAS DEL BACKTEST vs VIVO
+        # ══════════════════════════════════════════════════════
+        st.markdown("#### 📊 Backtest congelado frente a la serie viva")
+
+        st.warning(
+            "**Las dos columnas de referencia miden con motores distintos y no "
+            "son intercambiables.** La *canónica* es el corto estático con "
+            "ejecución en apertura — exactamente lo que describe la "
+            "especificación congelada y lo que calcula este panel. La del *motor "
+            "genérico* reequilibra a peso fijo; el propio README del modelo la "
+            "llama «cota inferior» y dice que «no reproduce» la canónica. "
+            "Comparar la serie viva contra la genérica produce una diferencia de "
+            "unos 3,7 puntos de volatilidad que **no es deriva: es método**. "
+            "Para vigilar deriva, mira la columna canónica.")
+
+        _ref_g, _ref_c = vinv.REF_MOTOR_GENERICO, vinv.REF_CANONICA
+
+        def _celda_dif(vivo, ref):
+            if ref is None or not np.isfinite(vivo):
+                return '<td style="color:var(--dim)">—</td>'
+            d = vivo - ref
+            c = "var(--dim)" if abs(d) < abs(ref) * 0.10 else "var(--y)"
+            return f'<td style="color:{c}">{_ne(d, 2, True)}</td>'
+
+        _filas_ref = [
+            ("CAGR", "%", _mv.get("cagr"), _ref_c["cagr"], _ref_g["cagr"]),
+            ("Volatilidad", "%", _mv.get("vol"), _ref_c["vol"], _ref_g["vol"]),
+            ("Sharpe", "", _mv.get("sharpe"), _ref_c["sharpe"], _ref_g["sharpe"]),
+            ("Peor caída", "%", _mv.get("dd"), _ref_c["dd"], _ref_g["dd"]),
+            ("Beta", "", _mv.get("beta"), None, _ref_g["beta"]),
+            ("Alfa anual", "%", _mv.get("alfa"), None, _ref_g["alfa"]),
+            ("Information ratio", "", _mv.get("ir"), None, _ref_g["ir"]),
+        ]
+        _html_ref = ""
+        for _n, _u, _viv, _rc, _rg in _filas_ref:
+            _dec = 3 if _u == "" else 2
+            _html_ref += (
+                f'<tr><td style="text-align:left;color:var(--t)">{_n}</td>'
+                f'<td style="font-weight:700;color:var(--w)">{_ne(_viv, _dec)}</td>'
+                f'<td>{_ne(_rc, _dec) if _rc is not None else "—"}</td>'
+                f'{_celda_dif(_viv, _rc) if _rc is not None else "<td>—</td>"}'
+                f'<td style="color:var(--dim)">{_ne(_rg, _dec)}</td></tr>')
+
+        st.markdown(f"""
+        <table class="dtbl">
+        <thead><tr>
+            <th style="text-align:left">Métrica</th>
+            <th>VIVO<br><span style="font-weight:400;text-transform:none">
+                desde {_vres['df'].index[0].strftime('%d/%m/%Y')}</span></th>
+            <th>Referencia<br><span style="font-weight:400;text-transform:none">
+                canónica</span></th>
+            <th>Deriva<br><span style="font-weight:400;text-transform:none">
+                vivo − canónica</span></th>
+            <th>Motor genérico<br><span style="font-weight:400;text-transform:none">
+                (cota inferior)</span></th>
+        </tr></thead>
+        <tbody>{_html_ref}</tbody></table>
+        """, unsafe_allow_html=True)
+
+        st.caption(
+            f"SPY en el mismo tramo: CAGR {_pe(_msp['cagr'])} (referencia "
+            f"{_pe(_ref_g['cagr_spy'])}) · peor caída {_pe(_msp['dd'])} "
+            f"(referencia {_pe(_ref_g['dd_spy'])}). "
+            f"El sleeve se mide al {_ne(_peso_vinv*100, 0)} % de la cartera; "
+            f"las cifras publicadas del modelo son al 20 %.")
+
+        with st.expander("📐 Por qué el apalancamiento equivalente no es 1,34x"):
+            st.markdown(f"""
+El documento del modelo publica la comparación contra un **SPY apalancado
+1,34x**, con una ventaja de **{_ne(vinv.REF_APALANCADO['ventaja_dd_pp'], 1)}
+puntos** menos de caída. Ese 1,34 sale de dividir la volatilidad del **motor
+genérico** ({_ne(_ref_g['vol'], 2)} %) entre la del SPY
+({_ne(_ref_g['vol_spy'], 1)} %).
+
+Este panel calcula la serie por el método **canónico**, cuya volatilidad es
+{_ne(_mv['vol'], 2)} %. Igualar volatilidad con esa serie exige
+**{_ne(_vres['k'], 3)}x**, y la ventaja en caída resulta de
+**{_ne(_vent, 1)} puntos**.
+
+Fijar 1,34x aquí compararía la cartera contra un SPY **más volátil que ella**,
+lo que inflaría artificialmente la ventaja. Por eso el apalancamiento se calcula
+en vivo: la comparación sólo es honesta si las dos series tienen de verdad la
+misma volatilidad.
+
+La conclusión cualitativa no cambia —a igual volatilidad, el sleeve cae
+menos— pero **la magnitud publicada corresponde a otro motor de medición**.
+            """)
+
+        st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
+
+        # ══════════════════════════════════════════════════════
+        # 4 · TABLA DE OPERACIONES
+        # ══════════════════════════════════════════════════════
+        _ops = _vres["operaciones"]
+        _cerr = [o for o in _ops if not o["abierta"]]
+        _gan = [o for o in _cerr if o["ret"] > 0]
+        _win = len(_gan) / len(_cerr) * 100 if _cerr else np.nan
+        _dur = np.median([o["dias"] for o in _cerr]) if _cerr else np.nan
+
+        st.markdown("#### 📋 Operaciones")
+        st.markdown(f"""<div class="mrow">
+            <div class="mpill"><div class="ml">Operaciones</div>
+                <div class="mv nt">{_ne(len(_ops), 0)}</div></div>
+            <div class="mpill"><div class="ml">Cerradas</div>
+                <div class="mv nt">{_ne(len(_cerr), 0)}</div></div>
+            <div class="mpill"><div class="ml">% ganadoras</div>
+                <div class="mv {'up' if _win >= 50 else 'dn'}">{_pe(_win, 1, False)}</div></div>
+            <div class="mpill"><div class="ml">Duración mediana</div>
+                <div class="mv nt">{_ne(_dur, 0)} sesiones</div></div>
+            <div class="mpill"><div class="ml">Operación media</div>
+                <div class="mv nt">{_pe(np.mean([o['ret'] for o in _cerr])*100 if _cerr else np.nan)}</div></div>
+        </div>""", unsafe_allow_html=True)
+
+        _n_ver = st.slider("Operaciones a mostrar (de la más reciente)",
+                           10, max(len(_ops), 10), min(25, len(_ops)),
+                           key="sl_vinv_ops")
+        _rows = ""
+        for _o in list(reversed(_ops))[:_n_ver]:
+            _neg = _o["ret"] <= 0
+            _bg = "background:rgba(248,81,73,0.10);" if _neg else ""
+            _rc2 = "var(--r)" if _neg else "var(--g)"
+            _fsal = (_o["f_salida"].strftime("%d/%m/%Y") if _o["f_salida"]
+                     else '<b style="color:var(--y)">ABIERTA</b>')
+            _psal = _ne(_o["px_salida"], 2) if _o["px_salida"] is not None else "—"
+            _rows += (
+                f'<tr style="{_bg}">'
+                f'<td>{_o["f_entrada"].strftime("%d/%m/%Y")}</td>'
+                f'<td>{_fsal}</td>'
+                f'<td>{_ne(_o["px_entrada"], 2)}</td>'
+                f'<td>{_psal}</td>'
+                f'<td>{_ne(_o["dias"], 0)}</td>'
+                f'<td style="color:{_rc2};font-weight:700">'
+                f'{_ne(_o["ret"]*100, 2, True)} %</td></tr>')
+
+        st.markdown(f"""
+        <table class="dtbl">
+        <thead><tr><th>Entrada</th><th>Salida</th><th>Apertura entrada</th>
+        <th>Apertura salida</th><th>Sesiones</th><th>Retorno del tramo</th>
+        </tr></thead><tbody>{_rows}</tbody></table>
+        """, unsafe_allow_html=True)
+        st.caption(
+            "Precios de **apertura**, que es donde se ejecuta. El retorno es el "
+            "**neto** del sleeve (compuesto de los rendimientos diarios, ya con "
+            f"préstamo al {_ne(vinv.PRESTAMO_ANUAL*100, 0)} % y coste de "
+            f"{_ne(vinv.COMISION_BPS, 0)} pb de comisión + "
+            f"{_ne(vinv.DESLIZAMIENTO_BPS, 0)} pb de deslizamiento), no "
+            "`entrada/salida − 1`: el bruto del precio exagera cada operación y "
+            "más cuanto más dure. En rojo, los tramos que perdieron.")
+
+        st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
+
+        # ══════════════════════════════════════════════════════
+        # 5 · LO QUE HAY QUE ENTENDER ANTES DE OPERARLO
+        # ══════════════════════════════════════════════════════
+        _e5 = vinv.ESTADO
+        st.markdown(f"""<div class="icard" style="border-left:3px solid var(--y)">
+        <div class="ic-title">⚠️ Qué es y qué no es este modelo</div>
+
+<div style="font-family:'Inter',sans-serif;font-size:0.84rem;color:var(--t);
+line-height:1.65">
+
+<p><b>No mejora el Sharpe.</b> Da más rentabilidad con proporcionalmente más
+riesgo. Su ventaja es que la volatilidad es <b>asimétrica</b> —más arriba, menos
+abajo— y por eso, a igual volatilidad, cae menos que el SPY apalancado. El
+Sharpe castiga las dos colas por igual y no lo ve: por eso hay que mirar la
+curva de caídas, no el Sharpe.</p>
+
+<p><b>No está formalmente validado.</b> La razón no es la calidad del análisis,
+es el tamaño efectivo de muestra: <b>{_ne(_e5['episodios'], 0)} episodios en
+{_ne(_e5['anios'], 0)} años</b>. El Sharpe deflactado del retorno activo sale
+{_pe(_e5['dsr_modelo']*100, 1, False)} contra el
+{_pe(_e5['dsr_umbral']*100, 0, False)} que pide la casa: se queda a las puertas.
+El Monte Carlo por bloques da <b>{_pe(_e5['prob_batir_spy']*100, 1, False)}</b>
+de probabilidad de batir al SPY, por debajo del
+{_pe(_e5['prob_umbral']*100, 0, False)} que la tesis fijó de antemano como
+criterio de muerte. <b>Ese criterio falló contra la vara que tenía delante y no
+se reinterpreta.</b></p>
+
+<p><b>El peso es deliberadamente menor que el óptimo.</b> El óptimo de la
+muestra es {_pe(_e5['kelly_completo']*100, 1, False)} (Kelly completo); el
+recomendado es {_ne(vinv.BANDA_PESO[0]*100, 0)}-{_ne(vinv.BANDA_PESO[1]*100, 0)} %,
+que resulta ser <b>medio Kelly</b> ({_pe(_e5['kelly_medio']*100, 1, False)}).
+Kelly supone conocida la distribución, y con {_ne(_e5['episodios'], 0)} eventos
+de cola esa suposición es justo la que falla. El óptimo siempre está
+sobreajustado.</p>
+
+<p><b>La señal está congelada a propósito.</b> Se probaron
+{_ne(_e5['n_pruebas'], 0)} configuraciones —stops, take-profits, Bollinger,
+apalancamiento variable, reoptimización— y <b>todas restan</b>. Añadir
+cualquiera de ellas a este panel sería deshacer el resultado del trabajo, no
+mejorarlo.</p>
+
+<p><b>La pérdida de un corto no tiene tope teórico.</b> El peor día visto fue un
++39 % del VXX en una sesión. No hay stop loss y es deliberado: se midió y resta.
+El control del riesgo aquí es el <b>tamaño</b>, no el stop.</p>
+
+</div></div>""", unsafe_allow_html=True)
+
+        with st.expander("🛑 Condiciones de parada del protocolo"):
+            st.markdown("""
+Fijadas **en frío**, con umbrales fuera de lo visto en trece años. Una condición
+dispara **revisión inmediata**; dos a la vez, **apagado**.
+
+| condición | umbral | histórico |
+|---|---|---|
+| La curva deja de pagar | < 55 % de días en contango en 12 meses | 85 % de media, peor año 64 % |
+| Los sustos se vuelven frecuentes | ≥ 3 episodios en 24 meses (VXX +40 % en 5 sesiones) | máximo visto: 2 |
+| La señal pierde su ventaja | Sharpe sobre siempre-corto < −0,50 durante 6 meses | ya es negativa el 35 % del tiempo |
+| Daño acumulado | caída del sleeve > 45 % | peor visto −26,2 % |
+| **Riesgo de producto** | VXX suspende emisiones · cambia de emisor · prima/descuento > 2 % sobre NAV · el bróker restringe el corto | **apagado inmediato, sin discusión** |
+
+Ninguna vigila el rendimiento, y es a propósito: se probó el CUSUM de Page
+calibrado por ARL y **se midió que no sirve** — o salta cada dos por tres, o
+tarda entre cuatro y doce años en avisar. Todas las condiciones son
+**estructurales**: miran cosas que se ven el día que pasan.
+
+> El riesgo de producto no está en el backtest y **ha ocurrido en el mundo
+> real**: VXX es un ETN, no un ETF (llevas riesgo de crédito del emisor);
+> Barclays suspendió emisiones de varios ETN en enero de 2019 y el XIV se
+> liquidó en un solo día en febrero de 2018.
+            """)
+
+        st.caption(
+            f"Especificación congelada el {vinv.FECHA_CONGELACION} · señal "
+            f"`(ratio_m2m1 > 1) OR (ratio_vix3m > 1)` con el cierre de t−1, "
+            f"ejecutada en la apertura de t · `ratio_m2m1` es **M2/M1** "
+            f"(contango = M2 > M1) · verificado sin anticipación en cada carga · "
+            f"datos de la Plataforma en sólo lectura · no es asesoramiento financiero.")
 
 
 # ━━━━━━━━━━━━━━━━━ TAB: BARÓMETRO VTS ━━━━━━━━━━━━━━━━━━━━━━
