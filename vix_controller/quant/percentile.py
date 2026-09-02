@@ -1,6 +1,10 @@
 """
 percentile.py — Rolling percentile con soporte mínimo configurable.
-Extraído de app.py::_rolling_percentile para que sea testeable sin Streamlit.
+
+Vectorizado con `rolling().rank(method="max", pct=True)`: para cada día,
+fracción de valores válidos de la ventana trailing que son <= al actual.
+Es exactamente lo que hacía el loop original en Python (que era O(n·window)
+y dominaba el tiempo del Barómetro: 13 indicadores × ~8.000 filas).
 """
 from __future__ import annotations
 import numpy as np
@@ -12,10 +16,13 @@ from ..config import VTS_ROLLING_WINDOW, VTS_MIN_OBS_FLOOR, VTS_MIN_OBS_RATIO
 def rolling_percentile(s: pd.Series, window: int = VTS_ROLLING_WINDOW,
                        min_obs: int | None = None) -> pd.Series:
     """
-    Percentil del último valor vs la ventana histórica. Devuelve 0-100.
+    Percentil del último valor vs la ventana histórica trailing. Devuelve 0-100.
 
     min_obs: observaciones válidas mínimas en la ventana.
     Por default max(VTS_MIN_OBS_FLOOR, window * VTS_MIN_OBS_RATIO).
+
+    Robusto a NaN: un NaN en la entrada produce NaN en la salida y no cuenta
+    como observación válida de la ventana.
     """
     if s is None or s.empty:
         return pd.Series(dtype=float)
@@ -23,19 +30,12 @@ def rolling_percentile(s: pd.Series, window: int = VTS_ROLLING_WINDOW,
     if min_obs is None:
         min_obs = max(VTS_MIN_OBS_FLOOR, int(window * VTS_MIN_OBS_RATIO))
 
-    arr = s.to_numpy(dtype=float)
-    n = len(arr)
-    out = np.full(n, np.nan, dtype=float)
-
-    for i in range(min_obs - 1, n):
-        start = max(0, i - window + 1)
-        window_vals = arr[start:i + 1]
-        cur = arr[i]
-        if np.isnan(cur):
-            continue
-        valid = window_vals[~np.isnan(window_vals)]
-        if len(valid) < min_obs:
-            continue
-        out[i] = (valid <= cur).mean() * 100.0
-
-    return pd.Series(out, index=s.index)
+    x = s.astype(float)
+    # Con ventana menor que el soporte mínimo nunca hay obs suficientes:
+    # el loop original devolvía todo NaN (pandas lanzaría ValueError).
+    if window < min_obs:
+        return pd.Series(np.nan, index=s.index, dtype=float)
+    # method="max": los empates reciben el rango máximo → (valid <= cur).mean()
+    out = x.rolling(window, min_periods=min_obs).rank(method="max", pct=True) * 100.0
+    out.name = None
+    return out

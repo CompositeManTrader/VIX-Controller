@@ -5,7 +5,35 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from vix_controller.quant.signals import bb_contango_signal
+from vix_controller.quant.signals import bb_contango_signal, bb_position_state
+
+
+def _reference_state(px, sma, upper):
+    """Máquina de estados original con .iloc, conservada como oráculo."""
+    out, pos = [], 0
+    for p, s, u in zip(px, sma, upper):
+        if np.isnan(p) or np.isnan(s) or np.isnan(u):
+            out.append(pos); continue
+        if pos == 0 and p < s:
+            pos = 1
+        elif pos == 1 and p > u:
+            pos = 0
+        out.append(pos)
+    return np.array(out)
+
+
+class TestStateMachineParity:
+    @pytest.mark.parametrize("seed", [0, 7, 42])
+    def test_numpy_matches_reference(self, seed):
+        rng = np.random.default_rng(seed)
+        n = 2000
+        px = 30 + np.cumsum(rng.normal(0, 0.8, n))
+        px[rng.random(n) < 0.02] = np.nan
+        s = pd.Series(px)
+        sma = s.rolling(20).mean().to_numpy()
+        upper = (sma + 2 * s.rolling(20).std().to_numpy())
+        np.testing.assert_array_equal(bb_position_state(px, sma, upper),
+                                      _reference_state(px, sma, upper))
 
 
 @pytest.fixture

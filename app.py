@@ -30,6 +30,9 @@ from vix_controller.quant.vrp import compute_vrp_tracker
 from vix_controller.quant.regime import fit_volatility_regime
 from vix_controller.quant.cross_asset import compute_stress_signals
 from vix_controller.quant import vix_inverse as vinv
+from vix_controller.quant import term_structure as tsig
+from vix_controller.quant.percentile import rolling_percentile as _rolling_percentile_mod
+from vix_controller.quant.signals import bb_position_state
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO,
@@ -83,118 +86,97 @@ pw_ready = check_playwright_installed()
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Inter:wght@400;500;600;700;800;900&display=swap');
-:root{--bg:#0D1117;--card:#161B22;--card2:#1A2129;--border:#30363D;--g:#3FB950;--r:#F85149;--y:#D29922;--b:#58A6FF;--c:#39D2C0;--t:#C9D1D9;--dim:#A0A8B0;--w:#F0F6FC;--gbg:#0B2E13;--rbg:#3B1218;--thead:#1C2128;--grid:#21262D;--zero:#484F58;--accent:#F7931A;--accent2:#FF6B35;--purple:#BC8CFF;
---shadow:0 8px 28px rgba(0,0,0,0.45),0 1px 0 rgba(255,255,255,0.04) inset;
---shadow-sm:0 3px 12px rgba(0,0,0,0.35),0 1px 0 rgba(255,255,255,0.03) inset;}
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700;800&display=swap');
+:root{--bg:#0B0F14;--card:#11161D;--card2:#151B23;--border:#232B35;--g:#2EA043;--r:#E5484D;--y:#D4A72C;--b:#6CA0DC;--c:#4FB3A9;--t:#D7DEE7;--dim:#8B96A5;--w:#F5F7FA;--gbg:#0E1F14;--rbg:#2A1215;--thead:#151B23;--grid:#1B222B;--zero:#3A4552;--accent:#C9A227;--accent2:#E0B94A;--purple:#A78BFA;
+--shadow:0 1px 2px rgba(0,0,0,0.35),0 8px 24px rgba(0,0,0,0.25);
+--shadow-sm:0 1px 2px rgba(0,0,0,0.30);}
 
-/* Fondo con profundidad (gradiente radial sutil) */
-.stApp{background:radial-gradient(1100px 600px at 15% -8%, #141B26 0%, var(--bg) 50%),
-                  radial-gradient(900px 500px at 100% 0%, #16121E 0%, var(--bg) 45%);
-       background-color:var(--bg);}
+/* Base: plano, sobrio, sin gradientes ni brillos */
+.stApp{background:var(--bg);}
 #MainMenu,footer,header{visibility:hidden;}
-.block-container{padding:0.5rem 1.5rem 2rem;max-width:1440px;}
-@keyframes pulse{0%,100%{opacity:1;box-shadow:0 0 0 0 rgba(63,185,80,0.5);}50%{opacity:0.75;box-shadow:0 0 0 5px rgba(63,185,80,0);}}
-@keyframes fadeUp{from{opacity:0;transform:translateY(6px);}to{opacity:1;transform:none;}}
-.hr{border:none;border-top:1px solid var(--border);margin:1rem 0;}
+.block-container{padding:0.6rem 1.75rem 2.5rem;max-width:1440px;}
+@keyframes fadeIn{from{opacity:0;}to{opacity:1;}}
+.hr{border:none;border-top:1px solid var(--border);margin:1.1rem 0;}
+h4{font-family:'Inter',sans-serif;font-weight:600;letter-spacing:0.2px;color:var(--w);}
 
-/* HEADER - barra con glow y dot live */
-.hdr{display:flex;align-items:center;padding:0.7rem 1.1rem;gap:1rem;margin-bottom:0.9rem;
-     background:linear-gradient(180deg,rgba(26,33,41,0.9),rgba(22,27,34,0.75));
-     border:1px solid var(--border);border-radius:12px;box-shadow:var(--shadow);
-     animation:fadeUp .35s ease;}
-.hdr .logo-box{display:flex;align-items:center;gap:0.7rem;}
-.hdr .logo-icon{width:38px;height:38px;background:linear-gradient(135deg,var(--accent),var(--accent2));
-     border-radius:9px;display:flex;align-items:center;justify-content:center;font-weight:900;
-     font-size:16px;color:#0D1117;font-family:'Inter',sans-serif;letter-spacing:-0.5px;
-     box-shadow:0 0 18px rgba(247,147,26,0.35);}
-.hdr .logo-text{font-family:'Inter',sans-serif;font-weight:800;font-size:1.2rem;letter-spacing:1px;
-     background:linear-gradient(90deg,var(--w) 60%,var(--accent));
-     -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;}
-.hdr .logo-tag{font-family:'JetBrains Mono',monospace;font-size:0.6rem;color:var(--accent);letter-spacing:2px;text-transform:uppercase;margin-top:1px;opacity:0.9;}
-.hdr .sub{font-family:'JetBrains Mono',monospace;font-size:0.7rem;color:var(--dim);margin-left:auto;text-align:right;line-height:1.5;}
-.live-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--g);margin-right:5px;animation:pulse 2s infinite;vertical-align:1px;}
-.dead-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--zero);margin-right:5px;vertical-align:1px;}
+/* HEADER — barra editorial con línea inferior */
+.hdr{display:flex;align-items:center;padding:0.9rem 0 0.8rem;gap:1rem;margin-bottom:1rem;
+     border-bottom:1px solid var(--border);animation:fadeIn .3s ease;}
+.hdr .logo-box{display:flex;align-items:center;gap:0.8rem;}
+.hdr .logo-icon{width:36px;height:36px;background:var(--accent);border-radius:6px;display:flex;
+     align-items:center;justify-content:center;font-weight:800;font-size:15px;color:#0B0F14;
+     font-family:'Inter',sans-serif;letter-spacing:-0.5px;}
+.hdr .logo-text{font-family:'Inter',sans-serif;font-weight:700;font-size:1.15rem;letter-spacing:1.5px;color:var(--w);}
+.hdr .logo-tag{font-family:'IBM Plex Mono',monospace;font-size:0.6rem;color:var(--accent);letter-spacing:2.5px;text-transform:uppercase;margin-top:2px;}
+.hdr .sub{font-family:'IBM Plex Mono',monospace;font-size:0.7rem;color:var(--dim);margin-left:auto;text-align:right;line-height:1.6;}
+.live-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--g);margin-right:6px;vertical-align:1px;}
+.dead-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--zero);margin-right:6px;vertical-align:1px;}
 
-/* STATUS STRIP global (command center) */
-.statusbar{display:flex;gap:0;margin-bottom:0.9rem;background:var(--card);
-     border:1px solid var(--border);border-radius:10px;overflow:hidden;box-shadow:var(--shadow-sm);
-     animation:fadeUp .4s ease;flex-wrap:wrap;}
-.statusbar .sb-item{flex:1;min-width:110px;padding:0.55rem 0.9rem;text-align:center;border-right:1px solid var(--border);}
+/* STATUS STRIP */
+.statusbar{display:flex;gap:0;margin-bottom:1rem;background:var(--card);border:1px solid var(--border);
+     border-radius:8px;overflow:hidden;box-shadow:var(--shadow-sm);flex-wrap:wrap;}
+.statusbar .sb-item{flex:1;min-width:110px;padding:0.6rem 0.9rem;text-align:center;border-right:1px solid var(--border);}
 .statusbar .sb-item:last-child{border-right:none;}
-.statusbar .sb-l{font-family:'JetBrains Mono',monospace;font-size:0.6rem;color:var(--dim);text-transform:uppercase;letter-spacing:1px;}
-.statusbar .sb-v{font-family:'Inter',sans-serif;font-weight:800;font-size:1.05rem;font-variant-numeric:tabular-nums;margin-top:1px;}
+.statusbar .sb-l{font-family:'IBM Plex Mono',monospace;font-size:0.6rem;color:var(--dim);text-transform:uppercase;letter-spacing:1.4px;}
+.statusbar .sb-v{font-family:'Inter',sans-serif;font-weight:700;font-size:1.05rem;font-variant-numeric:tabular-nums;margin-top:2px;}
 
-/* METRIC PILLS - cards con hover lift y acento */
-.mrow{display:flex;gap:8px;margin-bottom:0.8rem;flex-wrap:wrap;}
-.mpill{background:linear-gradient(180deg,var(--card2),var(--card));border:1px solid var(--border);
-     border-radius:10px;padding:0.55rem 0.8rem;flex:1;min-width:125px;text-align:center;
-     box-shadow:var(--shadow-sm);transition:transform .15s ease,border-color .15s ease;position:relative;overflow:hidden;}
-.mpill::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;
-     background:linear-gradient(90deg,transparent,rgba(247,147,26,0.5),transparent);opacity:0;transition:opacity .2s;}
-.mpill:hover{transform:translateY(-2px);border-color:var(--zero);}
-.mpill:hover::before{opacity:1;}
-.mpill .ml{font-family:'JetBrains Mono',monospace;font-size:0.62rem;color:var(--dim);text-transform:uppercase;letter-spacing:1px;}
-.mpill .mv{font-family:'Inter',sans-serif;font-weight:800;font-size:1.3rem;font-variant-numeric:tabular-nums;margin-top:1px;}
-.mv.up{color:var(--g);text-shadow:0 0 14px rgba(63,185,80,0.3);}
-.mv.dn{color:var(--r);text-shadow:0 0 14px rgba(248,81,73,0.3);}
-.mv.nt{color:var(--b);}
+/* METRIC PILLS — planas, jerarquía por tipografía */
+.mrow{display:flex;gap:8px;margin-bottom:0.9rem;flex-wrap:wrap;}
+.mpill{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:0.6rem 0.85rem;flex:1;
+     min-width:125px;text-align:center;box-shadow:var(--shadow-sm);transition:border-color .15s ease;}
+.mpill:hover{border-color:var(--zero);}
+.mpill .ml{font-family:'IBM Plex Mono',monospace;font-size:0.6rem;color:var(--dim);text-transform:uppercase;letter-spacing:1.4px;}
+.mpill .mv{font-family:'Inter',sans-serif;font-weight:700;font-size:1.3rem;font-variant-numeric:tabular-nums;margin-top:2px;color:var(--w);}
+.mv.up{color:var(--g);}.mv.dn{color:var(--r);}.mv.nt{color:var(--b);}
 
 /* Tablas */
-.ctx{width:100%;border-collapse:separate;border-spacing:0;font-family:'JetBrains Mono',monospace;font-size:0.78rem;margin:0.4rem 0;border:1px solid var(--border);border-radius:8px;overflow:hidden;}
-.ctx td,.ctx th{padding:0.4rem 0.55rem;text-align:center;border-bottom:1px solid var(--grid);border-right:1px solid var(--grid);}
+.ctx{width:100%;border-collapse:separate;border-spacing:0;font-family:'IBM Plex Mono',monospace;font-size:0.78rem;margin:0.4rem 0;border:1px solid var(--border);border-radius:8px;overflow:hidden;}
+.ctx td,.ctx th{padding:0.42rem 0.55rem;text-align:center;border-bottom:1px solid var(--grid);border-right:1px solid var(--grid);}
 .ctx tr:last-child td{border-bottom:none;}
 .ctx td:last-child,.ctx th:last-child{border-right:none;}
-.ctx th{background:var(--thead);color:var(--dim);font-weight:600;font-size:0.7rem;text-transform:uppercase;letter-spacing:0.5px;}
+.ctx th{background:var(--thead);color:var(--dim);font-weight:600;font-size:0.68rem;text-transform:uppercase;letter-spacing:1px;}
 .ctx .pos{color:var(--g);}.ctx .neg{color:var(--r);}
 .ctx .hdr-cell{background:var(--card);color:var(--t);font-weight:600;text-align:left;width:120px;}
-.ctx tbody tr:nth-child(even) td{background:rgba(255,255,255,0.015);}
-.dtbl{width:100%;border-collapse:collapse;font-family:'JetBrains Mono',monospace;font-size:0.75rem;margin-top:0.5rem;}
-.dtbl th{color:var(--b);font-weight:600;padding:0.45rem 0.6rem;border-bottom:1px solid var(--border);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.8px;text-align:center;background:rgba(88,166,255,0.04);}
-.dtbl td{padding:0.4rem 0.6rem;text-align:center;color:var(--t);border-bottom:1px solid rgba(255,255,255,0.04);font-variant-numeric:tabular-nums;}
-.dtbl tbody tr:nth-child(even) td{background:rgba(255,255,255,0.015);}
-.dtbl tr:hover td{background:rgba(88,166,255,0.07);}
+.ctx tbody tr:nth-child(even) td{background:rgba(255,255,255,0.012);}
+.dtbl{width:100%;border-collapse:collapse;font-family:'IBM Plex Mono',monospace;font-size:0.76rem;margin-top:0.5rem;}
+.dtbl th{color:var(--dim);font-weight:600;padding:0.5rem 0.6rem;border-bottom:1px solid var(--border);font-size:0.66rem;text-transform:uppercase;letter-spacing:1.2px;text-align:center;}
+.dtbl td{padding:0.42rem 0.6rem;text-align:center;color:var(--t);border-bottom:1px solid rgba(255,255,255,0.05);font-variant-numeric:tabular-nums;}
+.dtbl tr:hover td{background:rgba(201,162,39,0.05);}
 
-/* Signal boxes con glow */
-.sig-box{border-radius:12px;padding:1.1rem;text-align:center;border-width:1px;border-style:solid;box-shadow:var(--shadow);}
-.sig-long{background:linear-gradient(180deg,rgba(63,185,80,0.14),var(--gbg));border-color:rgba(63,185,80,0.55);box-shadow:0 0 32px rgba(63,185,80,0.12),var(--shadow-sm);}
-.sig-cash{background:linear-gradient(180deg,rgba(248,81,73,0.13),var(--rbg));border-color:rgba(248,81,73,0.55);box-shadow:0 0 32px rgba(248,81,73,0.10),var(--shadow-sm);}
-.sig-box .sl{font-family:'Inter',sans-serif;font-weight:900;font-size:2.2rem;letter-spacing:1px;}
-.sig-box .sd{font-family:'JetBrains Mono',monospace;font-size:0.7rem;color:var(--dim);margin-top:3px;}
-.chk{display:flex;align-items:center;gap:0.5rem;padding:0.3rem 0;font-family:'JetBrains Mono',monospace;font-size:0.82rem;color:var(--t);}
+/* Signal boxes — color por significado, sin glow */
+.sig-box{border-radius:10px;padding:1.2rem 1rem;text-align:center;border:1px solid var(--border);box-shadow:var(--shadow-sm);}
+.sig-long{background:var(--gbg);border-color:rgba(46,160,67,0.45);}
+.sig-cash{background:var(--rbg);border-color:rgba(229,72,77,0.45);}
+.sig-box .sl{font-family:'Inter',sans-serif;font-weight:800;font-size:2.1rem;letter-spacing:1.5px;}
+.sig-box .sd{font-family:'IBM Plex Mono',monospace;font-size:0.7rem;color:var(--dim);margin-top:4px;}
+.chk{display:flex;align-items:center;gap:0.5rem;padding:0.32rem 0;font-family:'IBM Plex Mono',monospace;font-size:0.8rem;color:var(--t);}
 .chk .ok{color:var(--g);font-weight:700;}.chk .no{color:var(--r);font-weight:700;}
 
-/* Info cards con profundidad */
-.icard{background:linear-gradient(180deg,var(--card2),var(--card));border:1px solid var(--border);
-     border-radius:12px;padding:0.9rem 1.1rem;margin-bottom:0.7rem;box-shadow:var(--shadow-sm);
-     animation:fadeUp .3s ease;}
-.icard .ic-title{font-family:'Inter',sans-serif;font-weight:700;font-size:0.88rem;color:var(--w);margin-bottom:0.55rem;border-bottom:1px solid var(--border);padding-bottom:0.4rem;letter-spacing:0.2px;}
-.icard .ic-row{display:flex;justify-content:space-between;padding:0.22rem 0;font-family:'JetBrains Mono',monospace;font-size:0.8rem;}
-.icard .ic-label{color:var(--dim);}.icard .ic-val{color:var(--t);font-weight:500;font-variant-numeric:tabular-nums;}
+/* Info cards */
+.icard{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:1rem 1.15rem;margin-bottom:0.8rem;box-shadow:var(--shadow-sm);animation:fadeIn .25s ease;}
+.icard .ic-title{font-family:'Inter',sans-serif;font-weight:600;font-size:0.84rem;color:var(--w);margin-bottom:0.6rem;border-bottom:1px solid var(--border);padding-bottom:0.45rem;letter-spacing:0.3px;}
+.icard .ic-row{display:flex;justify-content:space-between;padding:0.24rem 0;font-family:'IBM Plex Mono',monospace;font-size:0.79rem;gap:1rem;}
+.icard .ic-label{color:var(--dim);}.icard .ic-val{color:var(--t);font-weight:500;font-variant-numeric:tabular-nums;text-align:right;}
 
-/* TABS estilo segmented-control */
-.stTabs [data-baseweb="tab-list"]{gap:4px;border-bottom:none;background:var(--card);
-     padding:5px;border-radius:11px;border:1px solid var(--border);box-shadow:var(--shadow-sm);
-     flex-wrap:wrap;}
-.stTabs [data-baseweb="tab"]{font-family:'Inter',sans-serif;font-weight:600;font-size:0.8rem;
-     color:var(--dim);padding:0.45rem 1.05rem;border-radius:8px;transition:all .18s ease;}
-.stTabs [data-baseweb="tab"]:hover{color:var(--w);background:rgba(255,255,255,0.04);}
-.stTabs [aria-selected="true"]{color:#0D1117 !important;
-     background:linear-gradient(135deg,var(--accent),var(--accent2)) !important;
-     box-shadow:0 2px 12px rgba(247,147,26,0.35);font-weight:700;}
+/* TABS — etiquetas en versalitas con subrayado dorado */
+.stTabs [data-baseweb="tab-list"]{gap:0.25rem;border-bottom:1px solid var(--border);background:transparent;padding:0;flex-wrap:wrap;}
+.stTabs [data-baseweb="tab"]{font-family:'Inter',sans-serif;font-weight:600;font-size:0.72rem;letter-spacing:1.2px;text-transform:uppercase;
+     color:var(--dim);padding:0.7rem 1rem;border-radius:0;border-bottom:2px solid transparent;transition:color .15s ease,border-color .15s ease;}
+.stTabs [data-baseweb="tab"]:hover{color:var(--w);}
+.stTabs [aria-selected="true"]{color:var(--w) !important;border-bottom:2px solid var(--accent) !important;background:transparent !important;}
 .stTabs [data-baseweb="tab-highlight"],.stTabs [data-baseweb="tab-border"]{display:none;}
 
 /* Sidebar */
-[data-testid="stSidebar"]{background:linear-gradient(180deg,var(--card2),var(--card));border-right:1px solid var(--border);}
+[data-testid="stSidebar"]{background:var(--card);border-right:1px solid var(--border);}
 
 /* Widgets nativos */
-.stButton>button{background:linear-gradient(180deg,var(--card2),var(--card));border:1px solid var(--border);color:var(--t);font-family:'Inter',sans-serif;font-weight:600;font-size:0.8rem;border-radius:9px;transition:all .15s ease;box-shadow:var(--shadow-sm);}
-.stButton>button:hover{border-color:var(--accent);color:var(--accent);box-shadow:0 0 16px rgba(247,147,26,0.18);transform:translateY(-1px);}
+.stButton>button{background:var(--card);border:1px solid var(--border);color:var(--t);font-family:'Inter',sans-serif;font-weight:600;font-size:0.78rem;letter-spacing:0.3px;border-radius:8px;transition:all .15s ease;box-shadow:var(--shadow-sm);}
+.stButton>button:hover{border-color:var(--accent);color:var(--accent);}
 [data-testid="stExpander"]{background:var(--card);border:1px solid var(--border);border-radius:10px;box-shadow:var(--shadow-sm);}
 [data-testid="stExpander"] summary{font-family:'Inter',sans-serif;font-weight:600;}
-[data-testid="stMetric"]{background:linear-gradient(180deg,var(--card2),var(--card));border:1px solid var(--border);border-radius:10px;padding:0.65rem 0.85rem;box-shadow:var(--shadow-sm);}
-[data-testid="stMetricLabel"]{font-family:'JetBrains Mono',monospace;font-size:0.68rem;color:var(--dim);text-transform:uppercase;letter-spacing:1px;}
-[data-testid="stMetricValue"]{font-family:'Inter',sans-serif;font-weight:800;font-variant-numeric:tabular-nums;}
+[data-testid="stMetric"]{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:0.7rem 0.9rem;box-shadow:var(--shadow-sm);}
+[data-testid="stMetricLabel"]{font-family:'IBM Plex Mono',monospace;font-size:0.64rem;color:var(--dim);text-transform:uppercase;letter-spacing:1.3px;}
+[data-testid="stMetricValue"]{font-family:'Inter',sans-serif;font-weight:700;font-variant-numeric:tabular-nums;}
 [data-testid="stAlert"]{border-radius:10px;}
 ::-webkit-scrollbar{width:10px;height:10px;}
 ::-webkit-scrollbar-track{background:var(--bg);}
@@ -979,7 +961,7 @@ def build_gex_profile_chart(gex_df: pd.DataFrame, spot: float,
     if df.empty:
         return fig
 
-    colors = ["#3FB950" if v >= 0 else "#F85149" for v in df["net_gex"]]
+    colors = ["#2EA043" if v >= 0 else "#E5484D" for v in df["net_gex"]]
 
     fig.add_trace(go.Bar(
         x=df["strike"], y=df["net_gex"],
@@ -990,37 +972,37 @@ def build_gex_profile_chart(gex_df: pd.DataFrame, spot: float,
     ))
 
     # Spot
-    fig.add_vline(x=spot, line_dash="solid", line_color="#F0F6FC", line_width=2,
+    fig.add_vline(x=spot, line_dash="solid", line_color="#F5F7FA", line_width=2,
                   annotation_text=f"  Spot ${spot:.1f}",
-                  annotation_font=dict(size=10, color="#F0F6FC", family="JetBrains Mono"))
+                  annotation_font=dict(size=10, color="#F5F7FA", family="IBM Plex Mono"))
 
     # Gamma flip
     gf = summary.get("flip_strike")
     if gf:
-        fig.add_vline(x=gf, line_dash="dash", line_color="#D29922", line_width=1.5,
+        fig.add_vline(x=gf, line_dash="dash", line_color="#D4A72C", line_width=1.5,
                       annotation_text=f"  Flip ${gf:.0f}",
-                      annotation_font=dict(size=9, color="#D29922", family="JetBrains Mono"),
+                      annotation_font=dict(size=9, color="#D4A72C", family="IBM Plex Mono"),
                       annotation_position="top right")
 
     # Call wall
     cw = summary.get("call_wall")
     if cw and lo <= cw <= hi:
-        fig.add_vline(x=cw, line_dash="dot", line_color="#BC8CFF", line_width=1.5,
+        fig.add_vline(x=cw, line_dash="dot", line_color="#A78BFA", line_width=1.5,
                       annotation_text=f"  Call Wall ${cw:.0f}",
-                      annotation_font=dict(size=9, color="#BC8CFF", family="JetBrains Mono"),
+                      annotation_font=dict(size=9, color="#A78BFA", family="IBM Plex Mono"),
                       annotation_position="bottom right")
 
     # Put wall
     pw = summary.get("put_wall")
     if pw and lo <= pw <= hi:
-        fig.add_vline(x=pw, line_dash="dot", line_color="#39D2C0", line_width=1.5,
+        fig.add_vline(x=pw, line_dash="dot", line_color="#4FB3A9", line_width=1.5,
                       annotation_text=f"  Put Wall ${pw:.0f}",
-                      annotation_font=dict(size=9, color="#39D2C0", family="JetBrains Mono"),
+                      annotation_font=dict(size=9, color="#4FB3A9", family="IBM Plex Mono"),
                       annotation_position="bottom left")
 
     regime    = summary.get("regime", "?")
     total_gex = summary.get("total_gex", 0)
-    regime_clr = "#3FB950" if regime == "POSITIVE" else "#F85149"
+    regime_clr = "#2EA043" if regime == "POSITIVE" else "#E5484D"
 
     fig.update_layout(
         title=dict(
@@ -1031,22 +1013,22 @@ def build_gex_profile_chart(gex_df: pd.DataFrame, spot: float,
                 f"<b>GEX Profile — {ticker}</b>"
                 f"<sup>  Net GEX: ${total_gex:+.1f}M · {regime}</sup>"
             ),
-            font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5,
+            font=dict(size=13, color="#D7DEE7", family="Inter"), x=0.5,
         ),
-        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+        template="plotly_dark", paper_bgcolor="#0B0F14", plot_bgcolor="#11161D",
         height=420, margin=dict(l=55, r=30, t=65, b=50),
         xaxis=dict(
-            title=dict(text="Strike Price ($)", font=dict(size=10, color="#8B949E")),
-            gridcolor="#21262D",
-            tickfont=dict(size=10, color="#8B949E", family="JetBrains Mono"),
+            title=dict(text="Strike Price ($)", font=dict(size=10, color="#8B96A5")),
+            gridcolor="#1B222B",
+            tickfont=dict(size=10, color="#8B96A5", family="IBM Plex Mono"),
             tickprefix="$",
         ),
         yaxis=dict(
-            title=dict(text="Net GEX ($M / 1% move)", font=dict(size=10, color="#8B949E")),
-            gridcolor="#21262D",
-            tickfont=dict(size=10, color="#8B949E", family="JetBrains Mono"),
+            title=dict(text="Net GEX ($M / 1% move)", font=dict(size=10, color="#8B96A5")),
+            gridcolor="#1B222B",
+            tickfont=dict(size=10, color="#8B96A5", family="IBM Plex Mono"),
             ticksuffix="M",
-            zeroline=True, zerolinecolor="#484F58", zerolinewidth=2,
+            zeroline=True, zerolinecolor="#3A4552", zerolinewidth=2,
         ),
         showlegend=False,
         hovermode="x unified",
@@ -1091,27 +1073,27 @@ def build_gex_by_expiry_chart(chains: dict, spot: float,
         return fig
 
     df_e = pd.DataFrame(rows)
-    colors = ["#3FB950" if v >= 0 else "#F85149" for v in df_e["net_gex_m"]]
+    colors = ["#2EA043" if v >= 0 else "#E5484D" for v in df_e["net_gex_m"]]
 
     fig.add_trace(go.Bar(
         x=df_e["exp"], y=df_e["net_gex_m"],
         marker_color=colors, opacity=0.8,
         hovertemplate="%{x}<br>GEX: $%{y:.2f}M<extra></extra>",
     ))
-    fig.add_hline(y=0, line_dash="solid", line_color="#484F58", line_width=1.5)
+    fig.add_hline(y=0, line_dash="solid", line_color="#3A4552", line_width=1.5)
     fig.update_layout(
         title=dict(
             text="<b>GEX por Vencimiento</b><sup>  Qué expiración concentra más gamma</sup>",
-            font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5,
+            font=dict(size=13, color="#D7DEE7", family="Inter"), x=0.5,
         ),
-        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+        template="plotly_dark", paper_bgcolor="#0B0F14", plot_bgcolor="#11161D",
         height=280, margin=dict(l=55, r=30, t=60, b=50),
-        xaxis=dict(tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono"),
-                   title=dict(text="Vencimiento", font=dict(size=10, color="#8B949E"))),
-        yaxis=dict(title=dict(text="Net GEX ($M)", font=dict(size=10, color="#8B949E")),
-                   gridcolor="#21262D",
-                   tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono"),
-                   ticksuffix="M", zeroline=True, zerolinecolor="#484F58"),
+        xaxis=dict(tickfont=dict(size=9, color="#8B96A5", family="IBM Plex Mono"),
+                   title=dict(text="Vencimiento", font=dict(size=10, color="#8B96A5"))),
+        yaxis=dict(title=dict(text="Net GEX ($M)", font=dict(size=10, color="#8B96A5")),
+                   gridcolor="#1B222B",
+                   tickfont=dict(size=9, color="#8B96A5", family="IBM Plex Mono"),
+                   ticksuffix="M", zeroline=True, zerolinecolor="#3A4552"),
         showlegend=False, bargap=0.2,
     )
     return fig
@@ -1161,17 +1143,17 @@ def build_gex_delta_exposure_chart(chains: dict, spot: float,
         return fig
 
     df_d = pd.DataFrame(rows).groupby("strike")["delta_usd"].sum().reset_index()
-    colors_d = ["#3FB950" if v >= 0 else "#F85149" for v in df_d["delta_usd"]]
+    colors_d = ["#2EA043" if v >= 0 else "#E5484D" for v in df_d["delta_usd"]]
 
     fig.add_trace(go.Bar(
         x=df_d["strike"], y=df_d["delta_usd"],
         marker_color=colors_d, opacity=0.75, name="Delta Exposure",
         hovertemplate="Strike: $%{x:.0f}<br>DEX: $%{y:.2f}M<extra></extra>"))
 
-    fig.add_vline(x=spot, line_dash="solid", line_color="#F0F6FC", line_width=2,
+    fig.add_vline(x=spot, line_dash="solid", line_color="#F5F7FA", line_width=2,
                   annotation_text=f"  Spot ${spot:.0f}",
-                  annotation_font=dict(size=9, color="#F0F6FC"))
-    fig.add_hline(y=0, line_dash="dash", line_color="#484F58", line_width=1.5)
+                  annotation_font=dict(size=9, color="#F5F7FA"))
+    fig.add_hline(y=0, line_dash="dash", line_color="#3A4552", line_width=1.5)
 
     # Max pain: strike con mayor dolor para holders de opciones
     combined_all = pd.concat([
@@ -1189,20 +1171,20 @@ def build_gex_delta_exposure_chart(chains: dict, spot: float,
         if pain:
             df_pain = pd.DataFrame(pain)
             mp = float(df_pain.loc[df_pain["pain"].idxmin(), "strike"])
-            fig.add_vline(x=mp, line_dash="dot", line_color="#D29922", line_width=2,
+            fig.add_vline(x=mp, line_dash="dot", line_color="#D4A72C", line_width=2,
                           annotation_text=f"  Max Pain ${mp:.0f}",
-                          annotation_font=dict(size=9, color="#D29922", family="JetBrains Mono"))
+                          annotation_font=dict(size=9, color="#D4A72C", family="IBM Plex Mono"))
 
     fig.update_layout(
         title=dict(text="<b>Delta Exposure (DEX)</b><sup>  Presión de hedging por strike · Max Pain marcado</sup>",
-                   font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5),
-        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+                   font=dict(size=13, color="#D7DEE7", family="Inter"), x=0.5),
+        template="plotly_dark", paper_bgcolor="#0B0F14", plot_bgcolor="#11161D",
         height=320, margin=dict(l=55, r=30, t=60, b=50),
-        xaxis=dict(title="Strike ($)", gridcolor="#21262D",
-                   tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono"), tickprefix="$"),
-        yaxis=dict(title="DEX ($M)", gridcolor="#21262D",
-                   tickfont=dict(size=9, color="#8B949E"), ticksuffix="M",
-                   zeroline=True, zerolinecolor="#484F58", zerolinewidth=2),
+        xaxis=dict(title="Strike ($)", gridcolor="#1B222B",
+                   tickfont=dict(size=9, color="#8B96A5", family="IBM Plex Mono"), tickprefix="$"),
+        yaxis=dict(title="DEX ($M)", gridcolor="#1B222B",
+                   tickfont=dict(size=9, color="#8B96A5"), ticksuffix="M",
+                   zeroline=True, zerolinecolor="#3A4552", zerolinewidth=2),
         showlegend=False, hovermode="x unified", bargap=0.1)
     return fig
 
@@ -1260,33 +1242,33 @@ def build_gex_vanna_charm_chart(chains: dict, spot: float,
     fig.add_trace(go.Bar(
         x=df_v["strike"], y=df_v["val"],
         name="Vanna ($M/vol pt)",
-        marker_color="#58A6FF", opacity=0.7,
+        marker_color="#6CA0DC", opacity=0.7,
         hovertemplate="Strike: $%{x:.0f}<br>Vanna: %{y:.3f}M<extra></extra>"))
 
     fig.add_trace(go.Scatter(
         x=df_c["strike"], y=df_c["val"],
         name="Charm (×1000)", yaxis="y2",
-        line=dict(color="#BC8CFF", width=2),
+        line=dict(color="#A78BFA", width=2),
         hovertemplate="Strike: $%{x:.0f}<br>Charm: %{y:.3f}<extra></extra>"))
 
-    fig.add_vline(x=spot, line_dash="dash", line_color="#F0F6FC", line_width=1.5,
+    fig.add_vline(x=spot, line_dash="dash", line_color="#F5F7FA", line_width=1.5,
                   annotation_text=f"  Spot ${spot:.0f}",
-                  annotation_font=dict(size=9, color="#F0F6FC"))
-    fig.add_hline(y=0, line_dash="dot", line_color="#484F58", line_width=1)
+                  annotation_font=dict(size=9, color="#F5F7FA"))
+    fig.add_hline(y=0, line_dash="dot", line_color="#3A4552", line_width=1)
 
     fig.update_layout(
         title=dict(text="<b>Vanna & Charm</b><sup>  Flujos de hedging por cambio de vol (Vanna) y tiempo (Charm)</sup>",
-                   font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5),
-        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+                   font=dict(size=13, color="#D7DEE7", family="Inter"), x=0.5),
+        template="plotly_dark", paper_bgcolor="#0B0F14", plot_bgcolor="#11161D",
         height=320, margin=dict(l=55, r=60, t=60, b=50),
-        xaxis=dict(title="Strike ($)", gridcolor="#21262D",
-                   tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono"), tickprefix="$"),
-        yaxis=dict(title="Vanna ($M)", gridcolor="#21262D",
-                   tickfont=dict(size=9, color="#58A6FF")),
+        xaxis=dict(title="Strike ($)", gridcolor="#1B222B",
+                   tickfont=dict(size=9, color="#8B96A5", family="IBM Plex Mono"), tickprefix="$"),
+        yaxis=dict(title="Vanna ($M)", gridcolor="#1B222B",
+                   tickfont=dict(size=9, color="#6CA0DC")),
         yaxis2=dict(title="Charm (×1000)", overlaying="y", side="right",
-                    tickfont=dict(size=9, color="#BC8CFF"), showgrid=False),
+                    tickfont=dict(size=9, color="#A78BFA"), showgrid=False),
         legend=dict(orientation="h", y=1.02, bgcolor="rgba(0,0,0,0)",
-                    font=dict(size=9, color="#C9D1D9", family="JetBrains Mono")),
+                    font=dict(size=9, color="#D7DEE7", family="IBM Plex Mono")),
         hovermode="x unified", bargap=0.1)
     return fig
 
@@ -1310,25 +1292,25 @@ def build_gex_cumulative_chart(gex_df: pd.DataFrame, spot: float,
 
     df["gex_cumsum"] = df["net_gex"].cumsum()
     zero_crossings = df[df["gex_cumsum"] * df["gex_cumsum"].shift(1) < 0]
-    colors_area = ["rgba(63,185,80,0.15)" if v >= 0 else "rgba(248,81,73,0.15)"
+    colors_area = ["rgba(46,160,67,0.15)" if v >= 0 else "rgba(229,72,77,0.15)"
                    for v in df["gex_cumsum"]]
 
     fig.add_trace(go.Scatter(
         x=df["strike"], y=df["gex_cumsum"],
         name="GEX Acumulado",
-        line=dict(color="#39D2C0", width=2.5),
-        fill="tozeroy", fillcolor="rgba(57,210,192,0.1)",
+        line=dict(color="#4FB3A9", width=2.5),
+        fill="tozeroy", fillcolor="rgba(79,179,169,0.1)",
         hovertemplate="Strike: $%{x:.0f}<br>GEX Acum: $%{y:.2f}M<extra></extra>"))
 
-    fig.add_vline(x=spot, line_dash="solid", line_color="#F0F6FC", line_width=2,
+    fig.add_vline(x=spot, line_dash="solid", line_color="#F5F7FA", line_width=2,
                   annotation_text=f"  Spot ${spot:.0f}",
-                  annotation_font=dict(size=9, color="#F0F6FC"))
-    fig.add_hline(y=0, line_dash="dash", line_color="#D29922", line_width=2,
+                  annotation_font=dict(size=9, color="#F5F7FA"))
+    fig.add_hline(y=0, line_dash="dash", line_color="#D4A72C", line_width=2,
                   annotation_text="  Gamma Flip Zone",
-                  annotation_font=dict(size=9, color="#D29922"))
+                  annotation_font=dict(size=9, color="#D4A72C"))
 
     for _, row in zero_crossings.iterrows():
-        fig.add_vline(x=row["strike"], line_dash="dot", line_color="#D29922",
+        fig.add_vline(x=row["strike"], line_dash="dot", line_color="#D4A72C",
                       line_width=1.5)
 
     flip_pct = (zero_crossings["strike"].iloc[0] / spot - 1)*100 if not zero_crossings.empty else None
@@ -1336,14 +1318,14 @@ def build_gex_cumulative_chart(gex_df: pd.DataFrame, spot: float,
 
     fig.update_layout(
         title=dict(text=f"<b>GEX Acumulado</b><sup>  {subtitle}</sup>",
-                   font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5),
-        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+                   font=dict(size=13, color="#D7DEE7", family="Inter"), x=0.5),
+        template="plotly_dark", paper_bgcolor="#0B0F14", plot_bgcolor="#11161D",
         height=300, margin=dict(l=55, r=30, t=60, b=50),
-        xaxis=dict(title="Strike ($)", gridcolor="#21262D",
-                   tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono"), tickprefix="$"),
-        yaxis=dict(title="GEX Acum ($M)", gridcolor="#21262D",
-                   tickfont=dict(size=9, color="#8B949E"), ticksuffix="M",
-                   zeroline=True, zerolinecolor="#D29922", zerolinewidth=2),
+        xaxis=dict(title="Strike ($)", gridcolor="#1B222B",
+                   tickfont=dict(size=9, color="#8B96A5", family="IBM Plex Mono"), tickprefix="$"),
+        yaxis=dict(title="GEX Acum ($M)", gridcolor="#1B222B",
+                   tickfont=dict(size=9, color="#8B96A5"), ticksuffix="M",
+                   zeroline=True, zerolinecolor="#D4A72C", zerolinewidth=2),
         showlegend=False, hovermode="x unified")
     return fig
 
@@ -1367,7 +1349,7 @@ def build_gex_expected_move_chart(gex_df: pd.DataFrame, chains: dict, spot: floa
         return fig
 
     # GEX profile
-    colors_gex = ["#3FB950" if v >= 0 else "#F85149" for v in df["net_gex"]]
+    colors_gex = ["#2EA043" if v >= 0 else "#E5484D" for v in df["net_gex"]]
     fig.add_trace(go.Bar(
         x=df["strike"], y=df["net_gex"].abs(),
         marker_color=colors_gex, opacity=0.4, name="|GEX|",
@@ -1391,38 +1373,38 @@ def build_gex_expected_move_chart(gex_df: pd.DataFrame, chains: dict, spot: floa
         em2 = em1 * 2
 
         for em, lbl, clr, dash in [
-            (em1, f"±1σ ({dte_f}d exp)", "#D29922", "dash"),
-            (em2, f"±2σ ({dte_f}d exp)", "#F85149", "dot"),
+            (em1, f"±1σ ({dte_f}d exp)", "#D4A72C", "dash"),
+            (em2, f"±2σ ({dte_f}d exp)", "#E5484D", "dot"),
         ]:
             for sign in [1, -1]:
                 fig.add_vline(
                     x=spot + sign*em,
                     line_dash=dash, line_color=clr, line_width=1.5,
                     annotation_text=f"  {lbl}" if sign > 0 else None,
-                    annotation_font=dict(size=8, color=clr, family="JetBrains Mono"))
+                    annotation_font=dict(size=8, color=clr, family="IBM Plex Mono"))
 
         # Agrega texto del ATM IV
         fig.add_annotation(
             x=hi*0.99, y=df["net_gex"].abs().max()*0.9,
             text=f"ATM IV: {atm_iv*100:.1f}%<br>±1σ: ±${em1:.1f}",
             showarrow=False,
-            font=dict(size=9, color="#D29922", family="JetBrains Mono"),
+            font=dict(size=9, color="#D4A72C", family="IBM Plex Mono"),
             align="right")
 
-    fig.add_vline(x=spot, line_dash="solid", line_color="#F0F6FC", line_width=2,
+    fig.add_vline(x=spot, line_dash="solid", line_color="#F5F7FA", line_width=2,
                   annotation_text=f"  Spot ${spot:.0f}",
-                  annotation_font=dict(size=9, color="#F0F6FC"))
+                  annotation_font=dict(size=9, color="#F5F7FA"))
 
     fig.update_layout(
         title=dict(text="<b>Expected Move + GEX Levels</b>"
                         "<sup>  Rango ±1σ/±2σ vs muros de gamma</sup>",
-                   font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5),
-        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+                   font=dict(size=13, color="#D7DEE7", family="Inter"), x=0.5),
+        template="plotly_dark", paper_bgcolor="#0B0F14", plot_bgcolor="#11161D",
         height=320, margin=dict(l=55, r=30, t=60, b=50),
-        xaxis=dict(title="Strike ($)", gridcolor="#21262D",
-                   tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono"), tickprefix="$"),
-        yaxis=dict(title="|GEX| ($M)", gridcolor="#21262D",
-                   tickfont=dict(size=9, color="#8B949E"), ticksuffix="M"),
+        xaxis=dict(title="Strike ($)", gridcolor="#1B222B",
+                   tickfont=dict(size=9, color="#8B96A5", family="IBM Plex Mono"), tickprefix="$"),
+        yaxis=dict(title="|GEX| ($M)", gridcolor="#1B222B",
+                   tickfont=dict(size=9, color="#8B96A5"), ticksuffix="M"),
         showlegend=False, hovermode="x unified", bargap=0.1)
     return fig
 
@@ -1610,47 +1592,47 @@ def build_svi_smile_chart(forecast_result: dict, exp_str: str,
         fig.add_trace(go.Scatter(
             x=obs_k, y=obs_iv, mode="markers",
             name="Observado",
-            marker=dict(color="#8B949E", size=6, opacity=0.7),
+            marker=dict(color="#8B96A5", size=6, opacity=0.7),
             hovertemplate="k: %{x:.1f}%<br>IV obs: %{y:.1f}%<extra></extra>"))
 
     # Fitted SVI actual
     fig.add_trace(go.Scatter(
         x=k_pct, y=fc["iv_cur"]*100, mode="lines",
         name="SVI Actual",
-        line=dict(color="#58A6FF", width=2.5),
+        line=dict(color="#6CA0DC", width=2.5),
         hovertemplate="k: %{x:.1f}%<br>IV SVI: %{y:.1f}%<extra></extra>"))
 
     # SVI Forecasted
     fig.add_trace(go.Scatter(
         x=k_pct, y=fc["iv_fc"]*100, mode="lines",
         name=f"SVI Forecast ({iv_change_pct:+.0%})",
-        line=dict(color="#3FB950", width=2.5, dash="dash"),
+        line=dict(color="#2EA043", width=2.5, dash="dash"),
         hovertemplate="k: %{x:.1f}%<br>IV forecast: %{y:.1f}%<extra></extra>"))
 
     # Área de oportunidad (IV drop)
     fig.add_trace(go.Scatter(
         x=list(k_pct)+list(k_pct[::-1]),
         y=list(fc["iv_cur"]*100)+list(fc["iv_fc"]*100)[::-1],
-        fill="toself", fillcolor="rgba(63,185,80,0.12)",
+        fill="toself", fillcolor="rgba(46,160,67,0.12)",
         line=dict(width=0), name="IV Drop (oportunidad)", hoverinfo="skip"))
 
-    fig.add_vline(x=0, line_dash="dash", line_color="#8B949E", line_width=1.5,
-                  annotation_text="ATM", annotation_font=dict(size=9, color="#8B949E"))
+    fig.add_vline(x=0, line_dash="dash", line_color="#8B96A5", line_width=1.5,
+                  annotation_text="ATM", annotation_font=dict(size=9, color="#8B96A5"))
 
     fig.update_layout(
         title=dict(
             text=f"<b>SVI Smile — {exp_str} ({dte}d)</b>"
                  f"<sup>  Azul=actual · Verde=forecast · zona=oportunidad de venta</sup>",
-            font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5),
-        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+            font=dict(size=13, color="#D7DEE7", family="Inter"), x=0.5),
+        template="plotly_dark", paper_bgcolor="#0B0F14", plot_bgcolor="#11161D",
         height=350, margin=dict(l=55, r=30, t=60, b=50),
-        xaxis=dict(title="Log-moneyness k (%)", gridcolor="#21262D",
-                   tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono"), ticksuffix="%",
-                   zeroline=True, zerolinecolor="#30363D"),
-        yaxis=dict(title="IV (%)", gridcolor="#21262D",
-                   tickfont=dict(size=9, color="#8B949E"), ticksuffix="%"),
+        xaxis=dict(title="Log-moneyness k (%)", gridcolor="#1B222B",
+                   tickfont=dict(size=9, color="#8B96A5", family="IBM Plex Mono"), ticksuffix="%",
+                   zeroline=True, zerolinecolor="#232B35"),
+        yaxis=dict(title="IV (%)", gridcolor="#1B222B",
+                   tickfont=dict(size=9, color="#8B96A5"), ticksuffix="%"),
         legend=dict(orientation="h", y=1.02, bgcolor="rgba(0,0,0,0)",
-                    font=dict(size=9, color="#C9D1D9", family="JetBrains Mono")),
+                    font=dict(size=9, color="#D7DEE7", family="IBM Plex Mono")),
         hovermode="x unified")
     return fig
 
@@ -1687,16 +1669,16 @@ def build_forecast_surface_chart(forecast_result: dict, spot: float,
 
     Z = np.array(Z_rows)
 
-    colorscale = ([[0.0,"#1565C0"],[0.3,"#3FB950"],[0.6,"#D29922"],[1.0,"#F85149"]]
+    colorscale = ([[0.0,"#1565C0"],[0.3,"#2EA043"],[0.6,"#D4A72C"],[1.0,"#E5484D"]]
                   if view == "drop" else
-                  [[0.0,"#1a237e"],[0.3,"#0288D1"],[0.6,"#3FB950"],[0.8,"#D29922"],[1.0,"#F85149"]])
+                  [[0.0,"#1a237e"],[0.3,"#0288D1"],[0.6,"#2EA043"],[0.8,"#D4A72C"],[1.0,"#E5484D"]])
 
     fig.add_trace(go.Surface(
         x=k_grid, y=dtes, z=Z,
         colorscale=colorscale,
         colorbar=dict(title=dict(text="∆IV pts" if view=="drop" else "IV%",
-                                  font=dict(color="#8B949E", size=10)),
-                      tickfont=dict(color="#8B949E", size=9), len=0.6, thickness=12),
+                                  font=dict(color="#8B96A5", size=10)),
+                      tickfont=dict(color="#8B96A5", size=9), len=0.6, thickness=12),
         hovertemplate="k: %{x:.1f}%<br>DTE: %{y}d<br>" +
                       ("IV Drop: %{z:.1f} pts<extra></extra>" if view=="drop"
                        else "IV Forecast: %{z:.1f}%<extra></extra>"),
@@ -1709,18 +1691,18 @@ def build_forecast_surface_chart(forecast_result: dict, spot: float,
 
     fig.update_layout(
         title=dict(text=f"<b>{title_map.get(view,'')}</b>",
-                   font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5),
+                   font=dict(size=13, color="#D7DEE7", family="Inter"), x=0.5),
         scene=dict(
-            xaxis=dict(title="Log-moneyness (%)", gridcolor="#30363D",
-                       backgroundcolor="#0D1117", tickfont=dict(size=9, color="#8B949E")),
-            yaxis=dict(title="DTE (días)", gridcolor="#30363D",
-                       backgroundcolor="#0D1117", tickfont=dict(size=9, color="#8B949E")),
+            xaxis=dict(title="Log-moneyness (%)", gridcolor="#232B35",
+                       backgroundcolor="#0B0F14", tickfont=dict(size=9, color="#8B96A5")),
+            yaxis=dict(title="DTE (días)", gridcolor="#232B35",
+                       backgroundcolor="#0B0F14", tickfont=dict(size=9, color="#8B96A5")),
             zaxis=dict(title="∆IV pts" if view=="drop" else "IV %",
-                       gridcolor="#30363D", backgroundcolor="#0D1117",
-                       tickfont=dict(size=9, color="#8B949E")),
-            bgcolor="#0D1117",
+                       gridcolor="#232B35", backgroundcolor="#0B0F14",
+                       tickfont=dict(size=9, color="#8B96A5")),
+            bgcolor="#0B0F14",
             camera=dict(eye=dict(x=-1.5, y=-1.5, z=0.9))),
-        paper_bgcolor="#0D1117", height=500, margin=dict(l=0, r=0, t=50, b=0))
+        paper_bgcolor="#0B0F14", height=500, margin=dict(l=0, r=0, t=50, b=0))
     return fig
 
 
@@ -1777,8 +1759,8 @@ def compute_skew_metrics(chains: dict, spot: float) -> dict:
 
 # ─── Chart: Skew Curves ────────────────────────────────────────────────────
 SKEW_PALETTE = [
-    "#58A6FF","#F0883E","#3FB950","#BC8CFF",
-    "#39D2C0","#D29922","#F85149","#79C0FF",
+    "#6CA0DC","#E0B94A","#2EA043","#A78BFA",
+    "#4FB3A9","#D4A72C","#E5484D","#8DB8E8",
 ]
 
 def build_skew_curves(chains: dict, spot: float,
@@ -1831,23 +1813,23 @@ def build_skew_curves(chains: dict, spot: float,
             hovertemplate=f"<b>{exp_str}</b><br>x: %{{x:.2f}}{x_suffix}<br>IV(BS): %{{y:.1f}}%<extra></extra>",
         ))
 
-    fig.add_vline(x=0, line_dash="dash", line_color="#8B949E", line_width=1.5,
-                  annotation_text="ATM", annotation_font=dict(size=10, color="#8B949E"))
+    fig.add_vline(x=0, line_dash="dash", line_color="#8B96A5", line_width=1.5,
+                  annotation_text="ATM", annotation_font=dict(size=10, color="#8B96A5"))
     fig.update_layout(
         title=dict(text="<b>Volatility Skew</b><sup>  IV Black-Scholes por vencimiento</sup>",
-                   font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5),
-        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+                   font=dict(size=13, color="#D7DEE7", family="Inter"), x=0.5),
+        template="plotly_dark", paper_bgcolor="#0B0F14", plot_bgcolor="#11161D",
         height=420, margin=dict(l=55, r=30, t=60, b=50),
-        xaxis=dict(title=dict(text=x_label, font=dict(size=10, color="#8B949E")),
-                   gridcolor="#21262D", zeroline=True, zerolinecolor="#30363D",
-                   tickfont=dict(size=10, color="#8B949E", family="JetBrains Mono")),
-        yaxis=dict(title=dict(text="Implied Volatility BS (%)", font=dict(size=10, color="#8B949E")),
-                   gridcolor="#21262D",
-                   tickfont=dict(size=10, color="#8B949E", family="JetBrains Mono"),
+        xaxis=dict(title=dict(text=x_label, font=dict(size=10, color="#8B96A5")),
+                   gridcolor="#1B222B", zeroline=True, zerolinecolor="#232B35",
+                   tickfont=dict(size=10, color="#8B96A5", family="IBM Plex Mono")),
+        yaxis=dict(title=dict(text="Implied Volatility BS (%)", font=dict(size=10, color="#8B96A5")),
+                   gridcolor="#1B222B",
+                   tickfont=dict(size=10, color="#8B96A5", family="IBM Plex Mono"),
                    ticksuffix="%"),
         legend=dict(orientation="v", yanchor="top", y=0.99, xanchor="right", x=0.99,
-                    bgcolor="rgba(22,27,34,0.9)", bordercolor="#30363D", borderwidth=1,
-                    font=dict(size=9, color="#C9D1D9", family="JetBrains Mono")),
+                    bgcolor="rgba(17,22,29,0.9)", bordercolor="#232B35", borderwidth=1,
+                    font=dict(size=9, color="#D7DEE7", family="IBM Plex Mono")),
         hovermode="x unified",
     )
     return fig
@@ -1873,24 +1855,24 @@ def build_atm_term_structure(chains: dict, spot: float) -> go.Figure:
     fig.add_trace(go.Scatter(
         x=df_atm["dte"], y=df_atm["atm_iv"],
         mode="lines+markers+text", name="ATM IV (BS)",
-        line=dict(color="#39D2C0", width=3, shape="spline"),
-        marker=dict(size=10, color="#39D2C0", line=dict(width=2, color="#0D1117")),
+        line=dict(color="#4FB3A9", width=3, shape="spline"),
+        marker=dict(size=10, color="#4FB3A9", line=dict(width=2, color="#0B0F14")),
         text=[f"{v:.1f}%" for v in df_atm["atm_iv"]],
         textposition="top center",
-        textfont=dict(size=9, color="#C9D1D9", family="JetBrains Mono"),
+        textfont=dict(size=9, color="#D7DEE7", family="IBM Plex Mono"),
         hovertemplate="DTE: %{x}d<br>ATM IV: %{y:.2f}%<extra></extra>",
     ))
     fig.update_layout(
         title=dict(text="<b>ATM IV Term Structure</b><sup>  IV en el dinero por vencimiento</sup>",
-                   font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5),
-        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+                   font=dict(size=13, color="#D7DEE7", family="Inter"), x=0.5),
+        template="plotly_dark", paper_bgcolor="#0B0F14", plot_bgcolor="#11161D",
         height=300, margin=dict(l=55, r=30, t=60, b=50),
-        xaxis=dict(title=dict(text="Días al Vencimiento (DTE)", font=dict(size=10, color="#8B949E")),
-                   gridcolor="#21262D",
-                   tickfont=dict(size=10, color="#8B949E", family="JetBrains Mono")),
-        yaxis=dict(title=dict(text="ATM IV (%)", font=dict(size=10, color="#8B949E")),
-                   gridcolor="#21262D",
-                   tickfont=dict(size=10, color="#8B949E", family="JetBrains Mono"),
+        xaxis=dict(title=dict(text="Días al Vencimiento (DTE)", font=dict(size=10, color="#8B96A5")),
+                   gridcolor="#1B222B",
+                   tickfont=dict(size=10, color="#8B96A5", family="IBM Plex Mono")),
+        yaxis=dict(title=dict(text="ATM IV (%)", font=dict(size=10, color="#8B96A5")),
+                   gridcolor="#1B222B",
+                   tickfont=dict(size=10, color="#8B96A5", family="IBM Plex Mono"),
                    ticksuffix="%"),
         hovermode="x unified", showlegend=False,
     )
@@ -1944,28 +1926,28 @@ def build_iv_surface(chains: dict, spot: float,
         x=xi, y=yi, z=zi,
         colorscale=[
             [0.0,"#1a237e"],[0.15,"#1565C0"],[0.30,"#0288D1"],
-            [0.45,"#00ACC1"],[0.55,"#3FB950"],[0.65,"#D29922"],
-            [0.80,"#F0883E"],[1.0,"#F85149"],
+            [0.45,"#00ACC1"],[0.55,"#2EA043"],[0.65,"#D4A72C"],
+            [0.80,"#E0B94A"],[1.0,"#E5484D"],
         ],
-        colorbar=dict(title=dict(text="IV %", font=dict(color="#8B949E",size=10)),
-                      tickfont=dict(color="#8B949E",size=9), len=0.6, thickness=12),
+        colorbar=dict(title=dict(text="IV %", font=dict(color="#8B96A5",size=10)),
+                      tickfont=dict(color="#8B96A5",size=9), len=0.6, thickness=12),
         hovertemplate="DTE: %{x:.0f}d<br>Y: %{y:.2f}<br>IV: %{z:.1f}%<extra></extra>",
         opacity=0.92,
     ))
     fig.update_layout(
         title=dict(text="<b>Implied Volatility Surface</b><sup>  IV Black-Scholes · griddata interpolation</sup>",
-                   font=dict(size=14, color="#C9D1D9", family="Inter"), x=0.5),
+                   font=dict(size=14, color="#D7DEE7", family="Inter"), x=0.5),
         scene=dict(
-            xaxis=dict(title="DTE (días)", gridcolor="#30363D", backgroundcolor="#0D1117",
-                       tickfont=dict(size=9, color="#8B949E")),
-            yaxis=dict(title=y_label, gridcolor="#30363D", backgroundcolor="#0D1117",
-                       tickfont=dict(size=9, color="#8B949E")),
-            zaxis=dict(title="IV (%)", gridcolor="#30363D", backgroundcolor="#0D1117",
-                       tickfont=dict(size=9, color="#8B949E")),
-            bgcolor="#0D1117",
+            xaxis=dict(title="DTE (días)", gridcolor="#232B35", backgroundcolor="#0B0F14",
+                       tickfont=dict(size=9, color="#8B96A5")),
+            yaxis=dict(title=y_label, gridcolor="#232B35", backgroundcolor="#0B0F14",
+                       tickfont=dict(size=9, color="#8B96A5")),
+            zaxis=dict(title="IV (%)", gridcolor="#232B35", backgroundcolor="#0B0F14",
+                       tickfont=dict(size=9, color="#8B96A5")),
+            bgcolor="#0B0F14",
             camera=dict(eye=dict(x=-1.6, y=-1.6, z=0.9), up=dict(x=0,y=0,z=1)),
         ),
-        paper_bgcolor="#0D1117", height=520, margin=dict(l=0,r=0,t=50,b=0),
+        paper_bgcolor="#0B0F14", height=520, margin=dict(l=0,r=0,t=50,b=0),
     )
     return fig
 
@@ -1998,27 +1980,27 @@ def build_iv_heatmap(chains: dict, spot: float,
     atm_idx = int(np.argmin(np.abs(mon_grid - 1.0)))
     fig.add_trace(go.Heatmap(
         z=Z, x=labels_x, y=labels_y,
-        colorscale=[[0.0,"#1565C0"],[0.25,"#0288D1"],[0.50,"#3FB950"],
-                    [0.70,"#D29922"],[0.85,"#F0883E"],[1.0,"#F85149"]],
-        colorbar=dict(title=dict(text="IV %",font=dict(color="#8B949E",size=10)),
-                      tickfont=dict(color="#8B949E",size=9), len=0.8, thickness=14),
+        colorscale=[[0.0,"#1565C0"],[0.25,"#0288D1"],[0.50,"#2EA043"],
+                    [0.70,"#D4A72C"],[0.85,"#E0B94A"],[1.0,"#E5484D"]],
+        colorbar=dict(title=dict(text="IV %",font=dict(color="#8B96A5",size=10)),
+                      tickfont=dict(color="#8B96A5",size=9), len=0.8, thickness=14),
         hoverongaps=False,
         hovertemplate="Δ Spot: %{x}<br>DTE: %{y}<br>IV(BS): %{z:.1f}%<extra></extra>",
         xgap=1, ygap=1,
     ))
-    fig.add_vline(x=labels_x[atm_idx], line_dash="dash", line_color="#8B949E",
+    fig.add_vline(x=labels_x[atm_idx], line_dash="dash", line_color="#8B96A5",
                   line_width=1.5,
-                  annotation_text="ATM", annotation_font=dict(size=9, color="#8B949E"))
+                  annotation_text="ATM", annotation_font=dict(size=9, color="#8B96A5"))
     fig.update_layout(
         title=dict(text="<b>IV Surface — Heatmap</b><sup>  Filas=DTE · Columnas=%Spot · Color=IV(BS)%</sup>",
-                   font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5),
-        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+                   font=dict(size=13, color="#D7DEE7", family="Inter"), x=0.5),
+        template="plotly_dark", paper_bgcolor="#0B0F14", plot_bgcolor="#11161D",
         height=380, margin=dict(l=55, r=20, t=60, b=60),
-        xaxis=dict(tickfont=dict(size=8,color="#8B949E",family="JetBrains Mono"),
-                   title=dict(text="Distancia al Spot",font=dict(size=10,color="#8B949E")),
+        xaxis=dict(tickfont=dict(size=8,color="#8B96A5",family="IBM Plex Mono"),
+                   title=dict(text="Distancia al Spot",font=dict(size=10,color="#8B96A5")),
                    tickangle=-45),
-        yaxis=dict(tickfont=dict(size=9,color="#8B949E",family="JetBrains Mono"),
-                   title=dict(text="DTE",font=dict(size=10,color="#8B949E")),
+        yaxis=dict(tickfont=dict(size=9,color="#8B96A5",family="IBM Plex Mono"),
+                   title=dict(text="DTE",font=dict(size=10,color="#8B96A5")),
                    autorange="reversed"),
     )
     return fig
@@ -2384,35 +2366,35 @@ def build_vrp_chart(bt, window=252):
     # Panel 1: VIX, HAR forecast, RV realizada ex-post
     fig.add_trace(go.Scatter(
         x=p.index, y=p['VIX_Close'], name='VIX (IV implícita)',
-        line=dict(color='#F85149', width=2.5),
+        line=dict(color='#E5484D', width=2.5),
         hovertemplate='VIX: %{y:.1f}<extra></extra>'), row=1, col=1)
 
     if use_har:
         fig.add_trace(go.Scatter(
             x=p.index, y=p['HAR_Forecast'], name='HAR-RV Forecast (E[vol])',
-            line=dict(color='#58A6FF', width=2, dash='dash'),
+            line=dict(color='#6CA0DC', width=2, dash='dash'),
             hovertemplate='HAR Forecast: %{y:.1f}<extra></extra>'), row=1, col=1)
         if 'RV_Fwd_22' in p.columns:
             fig.add_trace(go.Scatter(
                 x=p.index, y=p['RV_Fwd_22'], name='RV Realizada 22d (ex-post)',
-                line=dict(color='#39D2C0', width=1.5, dash='dot'),
+                line=dict(color='#4FB3A9', width=1.5, dash='dot'),
                 hovertemplate='RV realizada: %{y:.1f}<extra></extra>'), row=1, col=1)
     else:
         fig.add_trace(go.Scatter(
             x=p.index, y=p['RV20'], name='RV20 (trailing)',
-            line=dict(color='#58A6FF', width=2),
+            line=dict(color='#6CA0DC', width=2),
             hovertemplate='RV20: %{y:.1f}<extra></extra>'), row=1, col=1)
 
     # Panel 2: VRP como área
     if col_vrp in p.columns and p[col_vrp].notna().sum() > 5:
         vrp_vals = p[col_vrp].fillna(0)
-        colors_vrp = ['#3FB950' if v >= 0 else '#F85149' for v in vrp_vals]
+        colors_vrp = ['#2EA043' if v >= 0 else '#E5484D' for v in vrp_vals]
         fig.add_trace(go.Bar(
             x=p.index, y=vrp_vals,
             name='VRP = VIX − E[RV]' if use_har else 'VRP = VIX − RV20',
             marker_color=colors_vrp, opacity=0.7,
             hovertemplate='VRP: %{y:+.1f} pts<extra></extra>'), row=2, col=1)
-        fig.add_hline(y=0, line_dash='dash', line_color='#484F58',
+        fig.add_hline(y=0, line_dash='dash', line_color='#3A4552',
                       line_width=1.5, row=2, col=1)
 
         # Líneas de percentil P25/P75 en VRP
@@ -2420,34 +2402,34 @@ def build_vrp_chart(bt, window=252):
         if len(vrp_clean) > 20:
             p25 = float(vrp_clean.quantile(0.25))
             p75 = float(vrp_clean.quantile(0.75))
-            fig.add_hline(y=p25, line_dash='dot', line_color='#D29922',
+            fig.add_hline(y=p25, line_dash='dot', line_color='#D4A72C',
                           line_width=1, row=2, col=1,
                           annotation_text=f' P25: {p25:.1f}',
-                          annotation_font=dict(size=8, color='#D29922'))
-            fig.add_hline(y=p75, line_dash='dot', line_color='#3FB950',
+                          annotation_font=dict(size=8, color='#D4A72C'))
+            fig.add_hline(y=p75, line_dash='dot', line_color='#2EA043',
                           line_width=1, row=2, col=1,
                           annotation_text=f' P75: {p75:.1f}',
-                          annotation_font=dict(size=8, color='#3FB950'))
+                          annotation_font=dict(size=8, color='#2EA043'))
 
     subtitle = ('VIX vs HAR-RV Forecast · VRP = prima pagada sobre vol esperada'
                 if use_har else 'VIX - RV20 trailing (definición simplificada)')
     fig.update_layout(
         title=dict(
             text=f'<b>Volatility Risk Premium</b><sup>  {subtitle}</sup>',
-            font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
-        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
+            font=dict(size=13, color='#D7DEE7', family='Inter'), x=0.5),
+        template='plotly_dark', paper_bgcolor='#0B0F14', plot_bgcolor='#11161D',
         height=480, margin=dict(l=55, r=30, t=60, b=40),
-        xaxis2=dict(gridcolor='#21262D',
-                    tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
-        xaxis=dict(gridcolor='#21262D',
-                   tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
-        yaxis=dict(title='Vol %', gridcolor='#21262D',
-                   tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
-        yaxis2=dict(title='VRP (pts)', gridcolor='#21262D',
-                    tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono'),
-                    zeroline=True, zerolinecolor='#30363D'),
+        xaxis2=dict(gridcolor='#1B222B',
+                    tickfont=dict(size=9, color='#8B96A5', family='IBM Plex Mono')),
+        xaxis=dict(gridcolor='#1B222B',
+                   tickfont=dict(size=9, color='#8B96A5', family='IBM Plex Mono')),
+        yaxis=dict(title='Vol %', gridcolor='#1B222B',
+                   tickfont=dict(size=9, color='#8B96A5', family='IBM Plex Mono')),
+        yaxis2=dict(title='VRP (pts)', gridcolor='#1B222B',
+                    tickfont=dict(size=9, color='#8B96A5', family='IBM Plex Mono'),
+                    zeroline=True, zerolinecolor='#232B35'),
         legend=dict(orientation='h', y=1.03, bgcolor='rgba(0,0,0,0)',
-                    font=dict(size=9, color='#C9D1D9', family='JetBrains Mono')),
+                    font=dict(size=9, color='#D7DEE7', family='IBM Plex Mono')),
         hovermode='x unified', bargap=0)
     return fig
 
@@ -2469,11 +2451,11 @@ def build_har_backtest_charts(backtest: dict) -> tuple:
     fig_ts = go.Figure()
     fig_ts.add_trace(go.Scatter(
         x=idx, y=rv, name='RV Realizada (ex-post, 22d)',
-        line=dict(color='#39D2C0', width=2),
+        line=dict(color='#4FB3A9', width=2),
         hovertemplate='%{x|%Y-%m-%d}<br>RV real: %{y:.1f}%<extra></extra>'))
     fig_ts.add_trace(go.Scatter(
         x=idx, y=fc, name='HAR-A Forecast',
-        line=dict(color='#F0883E', width=2, dash='dash'),
+        line=dict(color='#E0B94A', width=2, dash='dash'),
         hovertemplate='HAR-A: %{y:.1f}%<extra></extra>'))
     # Error band
     err = fc - rv
@@ -2488,14 +2470,14 @@ def build_har_backtest_charts(backtest: dict) -> tuple:
         title=dict(
             text=f'<b>HAR-A Backtest — Forecast vs RV Realizada</b>'
                  f'<sup>  OOS R²={r2:.3f} · RMSE={rmse:.2f} · n={backtest["n_test"]}d</sup>',
-            font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
-        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
+            font=dict(size=13, color='#D7DEE7', family='Inter'), x=0.5),
+        template='plotly_dark', paper_bgcolor='#0B0F14', plot_bgcolor='#11161D',
         height=300, margin=dict(l=55, r=30, t=60, b=40),
-        xaxis=dict(gridcolor='#21262D', tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
-        yaxis=dict(title='Vol % (anualizada)', gridcolor='#21262D',
-                   tickfont=dict(size=9, color='#8B949E')),
+        xaxis=dict(gridcolor='#1B222B', tickfont=dict(size=9, color='#8B96A5', family='IBM Plex Mono')),
+        yaxis=dict(title='Vol % (anualizada)', gridcolor='#1B222B',
+                   tickfont=dict(size=9, color='#8B96A5')),
         legend=dict(orientation='h', y=1.02, bgcolor='rgba(0,0,0,0)',
-                    font=dict(size=9, color='#C9D1D9', family='JetBrains Mono')),
+                    font=dict(size=9, color='#D7DEE7', family='IBM Plex Mono')),
         hovermode='x unified')
 
     # ── Fig 2: Mincer-Zarnowitz scatter ───────────────────────────
@@ -2508,34 +2490,34 @@ def build_har_backtest_charts(backtest: dict) -> tuple:
     fig_mz = go.Figure()
     fig_mz.add_trace(go.Scatter(
         x=fc, y=rv, mode='markers',
-        marker=dict(color='#58A6FF', size=4, opacity=0.5),
+        marker=dict(color='#6CA0DC', size=4, opacity=0.5),
         name='Observaciones',
         hovertemplate='Forecast: %{x:.1f}%<br>Real: %{y:.1f}%<extra></extra>'))
     # Línea ideal 45°
     fig_mz.add_trace(go.Scatter(
         x=[vmin, vmax], y=[vmin, vmax], mode='lines',
         name='Ideal (a=0, b=1)',
-        line=dict(color='#3FB950', width=2, dash='dot')))
+        line=dict(color='#2EA043', width=2, dash='dot')))
     # Línea MZ regresión
     x_line = np.linspace(vmin, vmax, 100)
     y_line = alpha + beta * x_line
     fig_mz.add_trace(go.Scatter(
         x=x_line, y=y_line, mode='lines',
         name=f'MZ fit: a={alpha:.2f}, b={beta:.2f}',
-        line=dict(color='#F0883E', width=2)))
+        line=dict(color='#E0B94A', width=2)))
     fig_mz.update_layout(
         title=dict(
             text=f'<b>Mincer-Zarnowitz</b>'
                  f'<sup>  a={alpha:.2f} (↓0) · b={beta:.2f} (↑1) · sin sesgo si a≈0, b≈1</sup>',
-            font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
-        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
+            font=dict(size=13, color='#D7DEE7', family='Inter'), x=0.5),
+        template='plotly_dark', paper_bgcolor='#0B0F14', plot_bgcolor='#11161D',
         height=300, margin=dict(l=55, r=30, t=60, b=55),
-        xaxis=dict(title='HAR-A Forecast (%)', gridcolor='#21262D',
-                   tickfont=dict(size=9, color='#8B949E')),
-        yaxis=dict(title='RV Realizada (%)', gridcolor='#21262D',
-                   tickfont=dict(size=9, color='#8B949E')),
+        xaxis=dict(title='HAR-A Forecast (%)', gridcolor='#1B222B',
+                   tickfont=dict(size=9, color='#8B96A5')),
+        yaxis=dict(title='RV Realizada (%)', gridcolor='#1B222B',
+                   tickfont=dict(size=9, color='#8B96A5')),
         legend=dict(orientation='h', y=1.02, bgcolor='rgba(0,0,0,0)',
-                    font=dict(size=9, color='#C9D1D9', family='JetBrains Mono')))
+                    font=dict(size=9, color='#D7DEE7', family='IBM Plex Mono')))
 
     return fig_ts, fig_mz
 
@@ -2544,20 +2526,20 @@ def build_rv_chart(bt, window=252):
     p = bt.tail(window).dropna(subset=['RV20'])
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=p.index, y=p['VIX_Close'], name='VIX',
-        line=dict(color='#F85149', width=2.5)))
-    for col, lbl, clr in [('RV5','RV5 (1w)','#D29922'), ('RV10','RV10 (2w)','#F0883E'),
-                           ('RV20','RV20 (1m)','#58A6FF'), ('RV60','RV60 (3m)','#BC8CFF')]:
+        line=dict(color='#E5484D', width=2.5)))
+    for col, lbl, clr in [('RV5','RV5 (1w)','#D4A72C'), ('RV10','RV10 (2w)','#E0B94A'),
+                           ('RV20','RV20 (1m)','#6CA0DC'), ('RV60','RV60 (3m)','#A78BFA')]:
         if col in p.columns:
             fig.add_trace(go.Scatter(x=p.index, y=p[col], name=lbl, line=dict(color=clr, width=1.2)))
     fig.update_layout(
         title=dict(text='<b>Implied vs Realized Vol</b><sup>  VIX encima = VRP positivo</sup>',
-                   font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
-        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
+                   font=dict(size=13, color='#D7DEE7', family='Inter'), x=0.5),
+        template='plotly_dark', paper_bgcolor='#0B0F14', plot_bgcolor='#11161D',
         height=350, margin=dict(l=50, r=30, t=55, b=40),
-        xaxis=dict(gridcolor='#21262D', tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
-        yaxis=dict(title='Vol %', gridcolor='#21262D', tickfont=dict(size=9, color='#8B949E')),
+        xaxis=dict(gridcolor='#1B222B', tickfont=dict(size=9, color='#8B96A5', family='IBM Plex Mono')),
+        yaxis=dict(title='Vol %', gridcolor='#1B222B', tickfont=dict(size=9, color='#8B96A5')),
         legend=dict(orientation='h', y=1.02, bgcolor='rgba(0,0,0,0)',
-                    font=dict(size=9, color='#8B949E', family='JetBrains Mono')),
+                    font=dict(size=9, color='#8B96A5', family='IBM Plex Mono')),
         hovermode='x unified')
     return fig
 
@@ -2566,22 +2548,22 @@ def build_roll_yield_chart(bt, window=252):
     if 'Roll_Yield' not in bt.columns:
         return go.Figure()
     p = bt.tail(window).dropna(subset=['Roll_Yield'])
-    colors = ['#3FB950' if v > 0 else '#F85149' for v in p['Roll_Yield']]
+    colors = ['#2EA043' if v > 0 else '#E5484D' for v in p['Roll_Yield']]
     fig = go.Figure()
     fig.add_trace(go.Bar(x=p.index, y=p['Roll_Yield'], marker_color=colors,
         name='Roll Yield %', opacity=0.7))
     fig.add_trace(go.Scatter(x=p.index, y=p['Roll_Yield'].rolling(20).mean(),
-        name='SMA(20)', line=dict(color='#39D2C0', width=2)))
-    fig.add_hline(y=0, line_dash='dash', line_color='#8B949E', line_width=1)
+        name='SMA(20)', line=dict(color='#4FB3A9', width=2)))
+    fig.add_hline(y=0, line_dash='dash', line_color='#8B96A5', line_width=1)
     fig.update_layout(
         title=dict(text='<b>Roll Yield</b><sup>  Carry anualizado · Verde=cobras</sup>',
-                   font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
-        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
+                   font=dict(size=13, color='#D7DEE7', family='Inter'), x=0.5),
+        template='plotly_dark', paper_bgcolor='#0B0F14', plot_bgcolor='#11161D',
         height=300, margin=dict(l=50, r=30, t=55, b=40),
-        xaxis=dict(gridcolor='#21262D', tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
-        yaxis=dict(title='Ann. %', gridcolor='#21262D', tickfont=dict(size=9, color='#8B949E')),
+        xaxis=dict(gridcolor='#1B222B', tickfont=dict(size=9, color='#8B96A5', family='IBM Plex Mono')),
+        yaxis=dict(title='Ann. %', gridcolor='#1B222B', tickfont=dict(size=9, color='#8B96A5')),
         legend=dict(orientation='h', y=1.02, bgcolor='rgba(0,0,0,0)',
-                    font=dict(size=9, color='#8B949E', family='JetBrains Mono')),
+                    font=dict(size=9, color='#8B96A5', family='IBM Plex Mono')),
         hovermode='x unified')
     return fig
 
@@ -2614,39 +2596,39 @@ def build_vvix_ratio_chart(bt, window=252):
 
     fig.add_trace(go.Scatter(
         x=p.index, y=y_vals, name='VVIX/VIX',
-        line=dict(color='#BC8CFF', width=2),
+        line=dict(color='#A78BFA', width=2),
         fill='tozeroy', fillcolor='rgba(188,140,255,0.07)',
         hovertemplate='%{x|%Y-%m-%d}<br>VVIX/VIX: %{y:.2f}<extra></extra>'))
 
     # Bands contextuales
     fig.add_hrect(y0=6, y1=max(float(y_vals.max(skipna=True)) + 1, 8),
-                  fillcolor='rgba(248,81,73,0.07)', line_width=0)
-    fig.add_hline(y=6, line_dash='dash', line_color='#F85149', line_width=1.5,
-        annotation_text='  ⚠ Danger > 6', annotation_font=dict(color='#F85149', size=10))
-    fig.add_hline(y=5, line_dash='dot', line_color='#D29922', line_width=1,
-        annotation_text='  Warning > 5', annotation_font=dict(color='#D29922', size=9))
-    fig.add_hline(y=4, line_dash='dot', line_color='#3FB950', line_width=0.8,
-        annotation_text='  Calm < 4', annotation_font=dict(color='#3FB950', size=8))
+                  fillcolor='rgba(229,72,77,0.07)', line_width=0)
+    fig.add_hline(y=6, line_dash='dash', line_color='#E5484D', line_width=1.5,
+        annotation_text='  ⚠ Danger > 6', annotation_font=dict(color='#E5484D', size=10))
+    fig.add_hline(y=5, line_dash='dot', line_color='#D4A72C', line_width=1,
+        annotation_text='  Warning > 5', annotation_font=dict(color='#D4A72C', size=9))
+    fig.add_hline(y=4, line_dash='dot', line_color='#2EA043', line_width=0.8,
+        annotation_text='  Calm < 4', annotation_font=dict(color='#2EA043', size=8))
 
     # SMA 20d
     sma = pd.Series(y_vals.values, index=p.index).rolling(20, min_periods=5).mean()
     fig.add_trace(go.Scatter(
         x=p.index, y=sma, name='SMA(20)',
-        line=dict(color='#39D2C0', width=1.2, dash='dot'), showlegend=True,
+        line=dict(color='#4FB3A9', width=1.2, dash='dot'), showlegend=True,
         hovertemplate='SMA20: %{y:.2f}<extra></extra>'))
 
     fig.update_layout(
         title=dict(
             text=f'<b>VVIX / VIX Ratio</b><sup>  Fuente: {src_label} · > 6 = dealers anticipan spike</sup>',
-            font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
-        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
+            font=dict(size=13, color='#D7DEE7', family='Inter'), x=0.5),
+        template='plotly_dark', paper_bgcolor='#0B0F14', plot_bgcolor='#11161D',
         height=300, margin=dict(l=50, r=30, t=55, b=40),
-        xaxis=dict(gridcolor='#21262D',
-                   tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
-        yaxis=dict(title='Ratio', gridcolor='#21262D',
-                   tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
+        xaxis=dict(gridcolor='#1B222B',
+                   tickfont=dict(size=9, color='#8B96A5', family='IBM Plex Mono')),
+        yaxis=dict(title='Ratio', gridcolor='#1B222B',
+                   tickfont=dict(size=9, color='#8B96A5', family='IBM Plex Mono')),
         legend=dict(orientation='h', y=1.02, bgcolor='rgba(0,0,0,0)',
-                    font=dict(size=9, color='#8B949E', family='JetBrains Mono')),
+                    font=dict(size=9, color='#8B96A5', family='IBM Plex Mono')),
         hovermode='x unified')
     return fig
 
@@ -2664,37 +2646,37 @@ def build_skew_chart(bt, window=252):
     # Banda ±1σ
     fig.add_hrect(
         y0=mean_skew - std_skew, y1=mean_skew + std_skew,
-        fillcolor='rgba(88,166,255,0.06)', line_width=0)
+        fillcolor='rgba(108,160,220,0.06)', line_width=0)
     fig.add_trace(go.Scatter(
         x=p.index, y=p['SKEW'], name='CBOE SKEW (^SKEW · yfinance)',
-        line=dict(color='#F0883E', width=2),
+        line=dict(color='#E0B94A', width=2),
         hovertemplate='%{x|%Y-%m-%d}<br>SKEW: %{y:.0f}<extra></extra>'))
     # SMA 20
     skew_sma = p['SKEW'].rolling(20, min_periods=5).mean()
     fig.add_trace(go.Scatter(
         x=p.index, y=skew_sma, name='SMA(20)',
-        line=dict(color='#8B949E', width=1.2, dash='dot'),
+        line=dict(color='#8B96A5', width=1.2, dash='dot'),
         hovertemplate='SMA: %{y:.0f}<extra></extra>'))
-    fig.add_hline(y=mean_skew, line_dash='dot', line_color='#58A6FF', line_width=1,
+    fig.add_hline(y=mean_skew, line_dash='dot', line_color='#6CA0DC', line_width=1,
         annotation_text=f'  μ={mean_skew:.0f}',
-        annotation_font=dict(color='#58A6FF', size=9))
-    fig.add_hline(y=150, line_dash='dash', line_color='#F85149', line_width=1.5,
+        annotation_font=dict(color='#6CA0DC', size=9))
+    fig.add_hline(y=150, line_dash='dash', line_color='#E5484D', line_width=1.5,
         annotation_text='  Extremo > 150 (tail-risk hedging)',
-        annotation_font=dict(color='#F85149', size=9))
-    fig.add_hline(y=130, line_dash='dot', line_color='#D29922', line_width=1,
+        annotation_font=dict(color='#E5484D', size=9))
+    fig.add_hline(y=130, line_dash='dot', line_color='#D4A72C', line_width=1,
         annotation_text='  Elevado > 130',
-        annotation_font=dict(color='#D29922', size=8))
+        annotation_font=dict(color='#D4A72C', size=8))
     fig.update_layout(
         title=dict(text='<b>CBOE SKEW Index</b><sup>  ^SKEW yfinance · > 150 = demanda extrema de cola</sup>',
-                   font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
-        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
+                   font=dict(size=13, color='#D7DEE7', family='Inter'), x=0.5),
+        template='plotly_dark', paper_bgcolor='#0B0F14', plot_bgcolor='#11161D',
         height=280, margin=dict(l=50, r=30, t=55, b=40),
-        xaxis=dict(gridcolor='#21262D',
-                   tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
-        yaxis=dict(title='SKEW', gridcolor='#21262D',
-                   tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
+        xaxis=dict(gridcolor='#1B222B',
+                   tickfont=dict(size=9, color='#8B96A5', family='IBM Plex Mono')),
+        yaxis=dict(title='SKEW', gridcolor='#1B222B',
+                   tickfont=dict(size=9, color='#8B96A5', family='IBM Plex Mono')),
         legend=dict(orientation='h', y=1.02, bgcolor='rgba(0,0,0,0)',
-                    font=dict(size=9, color='#8B949E', family='JetBrains Mono')),
+                    font=dict(size=9, color='#8B96A5', family='IBM Plex Mono')),
         hovermode='x unified')
     return fig
 def build_credit_chart(bt, window=252):
@@ -2716,44 +2698,44 @@ def build_credit_chart(bt, window=252):
 
     fig = go.Figure()
     # Área credit spread
-    colors_cs = ['#F85149' if v > 0 else '#3FB950' for v in p['Credit_Spread']]
+    colors_cs = ['#E5484D' if v > 0 else '#2EA043' for v in p['Credit_Spread']]
     fig.add_trace(go.Scatter(
         x=p.index, y=p['Credit_Spread'].clip(lower=0),
         name='Spread widening (risk-off)',
-        fill='tozeroy', line=dict(color='#F85149', width=0),
-        fillcolor='rgba(248,81,73,0.15)',
+        fill='tozeroy', line=dict(color='#E5484D', width=0),
+        fillcolor='rgba(229,72,77,0.15)',
         hoverinfo='skip'))
     fig.add_trace(go.Scatter(
         x=p.index, y=p['Credit_Spread'], name='Credit Spread (HYG-IEF · yfinance)',
-        line=dict(color='#D29922', width=2),
+        line=dict(color='#D4A72C', width=2),
         hovertemplate='%{x|%Y-%m-%d}<br>Spread: %{y:.2f}<extra></extra>'))
     # VIX en eje derecho
     fig.add_trace(go.Scatter(
         x=p.index, y=p['VIX_Close'], name='VIX (^VIX)',
-        yaxis='y2', line=dict(color='#F85149', width=1.5, dash='dot'),
+        yaxis='y2', line=dict(color='#E5484D', width=1.5, dash='dot'),
         hovertemplate='VIX: %{y:.1f}<extra></extra>'))
     # Líneas de percentil
-    fig.add_hline(y=0, line_dash='dash', line_color='#484F58', line_width=1)
-    fig.add_hline(y=p75, line_dash='dot', line_color='#D29922', line_width=1,
+    fig.add_hline(y=0, line_dash='dash', line_color='#3A4552', line_width=1)
+    fig.add_hline(y=p75, line_dash='dot', line_color='#D4A72C', line_width=1,
         annotation_text=f'  P75: {p75:.2f}',
-        annotation_font=dict(color='#D29922', size=8))
-    fig.add_hline(y=p90, line_dash='dash', line_color='#F85149', line_width=1,
+        annotation_font=dict(color='#D4A72C', size=8))
+    fig.add_hline(y=p90, line_dash='dash', line_color='#E5484D', line_width=1,
         annotation_text=f'  P90: {p90:.2f} (stress)',
-        annotation_font=dict(color='#F85149', size=8))
+        annotation_font=dict(color='#E5484D', size=8))
     fig.update_layout(
         title=dict(
             text='<b>Credit Spread vs VIX</b><sup>  HYG/IEF yfinance · Divergencia credit/VIX = warning</sup>',
-            font=dict(size=13, color='#C9D1D9', family='Inter'), x=0.5),
-        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
+            font=dict(size=13, color='#D7DEE7', family='Inter'), x=0.5),
+        template='plotly_dark', paper_bgcolor='#0B0F14', plot_bgcolor='#11161D',
         height=280, margin=dict(l=50, r=60, t=55, b=40),
-        xaxis=dict(gridcolor='#21262D',
-                   tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
+        xaxis=dict(gridcolor='#1B222B',
+                   tickfont=dict(size=9, color='#8B96A5', family='IBM Plex Mono')),
         yaxis=dict(title='Credit Spread (20d momentum)',
-                   gridcolor='#21262D', tickfont=dict(size=9, color='#8B949E')),
+                   gridcolor='#1B222B', tickfont=dict(size=9, color='#8B96A5')),
         yaxis2=dict(title='VIX', overlaying='y', side='right',
-                    tickfont=dict(size=9, color='#F85149'), showgrid=False),
+                    tickfont=dict(size=9, color='#E5484D'), showgrid=False),
         legend=dict(orientation='h', y=1.02, bgcolor='rgba(0,0,0,0)',
-                    font=dict(size=9, color='#8B949E', family='JetBrains Mono')),
+                    font=dict(size=9, color='#8B96A5', family='IBM Plex Mono')),
         hovermode='x unified')
     return fig
 
@@ -2762,8 +2744,108 @@ def build_credit_chart(bt, window=252):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 PARQUET_PATH      = "data/master.parquet"
 BARO_PARQUET_PATH = "data/baro_history.parquet"
+VX_CURVE_PARQUET_PATH = "data/vx_curve_history.parquet"
 
 @st.cache_data(ttl=cfg.CACHE_TTL["parquet"])
+def load_vx_curve_parquet() -> pd.DataFrame:
+    """
+    Histórico DIARIO de la curva de futuros del VIX (M1..M8, DTE, OI, VIX,
+    contango/basis/roll). Lo escribe scripts/update_vx_curve.py desde el CDN
+    público de CBOE, vía GitHub Action diaria. Vacío si aún no existe.
+    """
+    log = logging.getLogger("vix_controller")
+    try:
+        df = pd.read_parquet(VX_CURVE_PARQUET_PATH)
+        df.index = pd.DatetimeIndex(df.index).normalize()
+        df = df.sort_index()
+        # Calidad de la curva: ~1 mes entre M1 y M2. Si no, falta un contrato
+        # en el CDN de CBOE y "M2" es en realidad el de dos meses.
+        if {"dias_m1", "dias_m2"} <= set(df.columns) and "gap_ok" not in df.columns:
+            gap = df["dias_m2"] - df["dias_m1"]
+            df["gap_ok"] = (gap >= 20) & (gap <= 45)
+        return df
+    except FileNotFoundError:
+        log.info("vx_curve parquet no encontrado en %s", VX_CURVE_PARQUET_PATH)
+        return pd.DataFrame()
+    except Exception as e:                       # noqa: BLE001
+        log.warning("Error leyendo vx_curve parquet: %s", e)
+        return pd.DataFrame()
+
+
+def build_curve_signal_history_chart(hist: pd.DataFrame, curve: pd.DataFrame,
+                                     days: int = 504) -> go.Figure:
+    """
+    Cómo ha cambiado la lectura de la curva en el tiempo:
+      panel 1: M1 y VIX (la base) con bandas de color por señal
+      panel 2: contango M1→M2 (%) y su percentil rolling
+    """
+    h = hist.tail(days)
+    c = curve.reindex(h.index)
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        row_heights=[0.58, 0.42], vertical_spacing=0.06,
+                        specs=[[{}], [{"secondary_y": True}]],
+                        subplot_titles=("<b>VIX spot y M1 · fondo = señal de curva</b>",
+                                        "<b>Contango M1→M2 y percentil rolling 5a</b>"))
+    colors = {tsig.SIGNAL_SHORT: "rgba(46,160,67,0.16)",
+              tsig.SIGNAL_LONG: "rgba(229,72,77,0.20)",
+              tsig.SIGNAL_NEUTRAL: "rgba(212,167,44,0.10)"}
+    codes = h["signal"].to_numpy()
+    idx = h.index
+    fig.add_trace(go.Scatter(x=idx, y=c["m1"].tolist(), name="M1 (settle)", mode="lines",
+                             line=dict(color="#C9A227", width=1.8),
+                             hovertemplate="%{x|%Y-%m-%d}<br>M1: %{y:.2f}<extra></extra>"),
+                  row=1, col=1)
+    fig.add_trace(go.Scatter(x=idx, y=c["VIX"].tolist(), name="VIX spot", mode="lines",
+                             line=dict(color="#D7DEE7", width=1.4),
+                             hovertemplate="%{x|%Y-%m-%d}<br>VIX: %{y:.2f}<extra></extra>"),
+                  row=1, col=1)
+    # Bandas por señal — DESPUÉS de los traces del panel: add_vrect(row=1) es
+    # un no-op silencioso si el subplot aún no tiene datos (plotly >= 6).
+    start = 0
+    for i in range(1, len(codes) + 1):
+        if i == len(codes) or codes[i] != codes[start]:
+            fig.add_vrect(x0=idx[start], x1=idx[min(i, len(codes) - 1)],
+                          fillcolor=colors.get(codes[start], "rgba(0,0,0,0)"),
+                          line_width=0, layer="below", row=1, col=1)
+            start = i
+    bar_clr = ["#2EA043" if v > 0 else "#E5484D" for v in h["contango_pct"].fillna(0)]
+    fig.add_trace(go.Bar(x=idx, y=h["contango_pct"].tolist(), name="Contango M1→M2 %",
+                         marker_color=bar_clr, opacity=0.8,
+                         hovertemplate="%{x|%Y-%m-%d}<br>%{y:+.2f}%<extra></extra>"),
+                  row=2, col=1, secondary_y=False)
+    fig.add_trace(go.Scatter(x=idx, y=h["ct_pctile"].tolist(), name="Percentil 5a (eje dcho.)",
+                             mode="lines",
+                             line=dict(color="#8B96A5", width=1.2, dash="dot"),
+                             hovertemplate="%{x|%Y-%m-%d}<br>p%{y:.0f}<extra></extra>"),
+                  row=2, col=1, secondary_y=True)
+    fig.add_hline(y=0, line_color="#3A4552", line_width=1, row=2, col=1, secondary_y=False)
+    # Proxies de leyenda para las bandas (x con fecha válida — ver bug plotly.js)
+    for name, key in (("Short vol favorable", tsig.SIGNAL_SHORT),
+                      ("Long vol", tsig.SIGNAL_LONG), ("Neutral", tsig.SIGNAL_NEUTRAL)):
+        fig.add_trace(go.Scatter(x=[idx[0]], y=[None], mode="markers", name=name,
+                                 marker=dict(size=10, symbol="square",
+                                             color=colors[key].replace("0.10", "0.7")
+                                             .replace("0.13", "0.7").replace("0.07", "0.7")),
+                                 hoverinfo="skip"), row=1, col=1)
+    fig.update_layout(
+        template="plotly_dark", paper_bgcolor="#0B0F14", plot_bgcolor="#11161D",
+        height=520, margin=dict(l=55, r=25, t=45, b=60), hovermode="x unified",
+        bargap=0,
+        legend=dict(orientation="h", yanchor="top", y=-0.07, x=0.5, xanchor="center",
+                    bgcolor="rgba(0,0,0,0)",
+                    font=dict(size=10, color="#D7DEE7", family="IBM Plex Mono")))
+    for ann in fig["layout"]["annotations"][:2]:
+        ann["font"] = dict(size=11, color="#8B96A5", family="Inter")
+        ann["xanchor"] = "left"; ann["x"] = 0.01
+    fig.update_xaxes(gridcolor="#1B222B", tickfont=dict(size=10, color="#8B96A5"))
+    fig.update_yaxes(gridcolor="#1B222B", tickfont=dict(size=9.5, color="#8B96A5"))
+    fig.update_yaxes(ticksuffix="%", row=2, col=1, secondary_y=False)
+    fig.update_yaxes(range=[0, 100], showgrid=False, ticksuffix="", row=2, col=1,
+                     secondary_y=True, title=dict(text="percentil",
+                                                  font=dict(size=9, color="#8B96A5")))
+    return fig
+
+
 def load_baro_parquet() -> pd.DataFrame:
     """
     Lee el parquet histórico del Barómetro VTS.
@@ -3082,7 +3164,7 @@ def build_equity_curve_chart(result: dict) -> go.Figure:
             bh_eq = bh_eq / bh_eq.iloc[0] * 100
             fig.add_trace(go.Scatter(
                 x=df_r.index, y=bh_eq, name="SVXY Buy & Hold",
-                line=dict(color="#484F58", width=1.5, dash="dot"),
+                line=dict(color="#3A4552", width=1.5, dash="dot"),
                 hovertemplate="%{x|%Y-%m-%d}<br>B&H: %{y:.0f}<extra></extra>"), row=1, col=1)
 
     if "ret_spy" in df_r.columns:
@@ -3091,29 +3173,29 @@ def build_equity_curve_chart(result: dict) -> go.Figure:
             spy_eq = spy_eq / spy_eq.iloc[0] * 100
             fig.add_trace(go.Scatter(
                 x=df_r.index, y=spy_eq, name="SPY Buy & Hold",
-                line=dict(color="#8B949E", width=1.5, dash="dot"),
+                line=dict(color="#8B96A5", width=1.5, dash="dot"),
                 hovertemplate="%{x|%Y-%m-%d}<br>SPY: %{y:.0f}<extra></extra>"), row=1, col=1)
 
     fig.add_trace(go.Scatter(
         x=eq.index, y=eq_norm, name="Estrategia BB×CT",
-        line=dict(color="#3FB950", width=2.5),
+        line=dict(color="#2EA043", width=2.5),
         hovertemplate="%{x|%Y-%m-%d}<br>Estrategia: %{y:.0f}<extra></extra>"), row=1, col=1)
 
     # Panel 2: Sharpe rolling 6M
     if "sharpe_roll" in df_r.columns:
         sr = df_r["sharpe_roll"].dropna()
-        colors_sr = ["#3FB950" if v >= 1.0 else "#D29922" if v >= 0.5 else "#F85149" for v in sr]
+        colors_sr = ["#2EA043" if v >= 1.0 else "#D4A72C" if v >= 0.5 else "#E5484D" for v in sr]
         fig.add_trace(go.Scatter(
             x=sr.index, y=sr, name="Sharpe Rolling 6M",
-            line=dict(color="#58A6FF", width=1.8),
+            line=dict(color="#6CA0DC", width=1.8),
             hovertemplate="%{x|%Y-%m-%d}<br>Sharpe 6M: %{y:.2f}<extra></extra>"), row=2, col=1)
-        fig.add_hline(y=1.0, line_dash="dash", line_color="#3FB950", line_width=1,
-                      annotation_text="  1.0 (óptimo)", annotation_font=dict(color="#3FB950", size=8),
+        fig.add_hline(y=1.0, line_dash="dash", line_color="#2EA043", line_width=1,
+                      annotation_text="  1.0 (óptimo)", annotation_font=dict(color="#2EA043", size=8),
                       row=2, col=1)
-        fig.add_hline(y=0.5, line_dash="dot", line_color="#D29922", line_width=1,
-                      annotation_text="  0.5 (alerta)", annotation_font=dict(color="#D29922", size=8),
+        fig.add_hline(y=0.5, line_dash="dot", line_color="#D4A72C", line_width=1,
+                      annotation_text="  0.5 (alerta)", annotation_font=dict(color="#D4A72C", size=8),
                       row=2, col=1)
-        fig.add_hline(y=0, line_dash="solid", line_color="#484F58", line_width=1,
+        fig.add_hline(y=0, line_dash="solid", line_color="#3A4552", line_width=1,
                       row=2, col=1)
 
     wf_m = result.get("wf_months", 6)
@@ -3121,27 +3203,27 @@ def build_equity_curve_chart(result: dict) -> go.Figure:
         title=dict(
             text=f"<b>Equity Curve + Sharpe Rolling {wf_m}M</b>"
                  "<sup>  Base 100 · Verde=estrategia · Gris=benchmarks</sup>",
-            font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5),
-        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+            font=dict(size=13, color="#D7DEE7", family="Inter"), x=0.5),
+        template="plotly_dark", paper_bgcolor="#0B0F14", plot_bgcolor="#11161D",
         height=520, margin=dict(l=55, r=30, t=65, b=40),
-        xaxis=dict(gridcolor="#21262D",
-                   tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono"),
+        xaxis=dict(gridcolor="#1B222B",
+                   tickfont=dict(size=9, color="#8B96A5", family="IBM Plex Mono"),
                    rangeselector=dict(
                        buttons=[dict(count=1,label="1A",step="year",stepmode="backward"),
                                 dict(count=3,label="3A",step="year",stepmode="backward"),
                                 dict(count=5,label="5A",step="year",stepmode="backward"),
                                 dict(step="all",label="Todo")],
-                       bgcolor="#161B22", activecolor="#F7931A",
-                       font=dict(size=9, color="#C9D1D9", family="JetBrains Mono"))),
-        xaxis2=dict(gridcolor="#21262D",
-                    tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono")),
-        yaxis=dict(title="Índice (base 100)", gridcolor="#21262D",
-                   tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono")),
-        yaxis2=dict(title="Sharpe 6M", gridcolor="#21262D",
-                    tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono"),
-                    zeroline=True, zerolinecolor="#484F58"),
+                       bgcolor="#11161D", activecolor="#C9A227",
+                       font=dict(size=9, color="#D7DEE7", family="IBM Plex Mono"))),
+        xaxis2=dict(gridcolor="#1B222B",
+                    tickfont=dict(size=9, color="#8B96A5", family="IBM Plex Mono")),
+        yaxis=dict(title="Índice (base 100)", gridcolor="#1B222B",
+                   tickfont=dict(size=9, color="#8B96A5", family="IBM Plex Mono")),
+        yaxis2=dict(title="Sharpe 6M", gridcolor="#1B222B",
+                    tickfont=dict(size=9, color="#8B96A5", family="IBM Plex Mono"),
+                    zeroline=True, zerolinecolor="#3A4552"),
         legend=dict(orientation="h", y=1.03, bgcolor="rgba(0,0,0,0)",
-                    font=dict(size=9, color="#C9D1D9", family="JetBrains Mono")),
+                    font=dict(size=9, color="#D7DEE7", family="IBM Plex Mono")),
         hovermode="x unified")
     return fig
 
@@ -3156,22 +3238,22 @@ def build_drawdown_chart(result: dict) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=dd.index, y=dd, name="Drawdown",
-        fill="tozeroy", line=dict(color="#F85149", width=1.5),
-        fillcolor="rgba(248,81,73,0.2)",
+        fill="tozeroy", line=dict(color="#E5484D", width=1.5),
+        fillcolor="rgba(229,72,77,0.2)",
         hovertemplate="%{x|%Y-%m-%d}<br>DD: %{y:.1f}%<extra></extra>"))
-    fig.add_hline(y=-10, line_dash="dot", line_color="#D29922", line_width=1,
-                  annotation_text="  -10%", annotation_font=dict(color="#D29922", size=8))
-    fig.add_hline(y=-20, line_dash="dash", line_color="#F85149", line_width=1,
-                  annotation_text="  -20%", annotation_font=dict(color="#F85149", size=8))
+    fig.add_hline(y=-10, line_dash="dot", line_color="#D4A72C", line_width=1,
+                  annotation_text="  -10%", annotation_font=dict(color="#D4A72C", size=8))
+    fig.add_hline(y=-20, line_dash="dash", line_color="#E5484D", line_width=1,
+                  annotation_text="  -20%", annotation_font=dict(color="#E5484D", size=8))
     fig.update_layout(
         title=dict(text="<b>Drawdown Histórico</b>",
-                   font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5),
-        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+                   font=dict(size=13, color="#D7DEE7", family="Inter"), x=0.5),
+        template="plotly_dark", paper_bgcolor="#0B0F14", plot_bgcolor="#11161D",
         height=280, margin=dict(l=55, r=30, t=55, b=40),
-        xaxis=dict(gridcolor="#21262D",
-                   tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono")),
-        yaxis=dict(title="Drawdown %", gridcolor="#21262D",
-                   tickfont=dict(size=9, color="#8B949E"),
+        xaxis=dict(gridcolor="#1B222B",
+                   tickfont=dict(size=9, color="#8B96A5", family="IBM Plex Mono")),
+        yaxis=dict(title="Drawdown %", gridcolor="#1B222B",
+                   tickfont=dict(size=9, color="#8B96A5"),
                    ticksuffix="%"),
         showlegend=False, hovermode="x unified")
     return fig
@@ -3186,7 +3268,7 @@ def build_walkforward_chart(wf_df: pd.DataFrame, wf_months: int = 6) -> go.Figur
 
     # Panel 1: Sharpe por ventana
     xs = wf_df["period_end"].astype(str)
-    colors_wf = ["#3FB950" if v >= 1.0 else "#D29922" if v >= 0.5 else "#F85149"
+    colors_wf = ["#2EA043" if v >= 1.0 else "#D4A72C" if v >= 0.5 else "#E5484D"
                  for v in wf_df["sharpe"]]
     fig.add_trace(go.Bar(
         x=xs, y=wf_df["sharpe"], name=f"Sharpe {wf_months}M",
@@ -3196,43 +3278,43 @@ def build_walkforward_chart(wf_df: pd.DataFrame, wf_months: int = 6) -> go.Figur
     if "bh_sharpe" in wf_df.columns:
         fig.add_trace(go.Scatter(
             x=xs, y=wf_df["bh_sharpe"], name="Sharpe B&H SVXY",
-            line=dict(color="#484F58", width=1.5, dash="dot"),
+            line=dict(color="#3A4552", width=1.5, dash="dot"),
             hovertemplate="B&H Sharpe: %{y:.2f}<extra></extra>"), row=1, col=1)
 
-    fig.add_hline(y=1.0, line_dash="dash", line_color="#3FB950", line_width=1.2, row=1, col=1)
-    fig.add_hline(y=0.5, line_dash="dot", line_color="#D29922", line_width=1, row=1, col=1)
-    fig.add_hline(y=0, line_dash="solid", line_color="#484F58", line_width=1, row=1, col=1)
+    fig.add_hline(y=1.0, line_dash="dash", line_color="#2EA043", line_width=1.2, row=1, col=1)
+    fig.add_hline(y=0.5, line_dash="dot", line_color="#D4A72C", line_width=1, row=1, col=1)
+    fig.add_hline(y=0, line_dash="solid", line_color="#3A4552", line_width=1, row=1, col=1)
 
     # Panel 2: % tiempo invertido
     if "pct_invested" in wf_df.columns:
         fig.add_trace(go.Bar(
             x=xs, y=wf_df["pct_invested"], name="% Tiempo invertido",
-            marker_color="#58A6FF", opacity=0.6,
+            marker_color="#6CA0DC", opacity=0.6,
             hovertemplate="%{x}<br>Invertido: %{y:.0f}%<extra></extra>"), row=2, col=1)
         if "ct_ratio" in wf_df.columns:
             fig.add_trace(go.Scatter(
                 x=xs, y=wf_df["ct_ratio"], name="% Días contango",
-                line=dict(color="#39D2C0", width=1.5),
+                line=dict(color="#4FB3A9", width=1.5),
                 hovertemplate="Contango: %{y:.0f}%<extra></extra>"), row=2, col=1)
 
     fig.update_layout(
         title=dict(
             text=f"<b>Walk-Forward Analysis — Ventanas de {wf_months} Meses</b>"
                  "<sup>  Verde=Sharpe≥1 · Amarillo=0.5-1 · Rojo=<0.5</sup>",
-            font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5),
-        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+            font=dict(size=13, color="#D7DEE7", family="Inter"), x=0.5),
+        template="plotly_dark", paper_bgcolor="#0B0F14", plot_bgcolor="#11161D",
         height=440, margin=dict(l=55, r=30, t=65, b=40),
-        xaxis2=dict(gridcolor="#21262D",
-                    tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono"),
+        xaxis2=dict(gridcolor="#1B222B",
+                    tickfont=dict(size=9, color="#8B96A5", family="IBM Plex Mono"),
                     tickangle=-30),
-        xaxis=dict(gridcolor="#21262D",
-                   tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono")),
-        yaxis=dict(title="Sharpe", gridcolor="#21262D",
-                   tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono")),
-        yaxis2=dict(title="%", gridcolor="#21262D",
-                    tickfont=dict(size=9, color="#8B949E", family="JetBrains Mono")),
+        xaxis=dict(gridcolor="#1B222B",
+                   tickfont=dict(size=9, color="#8B96A5", family="IBM Plex Mono")),
+        yaxis=dict(title="Sharpe", gridcolor="#1B222B",
+                   tickfont=dict(size=9, color="#8B96A5", family="IBM Plex Mono")),
+        yaxis2=dict(title="%", gridcolor="#1B222B",
+                    tickfont=dict(size=9, color="#8B96A5", family="IBM Plex Mono")),
         legend=dict(orientation="h", y=1.03, bgcolor="rgba(0,0,0,0)",
-                    font=dict(size=9, color="#C9D1D9", family="JetBrains Mono")),
+                    font=dict(size=9, color="#D7DEE7", family="IBM Plex Mono")),
         hovermode="x unified", bargap=0.1)
     return fig
 
@@ -3269,23 +3351,23 @@ def build_monthly_returns_heatmap(monthly_df: pd.DataFrame) -> go.Figure:
     fig.add_trace(go.Heatmap(
         z=Z, x=month_names, y=years,
         text=text, texttemplate="%{text}",
-        textfont=dict(size=9, color="#F0F6FC", family="JetBrains Mono"),
+        textfont=dict(size=9, color="#F5F7FA", family="IBM Plex Mono"),
         colorscale=colorscale,
         zmid=0,
-        colorbar=dict(title=dict(text="Ret%", font=dict(color="#8B949E", size=9)),
-                      tickfont=dict(color="#8B949E", size=8),
+        colorbar=dict(title=dict(text="Ret%", font=dict(color="#8B96A5", size=9)),
+                      tickfont=dict(color="#8B96A5", size=8),
                       len=0.8, thickness=12, ticksuffix="%"),
         hovertemplate="Año: %{y}<br>Mes: %{x}<br>Ret: %{z:.1f}%<extra></extra>",
         xgap=2, ygap=2))
 
     fig.update_layout(
         title=dict(text="<b>Retornos Mensuales — Estrategia BB×Contango</b>",
-                   font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5),
-        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+                   font=dict(size=13, color="#D7DEE7", family="Inter"), x=0.5),
+        template="plotly_dark", paper_bgcolor="#0B0F14", plot_bgcolor="#11161D",
         height=max(280, len(years)*38 + 80),
         margin=dict(l=60, r=20, t=60, b=40),
-        xaxis=dict(tickfont=dict(size=10, color="#C9D1D9", family="JetBrains Mono")),
-        yaxis=dict(tickfont=dict(size=10, color="#C9D1D9", family="JetBrains Mono"),
+        xaxis=dict(tickfont=dict(size=10, color="#D7DEE7", family="IBM Plex Mono")),
+        yaxis=dict(tickfont=dict(size=10, color="#D7DEE7", family="IBM Plex Mono"),
                    autorange="reversed"))
     return fig
 
@@ -3297,7 +3379,7 @@ def build_trades_chart(trades_df: pd.DataFrame) -> go.Figure:
     fig = make_subplots(rows=2, cols=1, shared_xaxes=False,
                         row_heights=[0.5, 0.5], vertical_spacing=0.06)
 
-    colors_t = ["#3FB950" if v > 0 else "#F85149" for v in trades_df["ret_pct"]]
+    colors_t = ["#2EA043" if v > 0 else "#E5484D" for v in trades_df["ret_pct"]]
     fig.add_trace(go.Bar(
         x=list(range(1, len(trades_df)+1)), y=trades_df["ret_pct"],
         marker_color=colors_t, opacity=0.8, name="Ret % por trade",
@@ -3309,27 +3391,27 @@ def build_trades_chart(trades_df: pd.DataFrame) -> go.Figure:
     cum = (1 + trades_df["ret_pct"]/100).cumprod() * 100
     fig.add_trace(go.Scatter(
         x=list(range(1, len(cum)+1)), y=cum, name="Equity por trade (base 100)",
-        line=dict(color="#58A6FF", width=2.5),
+        line=dict(color="#6CA0DC", width=2.5),
         hovertemplate="Trade %{x}<br>Eq: %{y:.0f}<extra></extra>"), row=2, col=1)
 
-    fig.add_hline(y=0, line_dash="dash", line_color="#484F58", row=1, col=1)
-    fig.add_hline(y=100, line_dash="dash", line_color="#484F58", row=2, col=1)
+    fig.add_hline(y=0, line_dash="dash", line_color="#3A4552", row=1, col=1)
+    fig.add_hline(y=100, line_dash="dash", line_color="#3A4552", row=2, col=1)
 
     fig.update_layout(
         title=dict(text="<b>Trades Individuales</b><sup>  Verde=ganador · Rojo=perdedor</sup>",
-                   font=dict(size=13, color="#C9D1D9", family="Inter"), x=0.5),
-        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+                   font=dict(size=13, color="#D7DEE7", family="Inter"), x=0.5),
+        template="plotly_dark", paper_bgcolor="#0B0F14", plot_bgcolor="#11161D",
         height=400, margin=dict(l=55, r=30, t=60, b=40),
-        xaxis=dict(title="Trade #", gridcolor="#21262D",
-                   tickfont=dict(size=9, color="#8B949E")),
-        xaxis2=dict(title="Trade #", gridcolor="#21262D",
-                    tickfont=dict(size=9, color="#8B949E")),
-        yaxis=dict(title="Retorno %", gridcolor="#21262D",
-                   tickfont=dict(size=9, color="#8B949E"), ticksuffix="%"),
-        yaxis2=dict(title="Equity (base 100)", gridcolor="#21262D",
-                    tickfont=dict(size=9, color="#8B949E")),
+        xaxis=dict(title="Trade #", gridcolor="#1B222B",
+                   tickfont=dict(size=9, color="#8B96A5")),
+        xaxis2=dict(title="Trade #", gridcolor="#1B222B",
+                    tickfont=dict(size=9, color="#8B96A5")),
+        yaxis=dict(title="Retorno %", gridcolor="#1B222B",
+                   tickfont=dict(size=9, color="#8B96A5"), ticksuffix="%"),
+        yaxis2=dict(title="Equity (base 100)", gridcolor="#1B222B",
+                    tickfont=dict(size=9, color="#8B96A5")),
         legend=dict(orientation="h", y=1.03, bgcolor="rgba(0,0,0,0)",
-                    font=dict(size=9, color="#C9D1D9", family="JetBrains Mono")),
+                    font=dict(size=9, color="#D7DEE7", family="IBM Plex Mono")),
         showlegend=True, hovermode="x unified", bargap=0.15)
     return fig
 
@@ -3355,18 +3437,13 @@ def build_strategy_cached(df: pd.DataFrame) -> pd.DataFrame:
     bt['BB_Upper'] = bt['BB_SMA20'] + 2.0 * bt['BB_STD20']
     bt['BB_Lower'] = bt['BB_SMA20'] - 2.0 * bt['BB_STD20']
 
-    # Señal BB pura
-    sig = pd.Series(0, index=bt.index)
-    pos = 0
-    for i in range(len(bt)):
-        p = bt['VXX_Close'].iloc[i]
-        s = bt['BB_SMA20'].iloc[i]
-        u = bt['BB_Upper'].iloc[i]
-        if pd.isna(s) or pd.isna(u) or pd.isna(p):
-            sig.iloc[i] = pos; continue
-        if pos == 0 and p < s:   pos = 1
-        elif pos == 1 and p > u: pos = 0
-        sig.iloc[i] = pos
+    # Señal BB pura — máquina de estados vectorizada en numpy (misma lógica,
+    # antes iteraba con .iloc fila a fila)
+    sig = pd.Series(
+        bb_position_state(bt['VXX_Close'].to_numpy(dtype=float),
+                          bt['BB_SMA20'].to_numpy(dtype=float),
+                          bt['BB_Upper'].to_numpy(dtype=float)),
+        index=bt.index)
 
     bt['sig_bb']    = sig.shift(1).fillna(0).astype(int)
     bt['ct_filter'] = bt['In_Contango'].fillna(0).astype(int)
@@ -3461,10 +3538,10 @@ def build_vxx_operational_chart(bt: pd.DataFrame,
     # item sí aparece en la leyenda.
     _x0 = bt.index[0]
     fig.add_trace(go.Scatter(x=[_x0], y=[None], mode='markers',
-        marker=dict(size=10, color='rgba(63,185,80,0.35)', symbol='square'),
+        marker=dict(size=10, color='rgba(46,160,67,0.35)', symbol='square'),
         name='Zona LONG', showlegend=True, hoverinfo='skip'), row=1, col=1)
     fig.add_trace(go.Scatter(x=[_x0], y=[None], mode='markers',
-        marker=dict(size=10, color='rgba(248,81,73,0.35)', symbol='square'),
+        marker=dict(size=10, color='rgba(229,72,77,0.35)', symbol='square'),
         name='Backwardation', showlegend=True, hoverinfo='skip'), row=1, col=1)
 
     # ── BB band (fill entre upper y lower) ────────────────
@@ -3475,30 +3552,30 @@ def build_vxx_operational_chart(bt: pd.DataFrame,
     # nativas la serialización es JSON plano y el render funciona.
     fig.add_trace(go.Scatter(x=bt.index, y=bt['BB_Upper'].tolist(),
         mode='lines', name='BB 2σ Upper',
-        line=dict(color='#F85149', width=1, dash='dot'),
+        line=dict(color='#E5484D', width=1, dash='dot'),
         hoverinfo='skip'), row=1, col=1)
     fig.add_trace(go.Scatter(x=bt.index, y=bt['BB_Lower'].tolist(),
         mode='lines', name='BB 2σ Lower', showlegend=False,
-        line=dict(color='#F85149', width=0.7, dash='dot'),
-        fill='tonexty', fillcolor='rgba(248,81,73,0.04)',
+        line=dict(color='#E5484D', width=0.7, dash='dot'),
+        fill='tonexty', fillcolor='rgba(229,72,77,0.04)',
         hoverinfo='skip'), row=1, col=1)
     fig.add_trace(go.Scatter(x=bt.index, y=bt['BB_SMA20'].tolist(),
         mode='lines', name='SMA(20)',
-        line=dict(color='#58A6FF', width=1.5, dash='dash'),
+        line=dict(color='#6CA0DC', width=1.5, dash='dash'),
         hovertemplate='%{x|%Y-%m-%d} · SMA: $%{y:.2f}<extra></extra>'), row=1, col=1)
     fig.add_trace(go.Scatter(x=bt.index, y=vxx.tolist(),
         mode='lines', name='VXX',
-        line=dict(color='#F0F6FC', width=2.2),
+        line=dict(color='#F5F7FA', width=2.2),
         hovertemplate='<b>%{x|%Y-%m-%d}</b><br>VXX: <b>$%{y:.2f}</b><extra></extra>'),
         row=1, col=1)
 
     # ── Shading de zonas (DESPUÉS de los traces — ver nota arriba) ──
     for start, end in long_blocks:
         fig.add_vrect(x0=start, x1=end, row=1, col=1,
-                      fillcolor='rgba(63,185,80,0.08)', line_width=0, layer='below')
+                      fillcolor='rgba(46,160,67,0.08)', line_width=0, layer='below')
     for start, end in bkwd_blocks:
         fig.add_vrect(x0=start, x1=end, row=1, col=1,
-                      fillcolor='rgba(248,81,73,0.07)', line_width=0, layer='below')
+                      fillcolor='rgba(229,72,77,0.07)', line_width=0, layer='below')
 
     # ── Flechas como SCATTER MARKERS (visibles) ──────────
     entry_dates, entry_prices = [], []
@@ -3540,7 +3617,7 @@ def build_vxx_operational_chart(bt: pd.DataFrame,
             y=[p * 0.94 for p in entry_prices],  # ligeramente debajo
             mode='markers',
             name=f'▲ Entrada ({n_entries})',
-            marker=dict(size=14, color='#3FB950', symbol='triangle-up',
+            marker=dict(size=14, color='#2EA043', symbol='triangle-up',
                         line=dict(width=1.5, color='#FFFFFF')),
             hovertemplate='<b>ENTRADA</b><br>%{x|%Y-%m-%d}<br>VXX: $%{customdata:.2f}<extra></extra>',
             customdata=entry_prices,
@@ -3553,7 +3630,7 @@ def build_vxx_operational_chart(bt: pd.DataFrame,
             y=[p * 1.06 for p in exit_bb_prices],
             mode='markers',
             name=f'▼ Salida BB ({len(exit_bb_dates)})',
-            marker=dict(size=14, color='#D29922', symbol='triangle-down',
+            marker=dict(size=14, color='#D4A72C', symbol='triangle-down',
                         line=dict(width=1.5, color='#FFFFFF')),
             hovertemplate='<b>SALIDA · BB 2σ</b><br>%{x|%Y-%m-%d}<br>VXX: $%{customdata:.2f}<extra></extra>',
             customdata=exit_bb_prices,
@@ -3566,14 +3643,14 @@ def build_vxx_operational_chart(bt: pd.DataFrame,
             y=[p * 1.06 for p in exit_ct_prices],
             mode='markers',
             name=f'▼ Salida CT ({len(exit_ct_dates)})',
-            marker=dict(size=14, color='#F85149', symbol='triangle-down',
+            marker=dict(size=14, color='#E5484D', symbol='triangle-down',
                         line=dict(width=1.5, color='#FFFFFF')),
             hovertemplate='<b>SALIDA · Contango</b><br>%{x|%Y-%m-%d}<br>VXX: $%{customdata:.2f}<extra></extra>',
             customdata=exit_ct_prices,
         ), row=1, col=1)
 
     # Punto HOY (grande, con halo)
-    today_clr = '#3FB950' if final_sig_today else '#F85149'
+    today_clr = '#2EA043' if final_sig_today else '#E5484D'
     today_lbl = 'HOY · LONG' if final_sig_today else 'HOY · CASH'
     # Halo (marker grande semi-transparente)
     fig.add_trace(go.Scatter(
@@ -3595,7 +3672,7 @@ def build_vxx_operational_chart(bt: pd.DataFrame,
     # ══════════════════════════════════════════════════════
     if 'Contango_pct' in bt.columns:
         ct_hist  = bt['Contango_pct'].fillna(0)
-        bar_clrs = ['#3FB950' if v > 0 else '#F85149' for v in ct_hist]
+        bar_clrs = ['#2EA043' if v > 0 else '#E5484D' for v in ct_hist]
         fig.add_trace(go.Bar(
             x=bt.index, y=ct_hist.tolist(),
             name='Contango % hist', marker_color=bar_clrs, opacity=0.75,
@@ -3603,7 +3680,7 @@ def build_vxx_operational_chart(bt: pd.DataFrame,
             showlegend=False,
         ), row=2, col=1)
         if ct_today is not None:
-            ct_clr = '#3FB950' if ct_today > 0 else '#F85149'
+            ct_clr = '#2EA043' if ct_today > 0 else '#E5484D'
             fig.add_trace(go.Scatter(
                 x=[bt.index[-1]], y=[ct_today],
                 mode='markers', name=f'CT hoy: {ct_today:+.2f}%',
@@ -3611,7 +3688,7 @@ def build_vxx_operational_chart(bt: pd.DataFrame,
                             line=dict(width=2, color='white')),
                 showlegend=False,
             ), row=2, col=1)
-        fig.add_hline(y=0, line_color='#484F58', line_width=1, row=2, col=1)
+        fig.add_hline(y=0, line_color='#3A4552', line_width=1, row=2, col=1)
 
     # ══════════════════════════════════════════════════════
     # PANEL 3: Equity Curve del régimen (estrategia inversa sobre VXX)
@@ -3631,16 +3708,16 @@ def build_vxx_operational_chart(bt: pd.DataFrame,
     fig.add_trace(go.Scatter(
         x=bt.index, y=bh_equity.tolist(),
         mode='lines', name='Buy & Hold SVXY',
-        line=dict(color='#8B949E', width=1.2, dash='dash'),
+        line=dict(color='#8B96A5', width=1.2, dash='dash'),
         hovertemplate='B&H: %{y:.3f}x<extra></extra>',
     ), row=3, col=1)
     fig.add_trace(go.Scatter(
         x=bt.index, y=equity.tolist(),
         mode='lines', name='Estrategia BB × CT',
-        line=dict(color='#39D2C0', width=2.2),
+        line=dict(color='#4FB3A9', width=2.2),
         hovertemplate='<b>%{x|%Y-%m-%d}</b><br>Equity: %{y:.3f}x<extra></extra>',
     ), row=3, col=1)
-    fig.add_hline(y=1.0, line_color='#484F58', line_width=1,
+    fig.add_hline(y=1.0, line_color='#3A4552', line_width=1,
                   line_dash='dot', row=3, col=1)
 
     # ── Stats para el título ──────────────────────────────
@@ -3669,7 +3746,7 @@ def build_vxx_operational_chart(bt: pd.DataFrame,
     # (y=1.12), encimándose todo en la misma franja.
     # ══════════════════════════════════════════════════════
     fig.update_layout(
-        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
+        template='plotly_dark', paper_bgcolor='#0B0F14', plot_bgcolor='#11161D',
         height=740, margin=dict(l=60, r=30, t=48, b=70),
         hovermode='x unified', dragmode='zoom', bargap=0,
         # Leyenda horizontal DEBAJO del chart (estilo Bloomberg) — nunca
@@ -3677,19 +3754,19 @@ def build_vxx_operational_chart(bt: pd.DataFrame,
         legend=dict(orientation='h', yanchor='top', y=-0.045,
                     x=0.5, xanchor='center',
                     bgcolor='rgba(0,0,0,0)', itemwidth=30,
-                    font=dict(size=10, color='#C9D1D9', family='JetBrains Mono')),
+                    font=dict(size=10, color='#D7DEE7', family='IBM Plex Mono')),
     )
 
     # Subplot titles (generados por make_subplots) — small caps a la izquierda
     for annotation in fig['layout']['annotations'][:3]:
-        annotation['font'] = dict(size=11, color='#A0A8B0', family='Inter')
+        annotation['font'] = dict(size=11, color='#8B96A5', family='Inter')
         annotation['xanchor'] = 'left'
         annotation['x'] = 0.01
 
     # Axes
     fig.update_xaxes(
-        gridcolor='#21262D', showgrid=True,
-        tickfont=dict(size=10, color='#A0A8B0', family='JetBrains Mono'),
+        gridcolor='#1B222B', showgrid=True,
+        tickfont=dict(size=10, color='#8B96A5', family='IBM Plex Mono'),
     )
     fig.update_xaxes(
         row=1, col=1,
@@ -3702,24 +3779,24 @@ def build_vxx_operational_chart(bt: pd.DataFrame,
                 dict(count=3,  label="3A",  step="year",  stepmode="backward"),
                 dict(step="all", label="Todo"),
             ],
-            bgcolor='#161B22', activecolor='#F7931A', bordercolor='#30363D',
-            font=dict(size=9, color='#C9D1D9', family='JetBrains Mono'),
+            bgcolor='#11161D', activecolor='#C9A227', bordercolor='#232B35',
+            font=dict(size=9, color='#D7DEE7', family='IBM Plex Mono'),
             x=0.0, xanchor='left', y=1.06, yanchor='bottom',
         ),
     )
-    fig.update_yaxes(gridcolor='#21262D',
-                     tickfont=dict(size=9.5, color='#A0A8B0', family='JetBrains Mono'))
+    fig.update_yaxes(gridcolor='#1B222B',
+                     tickfont=dict(size=9.5, color='#8B96A5', family='IBM Plex Mono'))
     # ESCALA LOG en el panel VXX: el precio back-adjusted (reverse splits 1:4
     # acumulados) va de ~4000 (2018) a ~50 (hoy) — en escala lineal la serie
     # reciente queda aplastada e invisible contra el borde inferior. Log es
     # la representación canónica para un activo con decay exponencial.
     # Los offsets de los markers (×0.94 / ×1.06) son multiplicativos → se
     # ven idénticos en log.
-    fig.update_yaxes(title=dict(text="VXX ($, log)", font=dict(size=10, color='#A0A8B0')),
+    fig.update_yaxes(title=dict(text="VXX ($, log)", font=dict(size=10, color='#8B96A5')),
                      type="log", row=1, col=1)
-    fig.update_yaxes(title=dict(text="CT (%)", font=dict(size=10, color='#A0A8B0')),
-                     zeroline=True, zerolinecolor='#30363D', row=2, col=1)
-    fig.update_yaxes(title=dict(text="Equity ($1 → x)", font=dict(size=10, color='#A0A8B0')),
+    fig.update_yaxes(title=dict(text="CT (%)", font=dict(size=10, color='#8B96A5')),
+                     zeroline=True, zerolinecolor='#232B35', row=2, col=1)
+    fig.update_yaxes(title=dict(text="Equity ($1 → x)", font=dict(size=10, color='#8B96A5')),
                      row=3, col=1)
 
     stats = {
@@ -3761,28 +3838,9 @@ def _rolling_percentile(s: pd.Series, window: int = cfg.VTS_ROLLING_WINDOW) -> p
     evitar percentiles con soporte insuficiente (antes los primeros 30 días
     de una serie producían percentiles basados en <30 obs válidas).
     """
-    if s is None or s.empty:
-        return pd.Series(dtype=float)
-
-    arr = s.to_numpy(dtype=float)
-    n   = len(arr)
-    out = np.full(n, np.nan, dtype=float)
-    min_obs = max(cfg.VTS_MIN_OBS_FLOOR, int(window * cfg.VTS_MIN_OBS_RATIO))
-
-    for i in range(min_obs - 1, n):
-        start = max(0, i - window + 1)
-        window_vals = arr[start:i + 1]
-        cur = arr[i]
-        if np.isnan(cur):
-            continue
-        # Contar cuántos valores válidos son <= cur
-        valid = window_vals[~np.isnan(window_vals)]
-        if len(valid) < min_obs:
-            continue
-        # Percentil: % de valores menores o iguales al actual
-        out[i] = (valid <= cur).mean() * 100.0
-
-    return pd.Series(out, index=s.index)
+    # Delegado al módulo vectorizado (rolling.rank). Mismos semánticos:
+    # min_obs = max(60, window//3), NaN → NaN, empates cuentan como <=.
+    return _rolling_percentile_mod(s, window=window)
 
 
 @st.cache_data(ttl=cfg.CACHE_TTL["barometer"])
@@ -4360,9 +4418,9 @@ def build_regime_probs_chart(probs: pd.DataFrame, days: int = 504) -> go.Figure:
     """Área apilada de probabilidades filtradas calm/transition/panic."""
     p = probs.tail(days)
     fig = go.Figure()
-    colors = {"calm": "rgba(63,185,80,0.75)",
-              "transition": "rgba(210,153,34,0.75)",
-              "panic": "rgba(248,81,73,0.80)"}
+    colors = {"calm": "rgba(46,160,67,0.75)",
+              "transition": "rgba(212,167,44,0.75)",
+              "panic": "rgba(229,72,77,0.80)"}
     names = {"calm": "Calma", "transition": "Transición", "panic": "Pánico"}
     for col in ["calm", "transition", "panic"]:
         if col not in p.columns:
@@ -4373,51 +4431,52 @@ def build_regime_probs_chart(probs: pd.DataFrame, days: int = 504) -> go.Figure:
             fillcolor=colors[col],
             hovertemplate=f"{names[col]}: %{{y:.0%}}<extra></extra>"))
     fig.update_layout(
-        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+        template="plotly_dark", paper_bgcolor="#0B0F14", plot_bgcolor="#11161D",
         height=260, margin=dict(l=50, r=20, t=30, b=35),
         hovermode="x unified", showlegend=True,
         legend=dict(orientation="h", y=1.12, x=0, font=dict(size=10)),
-        yaxis=dict(tickformat=".0%", range=[0, 1], gridcolor="#21262D",
-                   title=dict(text="P(régimen)", font=dict(size=10, color="#A0A8B0"))),
-        xaxis=dict(gridcolor="#21262D"),
+        yaxis=dict(tickformat=".0%", range=[0, 1], gridcolor="#1B222B",
+                   title=dict(text="P(régimen)", font=dict(size=10, color="#8B96A5"))),
+        xaxis=dict(gridcolor="#1B222B"),
         title=dict(text="<b>Probabilidad filtrada de régimen (sin look-ahead)</b>",
-                   font=dict(size=12, color="#A0A8B0"), x=0.01))
+                   font=dict(size=12, color="#8B96A5"), x=0.01))
     return fig
 
 
-def build_vrp_chart(vrp_df: pd.DataFrame, days: int = 756) -> go.Figure:
-    """VRP (vol points) con zona negativa resaltada + percentil rolling."""
+def build_vrp_tracker_chart(vrp_df: pd.DataFrame, days: int = 756) -> go.Figure:
+    """VRP (vol points) con zona negativa resaltada + percentil rolling.
+    (Renombrada: sombreaba a build_vrp_chart(ebt), el chart VRP/HAR original.)"""
     p = vrp_df.tail(days)
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
                         row_heights=[0.65, 0.35], vertical_spacing=0.06,
                         subplot_titles=("<b>VRP = VIX − RV20 (vol points)</b>",
                                         "<b>Percentil rolling del VRP en varianza</b>"))
-    vrp_clr = ['#3FB950' if v >= 0 else '#F85149' for v in p['vrp_vol']]
+    vrp_clr = ['#2EA043' if v >= 0 else '#E5484D' for v in p['vrp_vol']]
     fig.add_trace(go.Bar(x=p.index, y=p['vrp_vol'], marker_color=vrp_clr,
                          opacity=0.75, name='VRP', showlegend=False,
                          hovertemplate='%{x|%Y-%m-%d}<br>VRP: %{y:+.2f} pts<extra></extra>'),
                   row=1, col=1)
-    fig.add_hline(y=0, line_color='#484F58', line_width=1, row=1, col=1)
+    fig.add_hline(y=0, line_color='#3A4552', line_width=1, row=1, col=1)
 
     fig.add_trace(go.Scatter(x=p.index, y=p['vrp_pct'], mode='lines',
-                             line=dict(color='#39D2C0', width=1.8),
+                             line=dict(color='#4FB3A9', width=1.8),
                              name='Percentil', showlegend=False,
                              hovertemplate='%{x|%Y-%m-%d}<br>Percentil: %{y:.0f}<extra></extra>'),
                   row=2, col=1)
-    fig.add_hrect(y0=0, y1=20, fillcolor='rgba(248,81,73,0.08)', line_width=0, row=2, col=1)
-    fig.add_hrect(y0=80, y1=100, fillcolor='rgba(63,185,80,0.08)', line_width=0, row=2, col=1)
+    fig.add_hrect(y0=0, y1=20, fillcolor='rgba(229,72,77,0.08)', line_width=0, row=2, col=1)
+    fig.add_hrect(y0=80, y1=100, fillcolor='rgba(46,160,67,0.08)', line_width=0, row=2, col=1)
 
     fig.update_layout(
-        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
+        template='plotly_dark', paper_bgcolor='#0B0F14', plot_bgcolor='#11161D',
         height=420, margin=dict(l=55, r=20, t=40, b=35),
         hovermode='x unified', bargap=0)
     for ann in fig['layout']['annotations'][:2]:
-        ann['font'] = dict(size=11, color='#A0A8B0', family='Inter')
+        ann['font'] = dict(size=11, color='#8B96A5', family='Inter')
         ann['xanchor'] = 'left'; ann['x'] = 0.01
-    fig.update_xaxes(gridcolor='#21262D',
-                     tickfont=dict(size=9.5, color='#A0A8B0', family='JetBrains Mono'))
-    fig.update_yaxes(gridcolor='#21262D',
-                     tickfont=dict(size=9.5, color='#A0A8B0', family='JetBrains Mono'))
+    fig.update_xaxes(gridcolor='#1B222B',
+                     tickfont=dict(size=9.5, color='#8B96A5', family='IBM Plex Mono'))
+    fig.update_yaxes(gridcolor='#1B222B',
+                     tickfont=dict(size=9.5, color='#8B96A5', family='IBM Plex Mono'))
     fig.update_yaxes(range=[0, 100], row=2, col=1)
     return fig
 
@@ -4447,10 +4506,10 @@ def build_vinv_capital_chart(series: pd.DataFrame, k: float) -> go.Figure:
                         "<b>Caída desde máximos</b>"))
 
     estilos = [
-        ("cartera", f"Cartera con sleeve", "#39D2C0", 2.4),
+        ("cartera", f"Cartera con sleeve", "#4FB3A9", 2.4),
         ("spy_apalancado", f"SPY apalancado {vinv.num_es(k, 2)}x (misma volatilidad)",
-         "#F7931A", 1.9),
-        ("spy", "SPY a secas", "#8B949E", 1.4),
+         "#C9A227", 1.9),
+        ("spy", "SPY a secas", "#8B96A5", 1.4),
     ]
     for col, nombre, color, ancho in estilos:
         eq = vinv.curva_capital(series[col])
@@ -4470,28 +4529,28 @@ def build_vinv_capital_chart(series: pd.DataFrame, k: float) -> go.Figure:
             hovertemplate="%{x|%Y-%m-%d}<br>" + nombre + ": %{y:.1f} %<extra></extra>",
         ), row=2, col=1)
 
-    fig.add_hline(y=1.0, line_dash="dot", line_color="#484F58",
+    fig.add_hline(y=1.0, line_dash="dot", line_color="#3A4552",
                   line_width=1, row=1, col=1)
-    fig.add_hline(y=0.0, line_color="#484F58", line_width=1, row=2, col=1)
+    fig.add_hline(y=0.0, line_color="#3A4552", line_width=1, row=2, col=1)
 
     fig.update_layout(
-        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+        template="plotly_dark", paper_bgcolor="#0B0F14", plot_bgcolor="#11161D",
         height=620, margin=dict(l=60, r=25, t=45, b=60), hovermode="x unified",
         legend=dict(orientation="h", yanchor="top", y=-0.06, x=0.5,
                     xanchor="center", bgcolor="rgba(0,0,0,0)",
-                    font=dict(size=10, color="#C9D1D9", family="JetBrains Mono")))
+                    font=dict(size=10, color="#D7DEE7", family="IBM Plex Mono")))
     for ann in fig["layout"]["annotations"][:2]:
-        ann["font"] = dict(size=11, color="#A0A8B0", family="Inter")
+        ann["font"] = dict(size=11, color="#8B96A5", family="Inter")
         ann["xanchor"] = "left"; ann["x"] = 0.01
-    fig.update_xaxes(gridcolor="#21262D",
-                     tickfont=dict(size=10, color="#A0A8B0", family="JetBrains Mono"))
-    fig.update_yaxes(gridcolor="#21262D",
-                     tickfont=dict(size=9.5, color="#A0A8B0", family="JetBrains Mono"))
+    fig.update_xaxes(gridcolor="#1B222B",
+                     tickfont=dict(size=10, color="#8B96A5", family="IBM Plex Mono"))
+    fig.update_yaxes(gridcolor="#1B222B",
+                     tickfont=dict(size=9.5, color="#8B96A5", family="IBM Plex Mono"))
     # Log en el capital: 13 años de compuesto aplastan el tramo inicial en lineal
     fig.update_yaxes(type="log", title=dict(text="capital (log)",
-                     font=dict(size=10, color="#A0A8B0")), row=1, col=1)
+                     font=dict(size=10, color="#8B96A5")), row=1, col=1)
     fig.update_yaxes(ticksuffix=" %", title=dict(text="caída",
-                     font=dict(size=10, color="#A0A8B0")), row=2, col=1)
+                     font=dict(size=10, color="#8B96A5")), row=2, col=1)
     return fig
 
 
@@ -4499,28 +4558,28 @@ def build_vinv_ratios_chart(df: pd.DataFrame, dias: int = 180) -> go.Figure:
     """Las dos medidas contra su umbral de 1,00 — es lo que avisa."""
     p = df.tail(dias)
     fig = go.Figure()
-    fig.add_hrect(y0=0.80, y1=1.0, fillcolor="rgba(248,81,73,0.07)", line_width=0)
-    for col, nombre, color in (("ratio_m2m1", "M2/M1 (futuros)", "#58A6FF"),
-                               ("ratio_vix3m", "VIX3M/VIX (índices)", "#BC8CFF")):
+    fig.add_hrect(y0=0.80, y1=1.0, fillcolor="rgba(229,72,77,0.07)", line_width=0)
+    for col, nombre, color in (("ratio_m2m1", "M2/M1 (futuros)", "#6CA0DC"),
+                               ("ratio_vix3m", "VIX3M/VIX (índices)", "#A78BFA")):
         fig.add_trace(go.Scatter(
             x=p.index, y=p[col].tolist(), name=nombre, mode="lines",
             connectgaps=False,          # un hueco es un hueco: no se interpola
             line=dict(color=color, width=2),
             hovertemplate="%{x|%Y-%m-%d}<br>" + nombre + ": %{y:.4f}<extra></extra>"))
-    fig.add_hline(y=1.0, line_color="#F85149", line_width=1.5, line_dash="dash",
+    fig.add_hline(y=1.0, line_color="#E5484D", line_width=1.5, line_dash="dash",
                   annotation_text="  1,00 — por debajo, invertida",
-                  annotation_font=dict(size=10, color="#F85149"))
+                  annotation_font=dict(size=10, color="#E5484D"))
     fig.update_layout(
-        template="plotly_dark", paper_bgcolor="#0D1117", plot_bgcolor="#161B22",
+        template="plotly_dark", paper_bgcolor="#0B0F14", plot_bgcolor="#11161D",
         height=300, margin=dict(l=55, r=25, t=30, b=50), hovermode="x unified",
         legend=dict(orientation="h", yanchor="top", y=-0.12, x=0.5,
                     xanchor="center", bgcolor="rgba(0,0,0,0)",
-                    font=dict(size=10, color="#C9D1D9", family="JetBrains Mono")),
-        yaxis=dict(gridcolor="#21262D", title=dict(text="ratio",
-                   font=dict(size=10, color="#A0A8B0")),
-                   tickfont=dict(size=9.5, color="#A0A8B0")),
-        xaxis=dict(gridcolor="#21262D",
-                   tickfont=dict(size=10, color="#A0A8B0")))
+                    font=dict(size=10, color="#D7DEE7", family="IBM Plex Mono")),
+        yaxis=dict(gridcolor="#1B222B", title=dict(text="ratio",
+                   font=dict(size=10, color="#8B96A5")),
+                   tickfont=dict(size=9.5, color="#8B96A5")),
+        xaxis=dict(gridcolor="#1B222B",
+                   tickfont=dict(size=10, color="#8B96A5")))
     return fig
 
 
@@ -4535,23 +4594,23 @@ def build_vts_barometer_gauge(score: float, regime: str,
         value=score,
         number=dict(
             suffix="%",
-            font=dict(size=40, color='#F0F6FC', family='Inter'),
+            font=dict(size=40, color='#F5F7FA', family='Inter'),
             valueformat='.2f',
         ),
         domain={'x': [0, 1], 'y': [0, 1]},
         title=dict(
-            text=f"<span style='font-size:0.85rem;color:#8B949E;font-family:JetBrains Mono'>"
+            text=f"<span style='font-size:0.85rem;color:#8B96A5;font-family:IBM Plex Mono'>"
                  f"{date_str}</span><br>"
-                 f"<b style='font-size:1.1rem;color:#F0F6FC;font-family:Inter'>"
+                 f"<b style='font-size:1.1rem;color:#F5F7FA;font-family:Inter'>"
                  f"VTS Volatility Barometer</b>",
-            font=dict(color='#F0F6FC'),
+            font=dict(color='#F5F7FA'),
         ),
         gauge={
             'axis': {
                 'range': [0, 100],
                 'tickwidth': 2,
-                'tickcolor': '#8B949E',
-                'tickfont': dict(size=11, color='#8B949E', family='JetBrains Mono'),
+                'tickcolor': '#8B96A5',
+                'tickfont': dict(size=11, color='#8B96A5', family='IBM Plex Mono'),
                 'tickmode': 'array',
                 'tickvals': [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100],
                 'ticktext': ['0%','10%','20%','30%','40%','50%',
@@ -4559,20 +4618,20 @@ def build_vts_barometer_gauge(score: float, regime: str,
             },
             'bar': {'color': 'rgba(0,0,0,0)', 'thickness': 0.0},
             # Sin borde grueso — el fondo del gauge es limpio
-            'bgcolor': '#0D1117',
+            'bgcolor': '#0B0F14',
             'borderwidth': 0,
-            'bordercolor': '#0D1117',
+            'bordercolor': '#0B0F14',
             'steps': [
                 {'range': [0, 20],   'color': '#2EA043'},    # verde fuerte
-                {'range': [20, 35],  'color': '#3FB950'},    # verde
+                {'range': [20, 35],  'color': '#2EA043'},    # verde
                 {'range': [35, 50],  'color': '#85E89D'},    # verde claro
                 {'range': [50, 65],  'color': '#FFD33D'},    # amarillo
-                {'range': [65, 80],  'color': '#FB8500'},    # naranja
-                {'range': [80, 90],  'color': '#F85149'},    # rojo
+                {'range': [65, 80],  'color': '#D4A72C'},    # naranja
+                {'range': [80, 90],  'color': '#E5484D'},    # rojo
                 {'range': [90, 100], 'color': '#B60205'},    # rojo oscuro
             ],
             'threshold': {
-                'line': {'color': '#0D1117', 'width': 8},
+                'line': {'color': '#0B0F14', 'width': 8},
                 'thickness': 0.85,
                 'value': score,
             },
@@ -4581,10 +4640,10 @@ def build_vts_barometer_gauge(score: float, regime: str,
 
     # Etiqueta de régimen debajo
     if   score < 20: clr = '#2EA043'
-    elif score < 40: clr = '#3FB950'
+    elif score < 40: clr = '#2EA043'
     elif score < 60: clr = '#FFD33D'
-    elif score < 80: clr = '#FB8500'
-    else:            clr = '#F85149'
+    elif score < 80: clr = '#D4A72C'
+    else:            clr = '#E5484D'
 
     fig.add_annotation(
         x=0.5, y=-0.05, xref='paper', yref='paper',
@@ -4593,9 +4652,9 @@ def build_vts_barometer_gauge(score: float, regime: str,
     )
 
     fig.update_layout(
-        paper_bgcolor='#0D1117',
-        plot_bgcolor='#0D1117',
-        font=dict(color='#C9D1D9'),
+        paper_bgcolor='#0B0F14',
+        plot_bgcolor='#0B0F14',
+        font=dict(color='#D7DEE7'),
         height=420,
         margin=dict(l=30, r=30, t=80, b=60),
     )
@@ -4650,12 +4709,12 @@ def build_vts_metrics_table(metrics: list, sort_mode: str = 'vts') -> go.Figure:
 
     # Color por bucket
     def bucket_color(p, is_nan_flag):
-        if is_nan_flag: return '#484F58'
+        if is_nan_flag: return '#3A4552'
         if p < 20:  return '#2EA043'
-        if p < 40:  return '#3FB950'
+        if p < 40:  return '#2EA043'
         if p < 60:  return '#FFD33D'
-        if p < 80:  return '#FB8500'
-        return '#F85149'
+        if p < 80:  return '#D4A72C'
+        return '#E5484D'
 
     bar_colors = [bucket_color(p, nn) for p, nn in zip(pctls, is_nan)]
 
@@ -4664,7 +4723,7 @@ def build_vts_metrics_table(metrics: list, sort_mode: str = 'vts') -> go.Figure:
     # Fondo: barra gris hasta 100
     fig.add_trace(go.Bar(
         x=[100] * n, y=names, orientation='h',
-        marker=dict(color='#161B22', line=dict(width=0)),
+        marker=dict(color='#11161D', line=dict(width=0)),
         showlegend=False, hoverinfo='skip',
         width=0.65,
     ))
@@ -4675,7 +4734,7 @@ def build_vts_metrics_table(metrics: list, sort_mode: str = 'vts') -> go.Figure:
         text=[f"N/A · {v} · w={w:.1f}" if nn else f"{p:.0f}% · {v} · w={w:.1f}"
               for p, v, w, nn in zip(pctls, vals, wts, is_nan)],
         textposition='inside', insidetextanchor='start',
-        textfont=dict(size=10, color='#F0F6FC', family='JetBrains Mono'),
+        textfont=dict(size=10, color='#F5F7FA', family='IBM Plex Mono'),
         showlegend=False,
         hovertemplate='<b>%{y}</b><br>Percentil: %{x:.1f}%<extra></extra>',
         width=0.65,
@@ -4688,30 +4747,30 @@ def build_vts_metrics_table(metrics: list, sort_mode: str = 'vts') -> go.Figure:
     fig.update_layout(
         title=dict(
             text=f"<b>Desglose del Barómetro — Percentil rolling por métrica</b>"
-                 f"<br><span style='font-size:0.7rem;color:#8B949E;font-family:JetBrains Mono'>"
+                 f"<br><span style='font-size:0.7rem;color:#8B96A5;font-family:IBM Plex Mono'>"
                  f"{title_sub} · Verde = vol baja · Rojo = vol alta"
                  f"</span>",
-            font=dict(size=13, color='#F0F6FC', family='Inter'), x=0.5, xanchor='center',
+            font=dict(size=13, color='#F5F7FA', family='Inter'), x=0.5, xanchor='center',
         ),
-        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#0D1117',
+        template='plotly_dark', paper_bgcolor='#0B0F14', plot_bgcolor='#0B0F14',
         barmode='overlay',
         height=max(420, n * 36 + 110),
         margin=dict(l=180, r=30, t=80, b=40),
         xaxis=dict(
-            range=[0, 100], showgrid=True, gridcolor='#21262D',
-            tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono'),
+            range=[0, 100], showgrid=True, gridcolor='#1B222B',
+            tickfont=dict(size=9, color='#8B96A5', family='IBM Plex Mono'),
             tickvals=[0, 25, 50, 75, 100],
             ticktext=['0%', '25%', '50%', '75%', '100%'],
         ),
         yaxis=dict(
-            tickfont=dict(size=10, color='#C9D1D9', family='JetBrains Mono'),
+            tickfont=dict(size=10, color='#D7DEE7', family='IBM Plex Mono'),
             autorange='reversed',
         ),
         showlegend=False,
     )
 
     # Línea vertical en 50%
-    fig.add_vline(x=50, line_color='#30363D', line_dash='dot', line_width=1)
+    fig.add_vline(x=50, line_color='#232B35', line_dash='dot', line_width=1)
 
     return fig
 
@@ -4738,10 +4797,10 @@ def build_vts_history_chart(history: pd.Series, window: int = 252) -> go.Figure:
     # Bandas de régimen (horizontales)
     for y0, y1, color, label in [
         (0, 20,   'rgba(46,160,67,0.10)',   'Vol Baja'),
-        (20, 40,  'rgba(63,185,80,0.08)',   'Moderada'),
+        (20, 40,  'rgba(46,160,67,0.08)',   'Moderada'),
         (40, 60,  'rgba(255,211,61,0.08)',  'Mid'),
         (60, 80,  'rgba(251,133,0,0.08)',   'Elevada'),
-        (80, 100, 'rgba(248,81,73,0.10)',   'Extrema'),
+        (80, 100, 'rgba(229,72,77,0.10)',   'Extrema'),
     ]:
         fig.add_hrect(y0=y0, y1=y1, fillcolor=color, line_width=0, layer='below')
 
@@ -4749,8 +4808,8 @@ def build_vts_history_chart(history: pd.Series, window: int = 252) -> go.Figure:
     fig.add_trace(go.Scatter(
         x=h.index, y=h.values,
         mode='lines', name='Barómetro VTS',
-        line=dict(color='#58A6FF', width=2.2),
-        fill='tozeroy', fillcolor='rgba(88,166,255,0.06)',
+        line=dict(color='#6CA0DC', width=2.2),
+        fill='tozeroy', fillcolor='rgba(108,160,220,0.06)',
         hovertemplate='<b>%{x|%Y-%m-%d}</b><br>Score: %{y:.1f}%<extra></extra>',
     ))
 
@@ -4758,33 +4817,33 @@ def build_vts_history_chart(history: pd.Series, window: int = 252) -> go.Figure:
     fig.add_trace(go.Scatter(
         x=[h.index[-1]], y=[h.iloc[-1]],
         mode='markers', name='HOY',
-        marker=dict(size=14, color='#F7931A', symbol='diamond',
+        marker=dict(size=14, color='#C9A227', symbol='diamond',
                     line=dict(width=2, color='white')),
         showlegend=False,
     ))
 
     # Línea de media histórica
     mean_val = h.mean()
-    fig.add_hline(y=mean_val, line_color='#F7931A', line_dash='dash',
+    fig.add_hline(y=mean_val, line_color='#C9A227', line_dash='dash',
                   line_width=1, annotation_text=f"Media: {mean_val:.1f}%",
                   annotation_position='top right',
-                  annotation_font=dict(size=9, color='#F7931A'))
+                  annotation_font=dict(size=9, color='#C9A227'))
 
     fig.update_layout(
         title=dict(
             text=f"<b>Histórico del Barómetro — últimos {len(h)} días de trading</b>",
-            font=dict(size=13, color='#F0F6FC', family='Inter'),
+            font=dict(size=13, color='#F5F7FA', family='Inter'),
             x=0.5, xanchor='center',
         ),
-        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
+        template='plotly_dark', paper_bgcolor='#0B0F14', plot_bgcolor='#11161D',
         height=380,
         margin=dict(l=50, r=30, t=60, b=40),
-        xaxis=dict(gridcolor='#21262D',
-                   tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono')),
+        xaxis=dict(gridcolor='#1B222B',
+                   tickfont=dict(size=9, color='#8B96A5', family='IBM Plex Mono')),
         yaxis=dict(
-            range=[0, 100], gridcolor='#21262D',
-            tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono'),
-            title=dict(text="Score %", font=dict(size=10, color='#8B949E')),
+            range=[0, 100], gridcolor='#1B222B',
+            tickfont=dict(size=9, color='#8B96A5', family='IBM Plex Mono'),
+            title=dict(text="Score %", font=dict(size=10, color='#8B96A5')),
             tickvals=[0, 20, 40, 60, 80, 100],
         ),
         hovermode='x unified', showlegend=False,
@@ -4807,10 +4866,10 @@ def build_vts_history_full(history: pd.Series) -> go.Figure:
     # Bandas de régimen (horizontales)
     for y0, y1, color, _ in [
         (0, 20,   'rgba(46,160,67,0.10)',   'Vol Baja'),
-        (20, 40,  'rgba(63,185,80,0.08)',   'Moderada'),
+        (20, 40,  'rgba(46,160,67,0.08)',   'Moderada'),
         (40, 60,  'rgba(255,211,61,0.08)',  'Mid'),
         (60, 80,  'rgba(251,133,0,0.08)',   'Elevada'),
-        (80, 100, 'rgba(248,81,73,0.10)',   'Extrema'),
+        (80, 100, 'rgba(229,72,77,0.10)',   'Extrema'),
     ]:
         fig.add_hrect(y0=y0, y1=y1, fillcolor=color, line_width=0, layer='below')
 
@@ -4818,8 +4877,8 @@ def build_vts_history_full(history: pd.Series) -> go.Figure:
     fig.add_trace(go.Scatter(
         x=h.index, y=h.values,
         mode='lines', name='Barómetro VTS',
-        line=dict(color='#58A6FF', width=1.5),
-        fill='tozeroy', fillcolor='rgba(88,166,255,0.04)',
+        line=dict(color='#6CA0DC', width=1.5),
+        fill='tozeroy', fillcolor='rgba(108,160,220,0.04)',
         hovertemplate='<b>%{x|%Y-%m-%d}</b><br>Score: %{y:.1f}%<extra></extra>',
     ))
 
@@ -4827,35 +4886,35 @@ def build_vts_history_full(history: pd.Series) -> go.Figure:
     fig.add_trace(go.Scatter(
         x=[h.index[-1]], y=[h.iloc[-1]],
         mode='markers', name='HOY',
-        marker=dict(size=14, color='#F7931A', symbol='diamond',
+        marker=dict(size=14, color='#C9A227', symbol='diamond',
                     line=dict(width=2, color='white')),
         showlegend=False,
     ))
 
     # Media histórica
     mean_val = h.mean()
-    fig.add_hline(y=mean_val, line_color='#F7931A', line_dash='dash',
+    fig.add_hline(y=mean_val, line_color='#C9A227', line_dash='dash',
                   line_width=1,
                   annotation_text=f"Media: {mean_val:.1f}%",
                   annotation_position='top right',
-                  annotation_font=dict(size=9, color='#F7931A'))
+                  annotation_font=dict(size=9, color='#C9A227'))
 
     fig.update_layout(
         title=dict(
             text=f"<b>Histórico completo del Barómetro VTS</b>"
-                 f"<br><span style='font-size:0.72rem;color:#8B949E;font-family:JetBrains Mono'>"
+                 f"<br><span style='font-size:0.72rem;color:#8B96A5;font-family:IBM Plex Mono'>"
                  f"{h.index[0].date()} → {h.index[-1].date()} · "
                  f"{len(h):,} días · Media: {mean_val:.1f}% · "
                  f"Min: {h.min():.1f}% · Max: {h.max():.1f}%"
                  f"</span>",
-            font=dict(size=13, color='#F0F6FC', family='Inter'),
+            font=dict(size=13, color='#F5F7FA', family='Inter'),
             x=0.5, xanchor='center',
         ),
-        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
+        template='plotly_dark', paper_bgcolor='#0B0F14', plot_bgcolor='#11161D',
         height=480, margin=dict(l=50, r=30, t=85, b=45),
         xaxis=dict(
-            gridcolor='#21262D',
-            tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono'),
+            gridcolor='#1B222B',
+            tickfont=dict(size=9, color='#8B96A5', family='IBM Plex Mono'),
             rangeselector=dict(
                 buttons=[
                     dict(count=1,  label="1M",  step="month", stepmode="backward"),
@@ -4865,15 +4924,15 @@ def build_vts_history_full(history: pd.Series) -> go.Figure:
                     dict(count=5,  label="5A",  step="year",  stepmode="backward"),
                     dict(step="all", label="Todo"),
                 ],
-                bgcolor='#161B22', activecolor='#F7931A', bordercolor='#30363D',
-                font=dict(size=9, color='#C9D1D9', family='JetBrains Mono'),
+                bgcolor='#11161D', activecolor='#C9A227', bordercolor='#232B35',
+                font=dict(size=9, color='#D7DEE7', family='IBM Plex Mono'),
             ),
-            rangeslider=dict(visible=True, thickness=0.04, bgcolor='#161B22'),
+            rangeslider=dict(visible=True, thickness=0.04, bgcolor='#11161D'),
         ),
         yaxis=dict(
-            range=[0, 100], gridcolor='#21262D',
-            tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono'),
-            title=dict(text="Score %", font=dict(size=10, color='#8B949E')),
+            range=[0, 100], gridcolor='#1B222B',
+            tickfont=dict(size=9, color='#8B96A5', family='IBM Plex Mono'),
+            title=dict(text="Score %", font=dict(size=10, color='#8B96A5')),
             tickvals=[0, 20, 40, 60, 80, 100],
         ),
         hovermode='x unified', showlegend=False,
@@ -4918,19 +4977,19 @@ def build_vts_monthly_heatmap(history: pd.Series) -> go.Figure:
         y=pivot.index.tolist(),
         text=text_vals,
         texttemplate='%{text}',
-        textfont=dict(size=10, color='#0D1117', family='JetBrains Mono'),
+        textfont=dict(size=10, color='#0B0F14', family='IBM Plex Mono'),
         colorscale=[
             [0.00, '#2EA043'],
-            [0.20, '#3FB950'],
+            [0.20, '#2EA043'],
             [0.40, '#FFD33D'],
-            [0.60, '#FB8500'],
-            [0.80, '#F85149'],
+            [0.60, '#D4A72C'],
+            [0.80, '#E5484D'],
             [1.00, '#B60205'],
         ],
         zmin=0, zmax=100,
         colorbar=dict(
-            title=dict(text="Score %", font=dict(color='#8B949E', size=10)),
-            tickfont=dict(size=9, color='#8B949E'),
+            title=dict(text="Score %", font=dict(color='#8B96A5', size=10)),
+            tickfont=dict(size=9, color='#8B96A5'),
             thickness=12,
         ),
         hovertemplate='<b>%{y} · %{x}</b><br>Score medio: %{z:.1f}%<extra></extra>',
@@ -4940,18 +4999,18 @@ def build_vts_monthly_heatmap(history: pd.Series) -> go.Figure:
     fig.update_layout(
         title=dict(
             text="<b>Heatmap mensual del Barómetro — media por mes/año</b>"
-                 "<br><span style='font-size:0.72rem;color:#8B949E;font-family:JetBrains Mono'>"
+                 "<br><span style='font-size:0.72rem;color:#8B96A5;font-family:IBM Plex Mono'>"
                  "Detecta patrones estacionales (ej: 'sell in May', vol de septiembre-octubre)"
                  "</span>",
-            font=dict(size=13, color='#F0F6FC', family='Inter'),
+            font=dict(size=13, color='#F5F7FA', family='Inter'),
             x=0.5, xanchor='center',
         ),
-        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#0D1117',
+        template='plotly_dark', paper_bgcolor='#0B0F14', plot_bgcolor='#0B0F14',
         height=max(340, len(pivot) * 24 + 120),
         margin=dict(l=60, r=30, t=85, b=40),
-        xaxis=dict(tickfont=dict(size=10, color='#C9D1D9', family='JetBrains Mono'),
+        xaxis=dict(tickfont=dict(size=10, color='#D7DEE7', family='IBM Plex Mono'),
                    side='top'),
-        yaxis=dict(tickfont=dict(size=10, color='#C9D1D9', family='JetBrains Mono'),
+        yaxis=dict(tickfont=dict(size=10, color='#D7DEE7', family='IBM Plex Mono'),
                    autorange='reversed', dtick=1),
     )
     return fig
@@ -4975,10 +5034,10 @@ def build_vts_regime_distribution(history: pd.Series) -> tuple[go.Figure, dict]:
     # Buckets de régimen
     buckets = [
         (0,   20,  'Vol BAJA',    '#2EA043'),
-        (20,  40,  'MODERADA',    '#3FB950'),
+        (20,  40,  'MODERADA',    '#2EA043'),
         (40,  60,  'MID',         '#FFD33D'),
-        (60,  80,  'ELEVADA',     '#FB8500'),
-        (80,  100, 'EXTREMA',     '#F85149'),
+        (60,  80,  'ELEVADA',     '#D4A72C'),
+        (80,  100, 'EXTREMA',     '#E5484D'),
     ]
 
     total = len(h)
@@ -5000,7 +5059,7 @@ def build_vts_regime_distribution(history: pd.Series) -> tuple[go.Figure, dict]:
         marker=dict(color=colors, line=dict(width=0)),
         text=[f"{c:.1f}% del tiempo" for c in counts],
         textposition='outside',
-        textfont=dict(size=11, color='#F0F6FC', family='JetBrains Mono'),
+        textfont=dict(size=11, color='#F5F7FA', family='IBM Plex Mono'),
         hovertemplate='%{y}<br>%{x:.2f}%<extra></extra>',
         showlegend=False,
     ))
@@ -5008,22 +5067,22 @@ def build_vts_regime_distribution(history: pd.Series) -> tuple[go.Figure, dict]:
     fig.update_layout(
         title=dict(
             text=f"<b>Distribución del tiempo por régimen</b>"
-                 f"<br><span style='font-size:0.72rem;color:#8B949E;font-family:JetBrains Mono'>"
+                 f"<br><span style='font-size:0.72rem;color:#8B96A5;font-family:IBM Plex Mono'>"
                  f"{total:,} días · {h.index[0].date()} → {h.index[-1].date()}"
                  f"</span>",
-            font=dict(size=13, color='#F0F6FC', family='Inter'),
+            font=dict(size=13, color='#F5F7FA', family='Inter'),
             x=0.5, xanchor='center',
         ),
-        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#0D1117',
+        template='plotly_dark', paper_bgcolor='#0B0F14', plot_bgcolor='#0B0F14',
         height=340, margin=dict(l=130, r=80, t=80, b=40),
         xaxis=dict(
             range=[0, max(counts) * 1.2],
-            gridcolor='#21262D', showgrid=True,
-            tickfont=dict(size=9, color='#8B949E', family='JetBrains Mono'),
+            gridcolor='#1B222B', showgrid=True,
+            tickfont=dict(size=9, color='#8B96A5', family='IBM Plex Mono'),
             ticksuffix='%',
         ),
         yaxis=dict(
-            tickfont=dict(size=10, color='#C9D1D9', family='JetBrains Mono'),
+            tickfont=dict(size=10, color='#D7DEE7', family='IBM Plex Mono'),
             autorange='reversed',
         ),
     )
@@ -5076,10 +5135,10 @@ def build_term_chart(vix_spot, df_vx, show_prev=True):
         fig.add_trace(go.Scatter(
             x=vx, y=vy, mode='lines+markers+text',
             name='Last', line=dict(color='#4A90D9', width=3, shape='spline'),
-            marker=dict(size=9, color='#4A90D9', line=dict(width=2, color='#0D1117')),
+            marker=dict(size=9, color='#4A90D9', line=dict(width=2, color='#0B0F14')),
             text=[f"{v:.3f}" for v in vy],
             textposition='top center',
-            textfont=dict(size=10, color='#C9D1D9', family='JetBrains Mono'),
+            textfont=dict(size=10, color='#D7DEE7', family='IBM Plex Mono'),
             hovertemplate='%{text}<extra></extra>',
         ))
 
@@ -5091,19 +5150,19 @@ def build_term_chart(vix_spot, df_vx, show_prev=True):
             fig.add_trace(go.Scatter(
                 x=pvx, y=pvy, mode='lines+markers',
                 name='Previous Close',
-                line=dict(color='#8B949E', width=1.5, dash='dot', shape='spline'),
-                marker=dict(size=5, color='#8B949E', symbol='diamond'),
+                line=dict(color='#8B96A5', width=1.5, dash='dot', shape='spline'),
+                marker=dict(size=5, color='#8B96A5', symbol='diamond'),
                 hovertemplate='Prev: %{y:.3f}<extra></extra>',
             ))
 
     # VIX Index dashed line
     if vix_spot:
-        fig.add_hline(y=vix_spot['price'], line_dash="dash", line_color="#3FB950", line_width=2,
+        fig.add_hline(y=vix_spot['price'], line_dash="dash", line_color="#2EA043", line_width=2,
                       annotation_text=f"  {vix_spot['price']:.2f}",
                       annotation_position="right",
-                      annotation_font=dict(size=12, color="#3FB950", family="Inter"))
+                      annotation_font=dict(size=12, color="#2EA043", family="Inter"))
         fig.add_trace(go.Scatter(x=[None], y=[None], mode='lines', name='VIX Index',
-                                 line=dict(color='#3FB950', width=2, dash='dash'), showlegend=True))
+                                 line=dict(color='#2EA043', width=2, dash='dash'), showlegend=True))
 
     all_y = vy + ([vix_spot['price']] if vix_spot else [])
     y_min = min(all_y) - 1.5 if all_y else 15
@@ -5112,22 +5171,22 @@ def build_term_chart(vix_spot, df_vx, show_prev=True):
     fig.update_layout(
         title=dict(
             text="<b>VIX Futures Term Structure</b><br><sup>Source: CBOE Delayed Quotes · vixcontroller</sup>",
-            font=dict(size=15, color='#C9D1D9', family='Inter'), x=0.5),
-        template='plotly_dark', paper_bgcolor='#0D1117', plot_bgcolor='#161B22',
+            font=dict(size=15, color='#D7DEE7', family='Inter'), x=0.5),
+        template='plotly_dark', paper_bgcolor='#0B0F14', plot_bgcolor='#11161D',
         height=420, margin=dict(l=50, r=30, t=65, b=50),
         xaxis=dict(tickvals=xpos, ticktext=labels,
-                   tickfont=dict(size=11, color='#8B949E', family='JetBrains Mono'),
-                   gridcolor='#21262D', showline=True, linecolor='#30363D',
-                   title=dict(text="Future Month", font=dict(size=11, color='#8B949E', family='Inter'))),
+                   tickfont=dict(size=11, color='#8B96A5', family='IBM Plex Mono'),
+                   gridcolor='#1B222B', showline=True, linecolor='#232B35',
+                   title=dict(text="Future Month", font=dict(size=11, color='#8B96A5', family='Inter'))),
         yaxis=dict(range=[y_min, y_max],
-                   title=dict(text="Volatility", font=dict(size=11, color='#8B949E', family='Inter')),
-                   tickfont=dict(size=11, color='#8B949E', family='JetBrains Mono'),
-                   gridcolor='#21262D', showline=True, linecolor='#30363D'),
+                   title=dict(text="Volatility", font=dict(size=11, color='#8B96A5', family='Inter')),
+                   tickfont=dict(size=11, color='#8B96A5', family='IBM Plex Mono'),
+                   gridcolor='#1B222B', showline=True, linecolor='#232B35'),
         legend=dict(orientation='v', yanchor='top', y=0.99, xanchor='right', x=0.99,
-                    bgcolor='rgba(22,27,34,0.9)', bordercolor='#30363D', borderwidth=1,
-                    font=dict(size=10, color='#C9D1D9', family='JetBrains Mono')),
-        hoverlabel=dict(bgcolor='#1C2128', bordercolor='#58A6FF',
-                        font=dict(size=11, family='JetBrains Mono', color='#C9D1D9')),
+                    bgcolor='rgba(17,22,29,0.9)', bordercolor='#232B35', borderwidth=1,
+                    font=dict(size=10, color='#D7DEE7', family='IBM Plex Mono')),
+        hoverlabel=dict(bgcolor='#151B23', bordercolor='#6CA0DC',
+                        font=dict(size=11, family='IBM Plex Mono', color='#D7DEE7')),
         hovermode='x unified',
     )
     return fig
@@ -5147,7 +5206,7 @@ now_str = now_cdmx().strftime("%Y-%m-%d %H:%M:%S") + " CDMX"
 _h = now_cdmx().hour + now_cdmx().minute / 60
 _mkt_open = 8.5 <= _h < 15 and now_cdmx().weekday() < 5
 mkt_status = "MARKET OPEN" if _mkt_open else "MARKET CLOSED"
-mkt_clr = "#3FB950" if _mkt_open else "#A0A8B0"
+mkt_clr = "#2EA043" if _mkt_open else "#8B96A5"
 mkt_dot = "live-dot" if _mkt_open else "dead-dot"
 st.markdown(f"""
 <div class="hdr">
@@ -5318,14 +5377,18 @@ with tab1:
     #   · Checklist transparente → señal compuesta
     # ═══════════════════════════════════════════════════════════
     _dfh = load_master_parquet()
+    _vxh = load_vx_curve_parquet()          # histórico diario de CBOE (M1..M8)
 
-    # Percentil del contango M1→M2 vs últimos 5 años
+    # Percentil del contango M1→M2 vs últimos 5 años. Fuente preferente: el
+    # histórico diario de futuros de CBOE; si aún no existe, master.parquet.
     ct_pctile = None
-    if (front_ct is not None and not _dfh.empty
-            and 'Contango_pct' in _dfh.columns):
-        _hist_ct = _dfh['Contango_pct'].dropna().tail(1260)
-        if len(_hist_ct) > 200:
-            ct_pctile = float((_hist_ct < front_ct).mean() * 100)
+    _hist_ct = pd.Series(dtype=float)
+    if not _vxh.empty and 'contango_pct' in _vxh.columns:
+        _hist_ct = _vxh['contango_pct'].dropna().tail(tsig.PCTILE_WINDOW)
+    elif not _dfh.empty and 'Contango_pct' in _dfh.columns:
+        _hist_ct = _dfh['Contango_pct'].dropna().tail(tsig.PCTILE_WINDOW)
+    if front_ct is not None and len(_hist_ct) > tsig.PCTILE_MIN_OBS:
+        ct_pctile = float((_hist_ct < front_ct).mean() * 100)
 
     # Roll yield anualizado del ETP: VXX/SVXY rollean DIARIAMENTE de M1 a M2,
     # así que su carry es el contango M1→M2 normalizado por los días entre
@@ -5341,39 +5404,16 @@ with tab1:
     except (TypeError, ValueError, KeyError, IndexError):
         pass
 
-    # ── Checklist → señal compuesta ────────────────────────────
-    checks = []
-    if front_ct is not None:
-        checks.append(("Contango M1→M2 positivo", front_ct > 0,
-                       f"{front_ct:+.2f}%"))
-    if spot_m1 is not None:
-        checks.append(("Prima M1 sobre VIX (basis > 0)", spot_m1 > 0,
-                       f"{spot_m1:+.2f}%"))
-    if ct_pctile is not None:
-        checks.append(("Contango NO comprimido (percentil > 25)", ct_pctile > 25,
-                       f"p{ct_pctile:.0f} de 5 años"))
-    if vix_p is not None:
-        checks.append(("VIX bajo control (< 22)", vix_p < 22, f"{vix_p:.1f}"))
-
-    n_ok = sum(1 for _, ok, _ in checks if ok)
-    inverted = (front_ct is not None and front_ct < 0) or \
-               (spot_m1 is not None and spot_m1 < 0)
-
-    if inverted:
-        ts_sig, ts_clr = "LONG VOL", "var(--r)"
-        ts_desc = ("Curva invertida/estresada — el mercado paga por vol inmediata. "
-                   "El viento de cola del roll favorece VXX/UVXY; el short vol PIERDE el carry.")
-    elif len(checks) >= 3 and n_ok == len(checks):
-        ts_sig, ts_clr = "SHORT VOL", "var(--g)"
-        ts_desc = ("Contango sano con prima sobre spot — la convergencia del futuro "
-                   "hacia el VIX paga el carry al short vol (SVXY/SVIX).")
-    elif ct_pctile is not None and ct_pctile < 15:
-        ts_sig, ts_clr = "NEUTRAL", "var(--y)"
-        ts_desc = ("Contango comprimido (p<15) — el carry no compensa el riesgo de spike. "
-                   "Esperar mejor entrada o reducir tamaño.")
-    else:
-        ts_sig, ts_clr = "NEUTRAL", "var(--y)"
-        ts_desc = "Señales mixtas — sin edge claro de curva. Revisa Barómetro y VRP."
+    # ── Checklist → señal compuesta (lógica en quant/term_structure.py, la
+    #    misma que se reproduce sobre el histórico) ─────────────────────
+    try:
+        _dte1_live = float(m1_dte)
+    except (TypeError, ValueError):
+        _dte1_live = None
+    _cs = tsig.curve_signal(front_ct, spot_m1, ct_pctile, vix_p, dte1=_dte1_live)
+    checks, n_ok, ts_sig, ts_desc = _cs["checks"], _cs["n_ok"], _cs["signal"], _cs["desc"]
+    ts_clr = {tsig.SIGNAL_LONG: "var(--r)", tsig.SIGNAL_SHORT: "var(--g)",
+              tsig.SIGNAL_NEUTRAL: "var(--y)"}[ts_sig]
 
     chk_html = "".join(
         f'<div class="chk"><span class="{"ok" if ok else "no"}">'
@@ -5402,7 +5442,7 @@ with tab1:
             <div class="ic-title">🧭 Lectura de la curva</div>
             <div style="font-family:'Inter',sans-serif;font-weight:900;font-size:1.7rem;
                         color:{ts_clr};text-align:center;padding:0.3rem 0">{ts_sig}</div>
-            <div style="font-family:'JetBrains Mono',monospace;font-size:0.7rem;
+            <div style="font-family:'IBM Plex Mono',monospace;font-size:0.7rem;
                         color:var(--dim);line-height:1.5">{ts_desc}</div>
         </div>""", unsafe_allow_html=True)
     with col_chk:
@@ -5447,42 +5487,73 @@ with tab1:
     fig = build_term_chart(vix_spot, df_vx, show_prev=SHOW_PREV)
     st.plotly_chart(fig, width="stretch", config=dict(displayModeBar=True, displaylogo=False))
 
+    # ── Histórico de la señal de curva (histórico diario de futuros CBOE) ──
+    if not _vxh.empty and {"m1", "m2", "VIX"} <= set(_vxh.columns):
+        try:
+            _sh = tsig.signal_history(_vxh)
+            _opts_sh = sorted(set([126, 252, 504, 1260, len(_sh)]))
+            _n_days_sh = st.select_slider(
+                "Ventana del histórico de señal", options=_opts_sh,
+                value=504 if 504 in _opts_sh else _opts_sh[-1], key="sl_ts_hist",
+                format_func=lambda x: {126: "6 meses", 252: "1 año", 504: "2 años",
+                                       1260: "5 años"}.get(x, "todo"))
+            st.plotly_chart(build_curve_signal_history_chart(_sh, _vxh, days=_n_days_sh),
+                            width="stretch", config=dict(displayModeBar=False))
+            _cnt = _sh["signal"].tail(_n_days_sh).value_counts()
+            _tot = max(int(_cnt.sum()), 1)
+            st.caption(
+                f"Señal reproducida día a día con las mismas reglas que la lectura en vivo, "
+                f"sobre settles diarios de CBOE ({_vxh.index[0].strftime('%d/%m/%Y')} → "
+                f"{_vxh.index[-1].strftime('%d/%m/%Y')}). Reparto en la ventana: "
+                f"short vol favorable {_cnt.get(tsig.SIGNAL_SHORT, 0)/_tot:.0%} · neutral "
+                f"{_cnt.get(tsig.SIGNAL_NEUTRAL, 0)/_tot:.0%} · long vol "
+                f"{_cnt.get(tsig.SIGNAL_LONG, 0)/_tot:.0%}. El percentil es rolling: "
+                f"ningún día ve datos posteriores."
+                + (f" ⚠️ {int((~_vxh['gap_ok']).sum())} fechas con contrato intermedio "
+                   f"ausente en el CDN de CBOE (M2 real = dos meses); se muestran tal cual."
+                   if "gap_ok" in _vxh.columns and (~_vxh["gap_ok"]).any() else ""))
+        except Exception as _e:                   # noqa: BLE001
+            st.warning(f"No se pudo reproducir el histórico de señal: {_e}")
+    else:
+        st.info("El histórico diario de futuros (data/vx_curve_history.parquet) aún no "
+                "existe — lo genera scripts/update_vx_curve.py (GitHub Action diaria).")
+
     # ── Contexto histórico del contango (percentiles visuales) ──
-    if not _dfh.empty and 'Contango_pct' in _dfh.columns:
-        with st.expander("📊 Contango M1→M2 — contexto histórico (últimos 6 meses vs bandas de 5 años)"):
-            _cth = _dfh['Contango_pct'].dropna()
-            if len(_cth) > 300:
+    if len(_hist_ct) > 300:
+        with st.expander("📊 Contango M1→M2 — últimos 6 meses vs bandas de 5 años"):
+            _cth = _hist_ct
+            if True:
                 _win = _cth.tail(1260)
                 _p20, _p50, _p80 = _win.quantile([0.20, 0.50, 0.80])
                 _recent = _cth.tail(126)
                 _fig_ct = go.Figure()
                 _fig_ct.add_hrect(y0=float(_win.min()) - 1, y1=float(_p20),
-                                  fillcolor='rgba(248,81,73,0.07)', line_width=0)
+                                  fillcolor='rgba(229,72,77,0.07)', line_width=0)
                 _fig_ct.add_hrect(y0=float(_p80), y1=float(_win.max()) + 1,
-                                  fillcolor='rgba(63,185,80,0.07)', line_width=0)
+                                  fillcolor='rgba(46,160,67,0.07)', line_width=0)
                 for _lv, _nm in [(_p20, "p20"), (_p50, "p50"), (_p80, "p80")]:
                     _fig_ct.add_hline(y=float(_lv), line_dash='dot',
-                                      line_color='#484F58', line_width=1,
+                                      line_color='#3A4552', line_width=1,
                                       annotation_text=_nm,
-                                      annotation_font=dict(size=9, color='#A0A8B0'))
-                _bar_clrs = ['#3FB950' if v > 0 else '#F85149' for v in _recent]
+                                      annotation_font=dict(size=9, color='#8B96A5'))
+                _bar_clrs = ['#2EA043' if v > 0 else '#E5484D' for v in _recent]
                 _fig_ct.add_trace(go.Bar(x=_recent.index, y=_recent.tolist(),
                                          marker_color=_bar_clrs, opacity=0.8,
                                          hovertemplate='%{x|%Y-%m-%d}<br>%{y:+.2f}%<extra></extra>'))
                 if front_ct is not None:
                     _fig_ct.add_trace(go.Scatter(
                         x=[_recent.index[-1]], y=[front_ct], mode='markers',
-                        marker=dict(size=13, color='#F7931A', symbol='diamond',
+                        marker=dict(size=13, color='#C9A227', symbol='diamond',
                                     line=dict(width=2, color='white')),
                         hovertemplate=f'HOY (CBOE live): {front_ct:+.2f}%<extra></extra>'))
                 _fig_ct.update_layout(
-                    template='plotly_dark', paper_bgcolor='#0D1117',
-                    plot_bgcolor='#161B22', height=280, showlegend=False,
+                    template='plotly_dark', paper_bgcolor='#0B0F14',
+                    plot_bgcolor='#11161D', height=280, showlegend=False,
                     margin=dict(l=50, r=20, t=20, b=35), bargap=0,
                     yaxis=dict(title=dict(text="Contango %",
-                               font=dict(size=10, color='#A0A8B0')),
-                               gridcolor='#21262D', ticksuffix='%'),
-                    xaxis=dict(gridcolor='#21262D'))
+                               font=dict(size=10, color='#8B96A5')),
+                               gridcolor='#1B222B', ticksuffix='%'),
+                    xaxis=dict(gridcolor='#1B222B'))
                 st.plotly_chart(_fig_ct, width="stretch",
                                 config=dict(displayModeBar=False))
                 st.caption(
@@ -5777,7 +5848,7 @@ with tab2:
     # ═══════════════════════════════════════════════════════════
     # SECCIÓN 3 — BACKTEST WALK-FORWARD
     # ═══════════════════════════════════════════════════════════
-    st.markdown("<div style='border-top:2px solid #F7931A;margin:1rem 0 0.5rem'></div>",
+    st.markdown("<div style='border-top:2px solid #C9A227;margin:1rem 0 0.5rem'></div>",
                 unsafe_allow_html=True)
     st.markdown("## 📊 Backtest Walk-Forward — BB×Contango")
 
@@ -6053,7 +6124,7 @@ with tab_edge:
                         <span class="ic-val" style="color:{_reg_clr}">{_reg_desc}</span></div>
                 </div>""", unsafe_allow_html=True)
                 with st.expander("📊 VRP histórico (3 años)", expanded=False):
-                    st.plotly_chart(build_vrp_chart(_vt['df']), width="stretch",
+                    st.plotly_chart(build_vrp_tracker_chart(_vt['df']), width="stretch",
                                     config=dict(displayModeBar=False))
                     st.caption(
                         "Panel superior: VRP diario en vol points (verde = cosechando, rojo = pagando). "
@@ -6099,11 +6170,11 @@ E[RV_futura] = β₀ + β₁·RV_diaria + β₂·RV_semanal(5d) + β₃·RV_mens
                     ev_tag = "HOY" if days == 0 else f"en {days}d"
                     ev_html += (f'<span style="background:var(--card);border:1px solid {ev_clr};'
                                f'border-radius:4px;padding:0.2rem 0.6rem;margin-right:0.4rem;'
-                               f'font-family:JetBrains Mono;font-size:0.75rem;color:{ev_clr}">'
+                               f'font-family:IBM Plex Mono;font-size:0.75rem;color:{ev_clr}">'
                                f'{name} {dt.strftime("%b %d")} · {ev_tag}</span>')
                 st.markdown(f'<div style="margin:0.4rem 0 0.8rem">{ev_html}</div>', unsafe_allow_html=True)
             else:
-                st.markdown('<div style="font-family:JetBrains Mono;font-size:0.75rem;color:#3FB950;'
+                st.markdown('<div style="font-family:IBM Plex Mono;font-size:0.75rem;color:#2EA043;'
                             'margin:0.4rem 0 0.8rem">Sin eventos macro en los proximos 14 dias</div>',
                             unsafe_allow_html=True)
 
@@ -6130,7 +6201,7 @@ E[RV_futura] = β₀ + β₁·RV_diaria + β₂·RV_semanal(5d) + β₃·RV_mens
             st.markdown(f"""<div style="background:{v_bg};border:1px solid {v_clr};
                 border-radius:6px;padding:0.6rem 1rem;margin-bottom:0.8rem">
                 <span style="font-family:Inter;font-weight:800;font-size:1rem;color:{v_clr}">{verdict}</span>
-                <span style="font-family:JetBrains Mono;font-size:0.7rem;color:var(--dim);margin-left:1rem">
+                <span style="font-family:IBM Plex Mono;font-size:0.7rem;color:var(--dim);margin-left:1rem">
                 {len(warnings_e)} warning{'s' if len(warnings_e) != 1 else ''}</span>
             </div>""", unsafe_allow_html=True)
             for w in warnings_e:
@@ -6141,8 +6212,8 @@ E[RV_futura] = β₀ + β₁·RV_diaria + β₂·RV_semanal(5d) + β₃·RV_mens
             # ── Última fecha disponible ──────────────────────────────
             last_date_ebt = ebt.index[-1].date()
             st.markdown(
-                f'<div style="font-family:JetBrains Mono;font-size:0.7rem;color:#8B949E;margin-bottom:0.4rem">'
-                f'📅 Datos hasta: <b style="color:#C9D1D9">{last_date_ebt}</b>'
+                f'<div style="font-family:IBM Plex Mono;font-size:0.7rem;color:#8B96A5;margin-bottom:0.4rem">'
+                f'📅 Datos hasta: <b style="color:#D7DEE7">{last_date_ebt}</b>'
                 f'{"  ✅ Al día" if last_date_ebt >= (now_cdmx().date() - timedelta(days=3)) else "  ⚠ parquet desactualizado"}'
                 f'</div>',
                 unsafe_allow_html=True)
@@ -6174,11 +6245,11 @@ E[RV_futura] = β₀ + β₁·RV_diaria + β₂·RV_semanal(5d) + β₃·RV_mens
                     n_t  = har_bt.get('n_test', '—')
                     st.dataframe(pd.DataFrame(brow1), width="stretch", hide_index=True)
                     st.markdown(f"""
-<div style="font-family:'JetBrains Mono';font-size:0.75rem;color:#8B949E;margin:0.3rem 0">
-<b style="color:#C9D1D9">Mincer-Zarnowitz:</b> α={mz_a} (ideal 0) · β={mz_b} (ideal 1) ·
-<b style="color:#C9D1D9">Muestra test:</b> {n_t} días (~2 años)
+<div style="font-family:'IBM Plex Mono';font-size:0.75rem;color:#8B96A5;margin:0.3rem 0">
+<b style="color:#D7DEE7">Mincer-Zarnowitz:</b> α={mz_a} (ideal 0) · β={mz_b} (ideal 1) ·
+<b style="color:#D7DEE7">Muestra test:</b> {n_t} días (~2 años)
 </div>
-<div style="font-family:'JetBrains Mono';font-size:0.7rem;color:#8B949E;margin-top:0.3rem">
+<div style="font-family:'IBM Plex Mono';font-size:0.7rem;color:#8B96A5;margin-top:0.3rem">
 <b>Interpretación:</b>
 R² OOS > 0.20 = buena predicción (vol es difícil de predecir) ·
 QLIKE penaliza asimétricamente subestimaciones ·
@@ -6442,11 +6513,11 @@ with tab_skew:
     # ════════════════════════════════════════════════════════
     # SECCIÓN: VOL SURFACE FORECAST + SELLING RECOMMENDATIONS
     # ════════════════════════════════════════════════════════
-    st.markdown("<div style='border-top:2px solid #F7931A;margin:0.8rem 0 0.4rem'></div>",
+    st.markdown("<div style='border-top:2px solid #C9A227;margin:0.8rem 0 0.4rem'></div>",
                 unsafe_allow_html=True)
     st.markdown("## 🔮 Forecast de Superficie + Oportunidades de Venta de Vol")
     st.markdown("""
-    <div style="font-family:'JetBrains Mono';font-size:0.72rem;color:#8B949E;margin-bottom:0.6rem">
+    <div style="font-family:'IBM Plex Mono';font-size:0.72rem;color:#8B96A5;margin-bottom:0.6rem">
     <b>Modelo: SVI (Stochastic Volatility Inspired)</b> — Gatheral (2004) ·
     Fitea el smile actual por vencimiento con 5 parámetros (a, b, ρ, m, σ) que satisfacen
     condiciones de no-arbitraje. Luego proyecta el smile del día siguiente según un escenario
@@ -6552,7 +6623,7 @@ with tab_skew:
         # ── Selling recommendations ───────────────────────────
         st.markdown("### 🎯 Opciones Candidatas para Vender Prima")
         st.markdown(f"""
-        <div style="font-family:'JetBrains Mono';font-size:0.72rem;color:#8B949E;margin-bottom:0.5rem">
+        <div style="font-family:'IBM Plex Mono';font-size:0.72rem;color:#8B96A5;margin-bottom:0.5rem">
         Ordenadas por <b>P&L esperado</b> si la IV cae <b>{iv_scenario:+.0f}%</b> hacia el nivel SVI forecasted.
         P&L = Vega × ΔIV · Solo muestra opciones OTM dentro de ±22% del spot con OI > 0.
         </div>""", unsafe_allow_html=True)
@@ -6565,13 +6636,13 @@ with tab_skew:
                 styles = pd.DataFrame("", index=df.index, columns=df.columns)
                 for i in df.index:
                     if df.loc[i,"Tipo"] == "PUT":
-                        styles.loc[i,"Tipo"] = "color: #39D2C0"
+                        styles.loc[i,"Tipo"] = "color: #4FB3A9"
                     else:
-                        styles.loc[i,"Tipo"] = "color: #BC8CFF"
+                        styles.loc[i,"Tipo"] = "color: #A78BFA"
                     if df.loc[i,"P&L Esp. ($)"] > 50:
-                        styles.loc[i,"P&L Esp. ($)"] = "color: #3FB950; font-weight:bold"
+                        styles.loc[i,"P&L Esp. ($)"] = "color: #2EA043; font-weight:bold"
                     elif df.loc[i,"P&L Esp. ($)"] > 20:
-                        styles.loc[i,"P&L Esp. ($)"] = "color: #D29922"
+                        styles.loc[i,"P&L Esp. ($)"] = "color: #D4A72C"
                 return styles
 
             st.dataframe(
@@ -6595,7 +6666,7 @@ with tab_skew:
                         padding:0.7rem 1rem;margin-top:0.5rem">
                 <div style="font-family:Inter;font-weight:800;font-size:1rem;color:var(--g)">
                     🎯 MEJOR CANDIDATO</div>
-                <div style="font-family:'JetBrains Mono';font-size:0.8rem;color:#C9D1D9;margin-top:0.3rem">
+                <div style="font-family:'IBM Plex Mono';font-size:0.8rem;color:#D7DEE7;margin-top:0.3rem">
                     <b>Vender {best['Tipo']} K=${best['Strike']:.0f} exp {best['Exp']} ({best['DTE']}d)</b>
                     · Dist spot: {best['Dist Spot %']:+.1f}%<br>
                     IV actual: {best['IV Actual %']:.1f}% → IV forecast: {best['IV Forecast %']:.1f}%
@@ -6603,7 +6674,7 @@ with tab_skew:
                     Mid: ${best['Mid $']:.2f} · OI: {best['OI']:,} · Vega/ct: ${best['Vega/ct ($)']:.0f}
                     · <b>P&L esperado: ${best['P&L Esp. ($)']:.0f}/contrato</b>
                 </div>
-                <div style="font-family:'JetBrains Mono';font-size:0.65rem;color:#8B949E;margin-top:0.3rem">
+                <div style="font-family:'IBM Plex Mono';font-size:0.65rem;color:#8B96A5;margin-top:0.3rem">
                 ⚠️ Solo análisis educativo. No es recomendación financiera.
                 El P&L esperado asume que la IV cae exactamente {iv_scenario:+.0f}% — nada garantizado.
                 </div>
@@ -6621,11 +6692,11 @@ with tab_skew:
 with tab_gex:
 
     st.markdown("""
-    <div style="font-family:'JetBrains Mono',monospace;font-size:0.72rem;color:#8B949E;
+    <div style="font-family:'IBM Plex Mono',monospace;font-size:0.72rem;color:#8B96A5;
                 padding:0.3rem 0 0.7rem;">
     <b>GEX (Gamma Exposure)</b> mide el gamma neto de los dealers del mercado por strike.
-    Cuando GEX es <span style="color:#3FB950">positivo</span>: dealers compran dips y venden rallies → mercado anclado al strike.
-    Cuando GEX es <span style="color:#F85149">negativo</span>: dealers venden dips y compran rallies → movimientos se amplifican.
+    Cuando GEX es <span style="color:#2EA043">positivo</span>: dealers compran dips y venden rallies → mercado anclado al strike.
+    Cuando GEX es <span style="color:#E5484D">negativo</span>: dealers venden dips y compran rallies → movimientos se amplifican.
     </div>
     """, unsafe_allow_html=True)
 
@@ -6734,11 +6805,11 @@ with tab_gex:
         </div>
         <div class="mpill">
             <div class="ml">Call Wall</div>
-            <div class="mv" style="color:#BC8CFF">${f"{call_w:.0f}" if call_w else "—"} <span style="font-size:0.75rem;color:var(--dim)">({cw_dist})</span></div>
+            <div class="mv" style="color:#A78BFA">${f"{call_w:.0f}" if call_w else "—"} <span style="font-size:0.75rem;color:var(--dim)">({cw_dist})</span></div>
         </div>
         <div class="mpill">
             <div class="ml">Put Wall</div>
-            <div class="mv" style="color:#39D2C0">${f"{put_w:.0f}" if put_w else "—"} <span style="font-size:0.75rem;color:var(--dim)">({pw_dist})</span></div>
+            <div class="mv" style="color:#4FB3A9">${f"{put_w:.0f}" if put_w else "—"} <span style="font-size:0.75rem;color:var(--dim)">({pw_dist})</span></div>
         </div>
         <div class="mpill">
             <div class="ml">%OTM con GEX+</div>
@@ -6866,7 +6937,7 @@ with tab_gex:
 with tab_vinv:
     _ne, _pe = vinv.num_es, vinv.pct_es
 
-    st.markdown(f"""<div style="font-family:'JetBrains Mono',monospace;
+    st.markdown(f"""<div style="font-family:'IBM Plex Mono',monospace;
         font-size:0.72rem;color:var(--dim);padding:0.4rem 0 0.8rem;">
     <b>VIX Inverse</b> · modelo <b style="color:var(--accent)">CONGELADO</b> el
     {vinv.FECHA_CONGELACION} · corto estático de VXX mientras haya contango,
@@ -7018,7 +7089,7 @@ with tab_vinv:
         # 2 · CURVA DE CAPITAL
         # ══════════════════════════════════════════════════════
         st.markdown("#### 📈 Curva de capital y caídas")
-        st.markdown(f"""<div style="font-family:'JetBrains Mono',monospace;
+        st.markdown(f"""<div style="font-family:'IBM Plex Mono',monospace;
             font-size:0.72rem;color:var(--dim);padding:0 0 0.5rem;">
         La comparación que importa es contra el <b style="color:var(--accent)">SPY
         apalancado a la misma volatilidad</b> ({_ne(_vres['k'], 2)}x), no contra el
@@ -7173,7 +7244,7 @@ menos— pero **la magnitud publicada corresponde a otro motor de medición**.
         _rows = ""
         for _o in list(reversed(_ops))[:_n_ver]:
             _neg = _o["ret"] <= 0
-            _bg = "background:rgba(248,81,73,0.10);" if _neg else ""
+            _bg = "background:rgba(229,72,77,0.10);" if _neg else ""
             _rc2 = "var(--r)" if _neg else "var(--g)"
             _fsal = (_o["f_salida"].strftime("%d/%m/%Y") if _o["f_salida"]
                      else '<b style="color:var(--y)">ABIERTA</b>')
@@ -7288,18 +7359,18 @@ tarda entre cuatro y doce años en avisar. Todas las condiciones son
 with tab_baro:
 
     st.markdown("""
-    <div style="font-family:'JetBrains Mono',monospace;font-size:0.72rem;color:#8B949E;
+    <div style="font-family:'IBM Plex Mono',monospace;font-size:0.72rem;color:#8B96A5;
                 padding:0.4rem 0 0.8rem;">
     <b>VTS Volatility Barometer</b> · Réplica de
     <a href="https://www.volatilitytradingstrategies.com" target="_blank"
-       style="color:#58A6FF;text-decoration:none;">volatilitytradingstrategies.com</a>
+       style="color:#6CA0DC;text-decoration:none;">volatilitytradingstrategies.com</a>
     · Combina los <b>13 indicadores oficiales VTS</b> (M1:M2, M4-M7, VX30:VIX Roll Yield,
     VIX/VVIX/VOLI, Cash VIX Oscillator, VIX-VOLI Residual, Traders VRP, SDEX/TDEX/SKEW,
     VIX:VIX3M Medium, Extreme Put/Call, VIX9D:VIX Fast, Volpocalypse Threshold, VIX Level)
     · Score 0-100% · Percentil rolling · Promedio ponderado ·
-    <span style="color:#3FB950">Verde</span> = short vol agresivo ·
-    <span style="color:#D29922">Amarillo</span> = cash / neutral ·
-    <span style="color:#F85149">Rojo</span> = hedge / long vol
+    <span style="color:#2EA043">Verde</span> = short vol agresivo ·
+    <span style="color:#D4A72C">Amarillo</span> = cash / neutral ·
+    <span style="color:#E5484D">Rojo</span> = hedge / long vol
     </div>
     """, unsafe_allow_html=True)
 
@@ -7530,7 +7601,7 @@ with tab_baro:
             if   score < 20: rc = 'var(--g)'
             elif score < 40: rc = 'var(--g)'
             elif score < 60: rc = 'var(--y)'
-            elif score < 80: rc = '#FB8500'
+            elif score < 80: rc = '#D4A72C'
             else:            rc = 'var(--r)'
 
             # Percentil del score HOY vs su historia
@@ -7545,8 +7616,8 @@ with tab_baro:
 
             st.markdown(f"""
             <div style="padding:0.5rem 0;">
-                <div class="sig-box" style="background:rgba(247,147,26,0.08);
-                     border-color:#F7931A;margin-bottom:0.8rem;">
+                <div class="sig-box" style="background:rgba(201,162,39,0.08);
+                     border-color:#C9A227;margin-bottom:0.8rem;">
                     <div class="sl" style="color:{rc};">{score:.2f}%</div>
                     <div class="sd" style="font-size:0.85rem;color:{rc};font-weight:700;">
                         Régimen: {regime}
@@ -7689,8 +7760,8 @@ La utilidad principal es como **filtro de régimen** complementario al Monitor O
         h_clean = hist.dropna()
 
         st.markdown(
-            f"<div style='font-family:JetBrains Mono,monospace;font-size:0.72rem;"
-            f"color:#8B949E;padding:0.3rem 0 0.8rem;'>"
+            f"<div style='font-family:IBM Plex Mono,monospace;font-size:0.72rem;"
+            f"color:#8B96A5;padding:0.3rem 0 0.8rem;'>"
             f"📊 Serie completa: <b>{len(h_clean):,} días</b> · "
             f"{h_clean.index[0].date()} → {h_clean.index[-1].date()} · "
             f"Ventana rolling: <b>{baro_window}d</b>"
@@ -7728,10 +7799,10 @@ La utilidad principal es como **filtro de régimen** complementario al Monitor O
 
         # Determinar régimen de esa fecha
         if   matched_score < 20: reg_sel, clr_sel = "VOL BAJA",  '#2EA043'
-        elif matched_score < 40: reg_sel, clr_sel = "MODERADA",  '#3FB950'
+        elif matched_score < 40: reg_sel, clr_sel = "MODERADA",  '#2EA043'
         elif matched_score < 60: reg_sel, clr_sel = "MID",       '#FFD33D'
-        elif matched_score < 80: reg_sel, clr_sel = "ELEVADA",   '#FB8500'
-        else:                    reg_sel, clr_sel = "EXTREMA",   '#F85149'
+        elif matched_score < 80: reg_sel, clr_sel = "ELEVADA",   '#D4A72C'
+        else:                    reg_sel, clr_sel = "EXTREMA",   '#E5484D'
 
         # Percentil de esa fecha vs todo el histórico
         pct_rank = (h_clean <= matched_score).mean() * 100
@@ -7751,8 +7822,8 @@ La utilidad principal es como **filtro de régimen** complementario al Monitor O
                                         font-size:1rem;color:{clr_sel};">
                                 {reg_sel}
                             </div>
-                            <div style="font-family:JetBrains Mono,monospace;font-size:0.75rem;
-                                        color:#8B949E;margin-top:2px;">
+                            <div style="font-family:IBM Plex Mono,monospace;font-size:0.75rem;
+                                        color:#8B96A5;margin-top:2px;">
                                 Percentil histórico: {pct_rank:.1f}°
                             </div>
                         </div>
@@ -7988,8 +8059,8 @@ with tab4:
     """)
 
 st.markdown(f"""
-<div style="text-align:center;padding:0.8rem 0 0.3rem;border-top:1px solid #30363D;margin-top:1rem;">
-    <span style="font-family:'JetBrains Mono',monospace;font-size:0.6rem;color:#484F58;">
+<div style="text-align:center;padding:0.8rem 0 0.3rem;border-top:1px solid #232B35;margin-top:1rem;">
+    <span style="font-family:'IBM Plex Mono',monospace;font-size:0.6rem;color:#3A4552;">
         VIX CONTROLLER · Alberto Alarcón González · Not financial advice
     </span>
 </div>""", unsafe_allow_html=True)
