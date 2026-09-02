@@ -44,3 +44,33 @@ class TestRollingPercentile:
         s = pd.Series(np.arange(100, dtype=float))
         p = rolling_percentile(s, window=50, min_obs=10)
         assert p.notna().sum() > 0
+
+
+def _reference_loop(s: pd.Series, window: int, min_obs: int) -> pd.Series:
+    """La implementación original en Python puro, conservada como oráculo."""
+    arr = s.to_numpy(dtype=float)
+    n = len(arr)
+    out = np.full(n, np.nan)
+    for i in range(min_obs - 1, n):
+        w = arr[max(0, i - window + 1):i + 1]
+        cur = arr[i]
+        if np.isnan(cur):
+            continue
+        valid = w[~np.isnan(w)]
+        if len(valid) < min_obs:
+            continue
+        out[i] = (valid <= cur).mean() * 100.0
+    return pd.Series(out, index=s.index)
+
+
+class TestVectorizedParity:
+    @pytest.mark.parametrize("seed", [0, 1, 2])
+    def test_matches_reference_with_nans_and_ties(self, seed):
+        rng = np.random.default_rng(seed)
+        x = np.round(rng.normal(0, 1, 1500), 1)        # redondeo → muchos empates
+        x[rng.random(1500) < 0.07] = np.nan            # huecos
+        s = pd.Series(x, index=pd.bdate_range("2018-01-01", periods=1500))
+        for window, min_obs in ((252, 84), (60, 20), (1260, 200)):
+            got = rolling_percentile(s, window=window, min_obs=min_obs)
+            ref = _reference_loop(s, window, min_obs)
+            pd.testing.assert_series_equal(got, ref, check_names=False, atol=1e-9)

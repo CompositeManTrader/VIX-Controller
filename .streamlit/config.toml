@@ -1,13 +1,13 @@
 # Tema nativo alineado a la paleta del dashboard (:root en app.py).
-# Esto hace que los widgets nativos de Streamlit (sliders, botones,
-# selectboxes, dataframes, spinners) usen los colores del design system
-# en lugar del rojo default de Streamlit.
+# Estética sobria de plataforma premium: navy profundo, acento dorado
+# apagado, sin brillos. Los widgets nativos (sliders, botones, selects,
+# dataframes, spinners) heredan estos colores.
 [theme]
 base = "dark"
-primaryColor = "#F7931A"
-backgroundColor = "#0D1117"
-secondaryBackgroundColor = "#161B22"
-textColor = "#C9D1D9"
+primaryColor = "#C9A227"
+backgroundColor = "#0B0F14"
+secondaryBackgroundColor = "#11161D"
+textColor = "#D7DEE7"
 
 [server]
 headless = true
