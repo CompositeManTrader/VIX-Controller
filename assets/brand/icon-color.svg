@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 96" width="120" height="96" role="img" aria-label="Spread Trading Club icon">
+  <line x1="12" y1="78" x2="108" y2="78" stroke="#262A30" stroke-width="1.2"/>
+  <path d="M48 78 L48 36 Q60 20 72 36 L72 78 Z" fill="#F5A623" fill-opacity="0.14"/>
+  <path d="M12 78 C 34 78, 44 26, 60 24 C 76 26, 86 78, 108 78" fill="none" stroke="#F5A623" stroke-width="4.2" stroke-linecap="round"/>
+  <line x1="48" y1="36" x2="48" y2="82" stroke="#F4F5F6" stroke-width="2"/>
+  <line x1="72" y1="36" x2="72" y2="82" stroke="#F4F5F6" stroke-width="2"/>
+  <circle cx="48" cy="36" r="2.8" fill="#F4F5F6"/>
+  <circle cx="72" cy="36" r="2.8" fill="#F4F5F6"/>
+</svg>

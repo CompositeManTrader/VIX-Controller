@@ -220,12 +220,16 @@ def señal_contango(df: pd.DataFrame) -> pd.Series:
     Contango observado en el cierre de CADA fila (sin desplazar todavía).
 
     contango = (M2/M1 > 1) OR (VIX3M/VIX > 1)
+    Si falta cualquiera de las dos medidas: contango = False (regla escrita
+    del informe, «La regla, sin ambigüedad», paso 2). En el histórico no hay
+    ninguna sesión sin alguna de las dos, así que no cambia ninguna cifra.
 
     OJO: `ratio_m2m1` es M2/M1. Invertirlo da la señal del revés.
     """
     r1 = df["ratio_m2m1"] > 1
-    r2 = df["ratio_vix3m"] > 1     # NaN > 1 → False, correcto para un OR
-    return (r1 | r2).astype(bool)
+    r2 = df["ratio_vix3m"] > 1
+    completo = df["ratio_m2m1"].notna() & df["ratio_vix3m"].notna()
+    return ((r1 | r2) & completo).astype(bool)
 
 
 def señal_posicion(df: pd.DataFrame) -> pd.Series:
@@ -271,9 +275,51 @@ def verificar_sin_anticipacion(df: pd.DataFrame, pos: pd.Series) -> None:
 # ──────────────────────────────────────────────────────────────────────
 # SIMULACIÓN — corto estático, ejecución en apertura
 # ──────────────────────────────────────────────────────────────────────
+def motor_corto(o: np.ndarray, c: np.ndarray, s: np.ndarray,
+                prestamo: float = PRESTAMO_ANUAL, coste: float = COSTE_POR_LADO,
+                cap0: float = 1.0, exp0: float = 0.0) -> tuple[np.ndarray, np.ndarray]:
+    """
+    El motor congelado, a pelo. Devuelve (capital, exposición) al CIERRE de
+    cada fila. La fila 0 es el estado inicial (cap0, exp0): su precio de
+    cierre solo se usa como referencia del salto nocturno de la fila 1.
+
+    Esto permite CONTINUAR una simulación: se guarda (cap, exp) del último
+    cierre y la siguiente pasada arranca con esa fila como fila 0. El
+    resultado es idéntico a haber simulado toda la serie de una vez.
+    """
+    o = np.asarray(o, dtype=float)
+    c = np.asarray(c, dtype=float)
+    s = np.asarray(s, dtype=bool)
+    n = len(c)
+    caps = np.full(n, np.nan)
+    exps = np.full(n, np.nan)
+    cap, exp = float(cap0), float(exp0)
+    if n:
+        caps[0], exps[0] = cap, exp
+    for i in range(1, n):
+        if exp:                                  # 1. salto nocturno
+            r = o[i] / c[i - 1] - 1
+            cap -= exp * r
+            exp *= (1 + r)
+        if s[i] and not exp:                     # 2. ejecución en apertura
+            exp = cap
+            cap -= cap * coste
+        elif not s[i] and exp:
+            cap -= abs(exp) * coste
+            exp = 0.0
+        if exp:                                  # 3. sesión + préstamo
+            r = c[i] / o[i] - 1
+            cap -= exp * r
+            exp *= (1 + r)
+            cap -= exp * prestamo / 252
+        caps[i], exps[i] = cap, exp
+    return caps, exps
+
+
 def simular_corto(px_o: pd.Series, px_c: pd.Series, pos: pd.Series,
                   prestamo: float = PRESTAMO_ANUAL,
-                  coste: float = COSTE_POR_LADO) -> pd.Series:
+                  coste: float = COSTE_POR_LADO,
+                  estado0: tuple[float, float] | None = None) -> pd.Series:
     """
     Corto ESTÁTICO de VXX con ejecución en la apertura.
 
@@ -296,30 +342,18 @@ def simular_corto(px_o: pd.Series, px_c: pd.Series, pos: pd.Series,
     ganadores, el resultado final no es monótono en el coste. Es una rareza
     del motor, no un error de transcripción: cambiarla alteraría las cifras
     publicadas del modelo congelado.
+
+    estado0: (capital, exposición) al cierre de la fila 0 para continuar una
+    simulación previa. Sin él, la fila 0 no tiene rendimiento (como el motor
+    original, cuya primera barra queda en NaN).
     """
-    o = px_o.to_numpy(dtype=float)
-    c = px_c.to_numpy(dtype=float)
-    s = pos.to_numpy()
-    cap, exp = 1.0, 0.0
-    out = np.full(len(c), np.nan)
-    for i in range(1, len(c)):
-        if exp:                                  # 1. salto nocturno
-            r = o[i] / c[i - 1] - 1
-            cap -= exp * r
-            exp *= (1 + r)
-        if s[i] and not exp:                     # 2. ejecución en apertura
-            exp = cap
-            cap -= cap * coste
-        elif not s[i] and exp:
-            cap -= abs(exp) * coste
-            exp = 0.0
-        if exp:                                  # 3. sesión + préstamo
-            r = c[i] / o[i] - 1
-            cap -= exp * r
-            exp *= (1 + r)
-            cap -= exp * prestamo / 252
-        out[i] = cap
-    return pd.Series(out, index=px_c.index).pct_change()
+    cap0, exp0 = estado0 if estado0 is not None else (1.0, 0.0)
+    caps, _ = motor_corto(px_o.to_numpy(dtype=float), px_c.to_numpy(dtype=float),
+                          pos.to_numpy(), prestamo, coste, cap0, exp0)
+    out = pd.Series(caps, index=px_c.index)
+    if estado0 is None and len(out):
+        out.iloc[0] = np.nan                     # idéntico al motor original
+    return out.pct_change()
 
 
 def construir_cartera(df: pd.DataFrame, sleeve: pd.Series,

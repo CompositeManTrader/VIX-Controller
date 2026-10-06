@@ -1,20 +1,34 @@
 """
 update_vx_curve.py — Histórico DIARIO de la curva de futuros del VIX.
 
-Fuente: CDN público y gratuito de CBOE (un CSV por contrato, más el índice
-VIX). Construye un panel por fecha con M1..M8 (settle), días a vencimiento,
-open interest, volumen y símbolo de cada mes, y las medidas de la curva que
-usa el tab Term Structure (contango M1→M2, basis VIX→M1, roll yield del ETP).
+Fuentes (CBOE, públicas y gratuitas):
+  · CSV por contrato (CDN)          histórico de settles, OI y volumen
+  · CSV de settlement por fecha     liquidación OFICIAL del día, publicada la
+                                    misma tarde (los CSV por contrato llegan
+                                    con un día de retraso)
+  · CSV de índices (CDN)            cierres de VIX y VIX3M
 
 Salida: data/vx_curve_history.parquet  (índice = fecha)
+  m1..m8, dias_mK, oi_mK, vol_mK, sym_mK, exp_mK, VIX, VIX3M,
+  contango_pct, basis_pct, roll_ann, ratio_m2m1, ratio_vix3m,
+  gap_ok, front_ok
 
-Modo incremental: si el parquet existe, solo baja los contratos vivos en las
-últimas semanas y hace upsert por fecha. Sin parquet: backfill completo desde
-2013 (~170 ficheros, un par de minutos).
+Integridad (lo que fallaba antes y ya no puede pasar en silencio):
+  1. VENCIMIENTOS FESTIVOS. La fórmula estándar (miércoles 30 días antes del
+     tercer viernes del mes siguiente) no conoce festivos: con Viernes Santo
+     o Juneteenth CBOE adelanta el vencimiento y el fichero con la fecha
+     calculada no existe. Se prueba el día hábil anterior. Sin esto el
+     contrato front desaparecía un mes entero (2014, 2019, 2022, 2024, 2025).
+  2. FALLOS DE RED abortan sin escribir: un contrato ausente corre todo el
+     ranking M1..M8.
+  3. front_ok: el M1 de cada fecha debe ser el vencimiento mensual más
+     cercano conocido. Un M1 equivocado no se ve mirando solo el hueco M1→M2.
+  4. El settlement por fecha solo se acepta si trae el front esperado (para
+     fechas antiguas CBOE devuelve listas truncadas sin el front).
 
 Uso:
-    python scripts/update_vx_curve.py            # incremental (o backfill si no hay parquet)
-    python scripts/update_vx_curve.py --full     # fuerza backfill completo
+    python scripts/update_vx_curve.py            # incremental
+    python scripts/update_vx_curve.py --full     # backfill completo
 """
 from __future__ import annotations
 
@@ -30,17 +44,20 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from vix_controller.data import cboe  # noqa: E402
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("update_vx_curve")
 
 CDN = "https://cdn.cboe.com"
 FUT_URL = f"{CDN}/data/us/futures/market_statistics/historical_data/VX/VX_%s.csv"
-VIX_URL = f"{CDN}/api/global/us_indices/daily_prices/VIX_History.csv"
 HEADERS = {"User-Agent": "vix-controller/1.0 (uso propio)"}
-PAUSE = 0.25
+PAUSE = 0.2
 N_MONTHS = 8
 DEFAULT_OUTPUT = Path("data/vx_curve_history.parquet")
 FIRST_YEAR = 2013
+CATCHUP_DAYS = 12          # días naturales que se re-verifican con el settlement oficial
 
 
 class TransientError(RuntimeError):
@@ -48,9 +65,7 @@ class TransientError(RuntimeError):
 
 
 def fetch(url: str, tries: int = 5) -> bytes | None:
-    """None solo si el recurso no existe (403/404). Un fallo de red persistente
-    lanza TransientError: construir la curva con un contrato ausente desplaza
-    todo el ranking M1..M8 en silencio, y eso es peor que no escribir."""
+    """None solo si el recurso no existe (403/404). Fallo de red → TransientError."""
     last = None
     for k in range(tries):
         try:
@@ -69,55 +84,48 @@ def fetch(url: str, tries: int = 5) -> bytes | None:
     raise TransientError(f"{url}: {last}")
 
 
-def settlement(year: int, month: int) -> pd.Timestamp:
-    """Miércoles 30 días antes del tercer viernes del mes SIGUIENTE."""
+def standard_settlement(year: int, month: int) -> pd.Timestamp:
+    """Miércoles 30 días antes del tercer viernes del mes SIGUIENTE (sin festivos)."""
     nxt = pd.Timestamp(year=year + (month == 12), month=1 if month == 12 else month + 1, day=1)
     first_friday = nxt + pd.Timedelta(days=(4 - nxt.weekday()) % 7)
     return first_friday + pd.Timedelta(days=14) - pd.Timedelta(days=30)
 
 
-def all_settlements(first_year: int, today: pd.Timestamp) -> list[pd.Timestamp]:
-    out = []
-    for y in range(first_year, today.year + 2):
-        for m in range(1, 13):
-            s = settlement(y, m)
-            if s <= today + pd.Timedelta(days=400):
-                out.append(s)
-    return out
+# Compatibilidad con código que importaba `settlement`
+settlement = standard_settlement
 
 
-def fetch_contract(settle_date: pd.Timestamp) -> pd.DataFrame | None:
-    raw = fetch(FUT_URL % settle_date.strftime("%Y-%m-%d"))
-    if raw is None:
-        return None
+def candidate_dates(std: pd.Timestamp) -> list[pd.Timestamp]:
+    """El vencimiento estándar y, si cae en festivo, los días hábiles previos."""
+    return [std, std - pd.offsets.BDay(1), std - pd.offsets.BDay(2)]
+
+
+def parse_contract_csv(raw: bytes, expiration: pd.Timestamp) -> pd.DataFrame:
     d = pd.read_csv(io.BytesIO(raw))
     d.columns = [c.strip() for c in d.columns]
     if "Trade Date" not in d.columns or "Settle" not in d.columns:
-        return None
+        return pd.DataFrame()
     d["fecha"] = pd.to_datetime(d["Trade Date"], errors="coerce")
-    d["liquidacion"] = settle_date
+    d["liquidacion"] = pd.Timestamp(expiration)
     d["sym"] = d["Futures"].astype(str).str.strip() if "Futures" in d.columns else ""
     for c in ("Settle", "Total Volume", "Open Interest"):
-        if c in d.columns:
-            d[c] = pd.to_numeric(d[c], errors="coerce")
-        else:
-            d[c] = np.nan
+        d[c] = pd.to_numeric(d[c], errors="coerce") if c in d.columns else np.nan
     return d[["fecha", "liquidacion", "sym", "Settle", "Total Volume", "Open Interest"]] \
         .rename(columns={"Settle": "settle", "Total Volume": "vol", "Open Interest": "oi"})
 
 
-def fetch_vix() -> pd.Series:
-    raw = fetch(VIX_URL)
-    if raw is None:
-        raise RuntimeError("No se pudo bajar VIX_History.csv de CBOE")
-    d = pd.read_csv(io.BytesIO(raw))
-    d.columns = [c.strip().upper() for c in d.columns]
-    d["DATE"] = pd.to_datetime(d["DATE"], errors="coerce")
-    s = pd.to_numeric(d.set_index("DATE")["CLOSE"], errors="coerce").dropna()
-    return s[~s.index.duplicated(keep="last")].sort_index().rename("VIX")
+def fetch_contract(year: int, month: int) -> tuple[pd.DataFrame | None, pd.Timestamp | None]:
+    """Descarga el contrato probando el vencimiento estándar y los desplazados."""
+    for cand in candidate_dates(standard_settlement(year, month)):
+        raw = fetch(FUT_URL % cand.strftime("%Y-%m-%d"))
+        if raw is not None:
+            df = parse_contract_csv(raw, cand)
+            return (df if not df.empty else None), cand
+        time.sleep(PAUSE)
+    return None, None
 
 
-def build_curve(contracts: pd.DataFrame, vix: pd.Series) -> pd.DataFrame:
+def build_curve(contracts: pd.DataFrame) -> pd.DataFrame:
     """Panel diario M1..M8. El día de liquidación el contrato ya no es front."""
     d = contracts.dropna(subset=["fecha", "settle"])
     d = d[(d["settle"] > 0) & (d["liquidacion"] > d["fecha"])].copy()
@@ -125,8 +133,7 @@ def build_curve(contracts: pd.DataFrame, vix: pd.Series) -> pd.DataFrame:
     d["dias"] = (d["liquidacion"] - d["fecha"]).dt.days
     d = d[d["rank"] <= N_MONTHS]
 
-    out = pd.DataFrame(index=sorted(d["fecha"].unique()))
-    out.index.name = "fecha"
+    out = pd.DataFrame(index=pd.DatetimeIndex(sorted(d["fecha"].unique()), name="fecha"))
     for k in range(1, N_MONTHS + 1):
         sub = d[d["rank"] == k].set_index("fecha")
         out[f"m{k}"] = sub["settle"]
@@ -135,14 +142,62 @@ def build_curve(contracts: pd.DataFrame, vix: pd.Series) -> pd.DataFrame:
         out[f"vol_m{k}"] = sub["vol"]
         out[f"sym_m{k}"] = sub["sym"]
         out[f"exp_m{k}"] = sub["liquidacion"]
-
-    out["VIX"] = vix.reindex(out.index)
-    out["contango_pct"] = (out["m2"] / out["m1"] - 1.0) * 100.0
-    out["basis_pct"] = (out["m1"] / out["VIX"] - 1.0) * 100.0
-    gap = (out["dias_m2"] - out["dias_m1"]).astype(float).where(lambda g: g > 0)
-    out["roll_ann"] = out["contango_pct"] * (365.0 / gap)
-    out["ratio_m2m1"] = out["m2"] / out["m1"]
     return out.sort_index()
+
+
+def add_measures(c: pd.DataFrame) -> pd.DataFrame:
+    """Medidas de la curva + flags de integridad."""
+    c = c.copy()
+    c["contango_pct"] = (c["m2"] / c["m1"] - 1.0) * 100.0
+    c["basis_pct"] = (c["m1"] / c["VIX"] - 1.0) * 100.0
+    gap = (c["dias_m2"] - c["dias_m1"]).astype(float)
+    c["roll_ann"] = c["contango_pct"] * (365.0 / gap.where(gap > 0))
+    c["ratio_m2m1"] = c["m2"] / c["m1"]                     # M2/M1 — >1 = contango
+    c["ratio_vix3m"] = c["VIX3M"] / c["VIX"]                # VIX3M/VIX — >1 = contango
+    c["gap_ok"] = (gap >= 20) & (gap <= 45)
+    return c
+
+
+def flag_front(c: pd.DataFrame, expirations: pd.DatetimeIndex) -> pd.Series:
+    """True si el M1 de la fecha es el vencimiento mensual más cercano conocido."""
+    exps = pd.DatetimeIndex(sorted(set(expirations.dropna())))
+    pos = exps.searchsorted(c.index, side="right")
+    expected = pd.Series(pd.NaT, index=c.index, dtype="datetime64[ns]")
+    ok_pos = pos < len(exps)
+    expected[ok_pos] = exps[pos[ok_pos]]
+    got = pd.to_datetime(c["exp_m1"])
+    return (got == expected).fillna(False)
+
+
+def settlement_rows(dates: list[pd.Timestamp], vix: pd.Series, vix3m: pd.Series,
+                    expected_front: dict[pd.Timestamp, pd.Timestamp]) -> pd.DataFrame:
+    """Filas oficiales del día desde el CSV de settlement, validadas."""
+    rows = {}
+    for d in dates:
+        try:
+            st = cboe.fetch_settlement(d)
+        except cboe.CboeError as e:
+            log.info("settlement %s: %s", d.date(), e)
+            continue
+        if len(st) < 4 or st.iloc[0]["DTE"] > 40:
+            log.warning("settlement %s rechazado: lista truncada (M1 a %s días)",
+                        d.date(), st.iloc[0]["DTE"] if len(st) else "?")
+            continue
+        exp_front = expected_front.get(d)
+        if exp_front is not None and pd.Timestamp(st.iloc[0]["Expiration"]) != exp_front:
+            log.warning("settlement %s rechazado: M1 %s ≠ front esperado %s",
+                        d.date(), st.iloc[0]["Expiration"].date(), exp_front.date())
+            continue
+        if d not in vix.index or d not in vix3m.index:
+            log.info("settlement %s: índices aún sin cierre — se espera", d.date())
+            continue
+        rows[d] = cboe.settlement_to_curve_row(st, N_MONTHS)
+        time.sleep(PAUSE)
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame.from_dict(rows, orient="index")
+    out.index = pd.DatetimeIndex(out.index, name="fecha")
+    return out
 
 
 def main() -> None:
@@ -160,68 +215,98 @@ def main() -> None:
         except Exception as e:                   # noqa: BLE001
             log.error("Parquet ilegible (%s) — backfill completo", e)
             old = pd.DataFrame()
+    full = old.empty
 
-    settles = all_settlements(FIRST_YEAR, today)
-    if not old.empty:
-        # Solo contratos vivos desde 10 días antes del último dato
-        since = old.index.max() - pd.Timedelta(days=10)
-        settles = [s for s in settles if s > since]
-        log.info("INCREMENTAL desde %s · %d contratos vivos", since.date(), len(settles))
+    months = [(y, m) for y in range(FIRST_YEAR, today.year + 2) for m in range(1, 13)
+              if standard_settlement(y, m) <= today + pd.Timedelta(days=400)]
+    if not full:
+        since = old.index.max() - pd.Timedelta(days=45)
+        months = [(y, m) for (y, m) in months if standard_settlement(y, m) > since]
+        log.info("INCREMENTAL · %d contratos vivos desde %s", len(months), since.date())
     else:
-        log.info("BACKFILL completo · %d contratos", len(settles))
+        log.info("BACKFILL completo · %d contratos", len(months))
 
-    frames, ok = [], 0
+    frames, found_exps, missing = [], [], []
     try:
-        for i, s in enumerate(settles, 1):
-            f = fetch_contract(s)
-            if f is not None and not f.empty:
-                frames.append(f)
-                ok += 1
+        for i, (y, m) in enumerate(months, 1):
+            df, exp = fetch_contract(y, m)
+            if df is not None:
+                frames.append(df)
+                found_exps.append(exp)
+                if exp != standard_settlement(y, m):
+                    log.info("  %d-%02d vence %s (desplazado por festivo)", y, m, exp.date())
+            elif standard_settlement(y, m) < today - pd.Timedelta(days=5):
+                missing.append(f"{y}-{m:02d}")
             if i % 25 == 0:
-                log.info("  %d/%d · %d con datos", i, len(settles), ok)
+                log.info("  %d/%d · %d con datos", i, len(months), len(frames))
             time.sleep(PAUSE)
-    except TransientError as e:
-        log.error("Fallo de red persistente — abortando SIN escribir el parquet: %s", e)
+        vix = cboe.fetch_index_history("VIX")
+        vix3m = cboe.fetch_index_history("VIX3M")
+    except (TransientError, cboe.CboeError) as e:
+        log.error("Fallo de red persistente — abortando SIN escribir: %s", e)
         sys.exit(2)
+
+    if missing:
+        log.warning("Contratos vencidos sin fichero en el CDN: %s", ", ".join(missing))
     if not frames:
         log.error("Ningún contrato descargado — abortando sin tocar el parquet")
         sys.exit(1)
 
-    vix = fetch_vix()
-    new = build_curve(pd.concat(frames, ignore_index=True), vix)
-    if new.empty:
-        log.error("Curva vacía — abortando")
-        sys.exit(1)
+    new = build_curve(pd.concat(frames, ignore_index=True))
 
-    if not old.empty:
-        # En incremental solo confiamos en fechas con M1..M4 completos: en los
-        # primeros días de la ventana faltan contratos que ya vencieron.
+    # Vencimientos conocidos: los encontrados ahora + los ya presentes en el histórico
+    exps_known = pd.DatetimeIndex(found_exps)
+    if not old.empty and "exp_m1" in old.columns:
+        exps_known = exps_known.append(pd.DatetimeIndex(pd.to_datetime(old["exp_m1"])))
+
+    if not full:
+        # En incremental solo se fusionan fechas con M1..M4 completos y M1 correcto.
         new = new.dropna(subset=["m1", "m2", "m3", "m4"])
-        combined = pd.concat([old, new])
+        new = new[flag_front(new, exps_known)]
+        curve_cols = [c for c in old.columns
+                      if c.startswith(("dias_", "oi_", "vol_", "sym_", "exp_"))
+                      or (c.startswith("m") and c[1:].isdigit())]
+        combined = pd.concat([old[curve_cols], new])
         combined = combined[~combined.index.duplicated(keep="last")].sort_index()
     else:
         combined = new
 
-    # Informe de integridad: entre M1 y M2 debe haber ~1 mes (20-45 días). Un
-    # hueco mayor = a esa fecha el CDN no tiene el contrato intermedio y el
-    # "M2" es en realidad el de dos meses. Ocurre en la propia fuente (la
-    # curva de la Plataforma, misma fuente, presenta los mismos huecos), así
-    # que se INFORMA y se marca (columna gap_ok), no se aborta. Los fallos de
-    # red sí abortan (TransientError, más arriba).
-    gap = (combined["dias_m2"] - combined["dias_m1"])
-    combined["gap_ok"] = (gap >= 20) & (gap <= 45)
-    bad = combined.index[~combined["gap_ok"]]
-    if len(bad):
-        log.warning("INTEGRIDAD: %d fechas con hueco M1→M2 fuera de 20-45 días "
-                    "(contrato intermedio ausente en el CDN): %s … %s",
-                    len(bad), bad.min().date(), bad.max().date())
+    # Cierre oficial de los últimos días desde el CSV de settlement (misma tarde)
+    exps_sorted = pd.DatetimeIndex(sorted(set(exps_known.dropna())))
+    recent = pd.bdate_range(today - pd.Timedelta(days=CATCHUP_DAYS), today)
+    exp_front = {}
+    for d in recent:
+        p = exps_sorted.searchsorted(d, side="right")
+        if p < len(exps_sorted):
+            exp_front[d] = exps_sorted[p]
+    pending = [d for d in recent if d not in combined.index or pd.isna(combined.loc[d, "m1"])]
+    st_rows = settlement_rows(pending, vix, vix3m, exp_front)
+    if not st_rows.empty:
+        log.info("Settlement oficial añadido para: %s",
+                 ", ".join(str(d.date()) for d in st_rows.index))
+        combined = pd.concat([combined, st_rows])
+        combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+
+    combined["VIX"] = vix.reindex(combined.index)
+    combined["VIX3M"] = vix3m.reindex(combined.index)
+    combined = add_measures(combined)
+    combined["front_ok"] = flag_front(combined, exps_known)
+
+    n_front = int((~combined["front_ok"]).sum())
+    n_gap = int((~combined["gap_ok"]).sum())
+    if n_front:
+        bad = combined.index[~combined["front_ok"]]
+        log.warning("INTEGRIDAD: %d fechas con M1 distinto del front esperado (%s … %s)",
+                    n_front, bad.min().date(), bad.max().date())
+    if n_gap:
+        log.warning("INTEGRIDAD: %d fechas con hueco M1→M2 fuera de 20-45 días", n_gap)
 
     a.output.parent.mkdir(parents=True, exist_ok=True)
     combined.to_parquet(a.output, compression="snappy")
     last = combined.index.max()
-    log.info("✅ %s · %s filas · %s → %s · última M1=%s contango=%+.2f%%",
+    log.info("OK %s · %s filas · %s → %s · M2/M1=%.4f · VIX3M/VIX=%.4f",
              a.output, f"{len(combined):,}", combined.index.min().date(), last.date(),
-             combined.loc[last, "m1"], combined.loc[last, "contango_pct"])
+             combined.loc[last, "ratio_m2m1"], combined.loc[last, "ratio_vix3m"])
 
 
 if __name__ == "__main__":
