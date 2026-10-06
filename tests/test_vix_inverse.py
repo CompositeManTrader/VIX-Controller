@@ -307,10 +307,11 @@ class TestDatosProblematicos:
         assert not vi.señal_contango(d).any(), (
             "Un NaN no puede activar el OR: sin dato no hay contango.")
 
-    def test_nan_en_vix3m_con_m2m1_en_contango_sigue_dentro(self):
+    def test_si_falta_una_medida_queda_fuera(self):
+        """Regla escrita del informe: «Si falta cualquiera de las dos: dentro = falso»."""
         d = _df(contango=True).copy()
         d["ratio_vix3m"] = np.nan
-        assert vi.señal_contango(d).all()
+        assert not vi.señal_contango(d).any()
 
     def test_dataframe_corto_lanza_error(self):
         d = _df(n=1)

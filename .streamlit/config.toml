@@ -1,16 +1,19 @@
-# Tema nativo alineado a la paleta del dashboard (:root en app.py).
-# Estética sobria de plataforma premium: navy profundo, acento dorado
-# apagado, sin brillos. Los widgets nativos (sliders, botones, selects,
-# dataframes, spinners) heredan estos colores.
+# Tema nativo alineado con Spread Trading Club · "Terminal Pro".
+# Negro, un solo acento ámbar. Los widgets nativos heredan estos colores;
+# el resto del sistema visual vive en vix_controller/ui/theme.py.
 [theme]
 base = "dark"
-primaryColor = "#C9A227"
-backgroundColor = "#0B0F14"
-secondaryBackgroundColor = "#11161D"
-textColor = "#D7DEE7"
+primaryColor = "#F5A623"
+backgroundColor = "#0A0B0D"
+secondaryBackgroundColor = "#15171A"
+textColor = "#F4F5F6"
+font = "sans serif"
 
 [server]
 headless = true
 
 [browser]
 gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"

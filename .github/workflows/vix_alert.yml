@@ -1,0 +1,104 @@
+name: VIX Inverse · curva, estrategia y alertas
+
+# Tres pasadas por día hábil. La primera que ve el cierre oficial envía el
+# correo; las siguientes no repiten (estado en data/vix_inverse_alerts.json).
+#   22:15 UTC  tras el cierre y el settlement de CBOE
+#   01:15 UTC  reintento si CBOE publicó tarde
+#   11:30 UTC  antes de la apertura: si aún no hay dato, avisa (DATO PENDIENTE)
+on:
+  schedule:
+    - cron: '15 22 * * 1-5'
+    - cron: '15 1 * * 2-6'
+    - cron: '30 11 * * 2-6'
+  workflow_dispatch:
+    inputs:
+      test_email:
+        description: 'Enviar un correo de PRUEBA (comprueba la configuración SMTP)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: data-commit
+  cancel-in-progress: false
+
+jobs:
+  alert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install "pandas>=2.2" "numpy>=1.26" "pyarrow>=14" "yfinance>=0.2.48" "curl_cffi>=0.6"
+
+      - name: Curva de futuros VIX (CBOE)
+        id: curve
+        continue-on-error: true
+        timeout-minutes: 10
+        run: python scripts/update_vx_curve.py
+        env:
+          PYTHONUNBUFFERED: '1'
+
+      - name: Historia de la estrategia
+        id: strategy
+        continue-on-error: true
+        timeout-minutes: 5
+        run: python scripts/update_vix_inverse.py
+        env:
+          PYTHONUNBUFFERED: '1'
+
+      - name: Correo de prueba
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.test_email }}
+        run: python scripts/vix_inverse_alert.py --test
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          ALERT_TO: ${{ secrets.ALERT_TO }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          APP_URL: ${{ vars.APP_URL }}
+
+      - name: Evaluar señal y alertar
+        id: alert
+        run: python scripts/vix_inverse_alert.py
+        env:
+          PYTHONUNBUFFERED: '1'
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          ALERT_TO: ${{ secrets.ALERT_TO }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          APP_URL: ${{ vars.APP_URL }}
+
+      - name: Commit de datos
+        if: always()
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add data/vx_curve_history.parquet data/vix_inverse_history.parquet data/vix_inverse_alerts.json 2>/dev/null || true
+          if git diff --staged --quiet; then
+            echo "Sin cambios"
+            exit 0
+          fi
+          git commit -m "Auto: curva VIX, estrategia y alertas [$(date -u +%F' '%H:%M)]"
+          for attempt in 1 2 3; do
+            if git push; then exit 0; fi
+            git pull --rebase origin main || true
+            sleep 5
+          done
+          exit 1
+
+      - name: Fallo de actualización de datos
+        if: ${{ steps.curve.outcome == 'failure' || steps.strategy.outcome == 'failure' }}
+        run: |
+          echo "::warning::La actualización de la curva o de la estrategia falló; la alerta se evaluó con el último dato disponible."
