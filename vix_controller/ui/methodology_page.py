@@ -74,8 +74,12 @@ def render() -> None:
          "Curva, contango, señal provisional intradía"],
         ["Liquidación oficial diaria", "CBOE · settlement por fecha + histórico por contrato",
          "Señal de la estrategia (M2/M1)"],
-        ["VIX, VIX3M y familia", "CBOE · índices diarios y cotización retrasada", "Señal (VIX3M/VIX), régimen"],
-        ["VXX, SPY, ETFs", "yfinance (precios ajustados)", "Curva de capital de la estrategia, ETPs"],
+        ["Curva 2004-2013", "CBOE · archivo histórico de CFE, un fichero por contrato",
+         "Historia larga de la curva y de las dos medidas"],
+        ["VIX, VIX3M y familia", "CBOE · índices diarios y cotización retrasada",
+         "Señal (VIX3M/VIX), página Volatilidad"],
+        ["VXX, SPY, HYG, IEF", "yfinance (precios ajustados)",
+         "Curva de capital, volatilidad realizada, crédito"],
         ["Opciones SPY", "Yahoo Finance", "Skew, superficie, GEX"],
     ]), unsafe_allow_html=True)
     st.markdown("""<p class="stc-note" style="margin-top:0.8rem">
@@ -91,7 +95,19 @@ def render() -> None:
         <p class="stc-note"><b style="color:var(--white)">Dos mediciones del mismo modelo.</b> El informe
         mide con el corto estático (canónico): CAGR 17,9 %, Sharpe 0,96, caída −30,9 %. El motor genérico
         reequilibra a peso fijo y da una cota inferior: 18,5 %, 0,86, −32,7 %. No son intercambiables;
-        el panel compara siempre contra la canónica.</p>""", unsafe_allow_html=True)
+        el panel compara siempre contra la canónica.</p>
+        <p class="stc-note"><b style="color:var(--white)">Curva antes de 2013.</b> El CDN actual de CBOE
+        no trae liquidaciones antes de mayo de 2013; el tramo 2004-2013 sale del archivo histórico de
+        CFE. Hasta el 26/03/2007 los futuros cotizaban a 10 veces el VIX y se dividen entre 10. En
+        2004-2006 CBOE no listaba todos los meses: esas fechas quedan marcadas y las dos medidas
+        reconstruidas empiezan después, en agosto de 2006.</p>
+        <p class="stc-note"><b style="color:var(--white)">Página Volatilidad.</b> Realizada = raíz de la
+        media de los rendimientos logarítmicos diarios del SPY al cuadrado, anualizada (×√252). Prima
+        = VIX de cada día menos la realizada de las 21 sesiones siguientes: solo se conoce 21 sesiones
+        después. El régimen se fija con el cierre del día y lo que se mide después usa solo días
+        posteriores. El VXX se reconstruye con la liquidación de CBOE siguiendo la metodología del
+        índice de futuros a un mes (reparto diario entre el primer y el segundo vencimiento); cuadra
+        con el VXX real año a año (2019: −68,3 % frente a −67,8 %).</p>""", unsafe_allow_html=True)
 
     st.markdown(T.section("Aviso", "Herramienta de seguimiento"), unsafe_allow_html=True)
     st.markdown('<p class="stc-note">Contenido educativo y de seguimiento de una estrategia propia. No es '

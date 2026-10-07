@@ -7,6 +7,8 @@ Fuentes (CBOE, públicas y gratuitas):
                                     misma tarde (los CSV por contrato llegan
                                     con un día de retraso)
   · CSV de índices (CDN)            cierres de VIX y VIX3M
+  · Archivo CFE (CDN)               contratos 2004-2014 (antes de mayo de 2013
+                                    el CDN nuevo no trae liquidaciones)
 
 Salida: data/vx_curve_history.parquet  (índice = fecha)
   m1..m8, dias_mK, oi_mK, vol_mK, sym_mK, exp_mK, VIX, VIX3M,
@@ -28,7 +30,8 @@ Integridad (lo que fallaba antes y ya no puede pasar en silencio):
 
 Uso:
     python scripts/update_vx_curve.py            # incremental
-    python scripts/update_vx_curve.py --full     # backfill completo
+    python scripts/update_vx_curve.py --full     # backfill completo (2004 →)
+    python scripts/update_vx_curve.py --archive  # solo añade 2004-2013 al parquet actual
 """
 from __future__ import annotations
 
@@ -52,6 +55,13 @@ log = logging.getLogger("update_vx_curve")
 
 CDN = "https://cdn.cboe.com"
 FUT_URL = f"{CDN}/data/us/futures/market_statistics/historical_data/VX/VX_%s.csv"
+# Archivo histórico de CFE (2004-2014): un CSV por contrato, CFE_K04_VX.csv.
+# La última fila de cada fichero es el día de vencimiento (liquidación final).
+ARCHIVE_URL = f"{CDN}/resources/futures/archive/volume-and-price/CFE_%s%02d_VX.csv"
+MONTH_CODES = "FGHJKMNQUVXZ"
+ARCHIVE_YEARS = (2004, 2014)
+# Hasta el 26/03/2007 los futuros cotizaban a 10× el VIX (escala VBI).
+RESCALE_UNTIL = pd.Timestamp("2007-03-26")
 HEADERS = {"User-Agent": "vix-controller/1.0 (uso propio)"}
 PAUSE = 0.2
 N_MONTHS = 8
@@ -123,6 +133,63 @@ def fetch_contract(year: int, month: int) -> tuple[pd.DataFrame | None, pd.Times
             return (df if not df.empty else None), cand
         time.sleep(PAUSE)
     return None, None
+
+
+def parse_archive_csv(raw: bytes) -> pd.DataFrame:
+    """CSV del archivo CFE. Vencimiento = última fecha del fichero; precios
+    anteriores al 26/03/2007 divididos entre 10 (cambio de escala de CBOE).
+    Algunos ficheros de 2004-2005 terminan ciertas líneas con una coma de más."""
+    lineas = raw.decode("utf-8", "replace").splitlines()
+    texto = "\n".join(linea.rstrip().rstrip(",") for linea in lineas)
+    d = pd.read_csv(io.StringIO(texto))
+    d.columns = [c.strip() for c in d.columns]
+    if "Trade Date" not in d.columns or "Settle" not in d.columns:
+        return pd.DataFrame()
+    d["fecha"] = pd.to_datetime(d["Trade Date"].astype(str).str.strip(), format="%m/%d/%Y",
+                                errors="coerce")
+    d = d.dropna(subset=["fecha"]).drop_duplicates(subset=["fecha"], keep="last")
+    if d.empty:
+        return pd.DataFrame()
+    d["liquidacion"] = d["fecha"].max()
+    d["sym"] = d["Futures"].astype(str).str.strip() if "Futures" in d.columns else ""
+    for c in ("Settle", "Total Volume", "Open Interest"):
+        d[c] = pd.to_numeric(d[c], errors="coerce") if c in d.columns else np.nan
+    d.loc[d["fecha"] < RESCALE_UNTIL, "Settle"] /= 10.0
+    return d[["fecha", "liquidacion", "sym", "Settle", "Total Volume", "Open Interest"]] \
+        .rename(columns={"Settle": "settle", "Total Volume": "vol", "Open Interest": "oi"})
+
+
+def fetch_archive() -> tuple[pd.DataFrame, list[pd.Timestamp]]:
+    """Todos los contratos del archivo CFE. Los meses sin fichero no se listaron."""
+    frames, exps = [], []
+    for y in range(ARCHIVE_YEARS[0], ARCHIVE_YEARS[1] + 1):
+        for m in range(1, 13):
+            raw = fetch(ARCHIVE_URL % (MONTH_CODES[m - 1], y % 100))
+            if raw is None:
+                continue
+            df = parse_archive_csv(raw)
+            if not df.empty:
+                frames.append(df)
+                exps.append(df["liquidacion"].iloc[0])
+            time.sleep(PAUSE)
+    log.info("Archivo CFE: %d contratos", len(frames))
+    return (pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()), exps
+
+
+def vix3m_extendido(vix3m: pd.Series) -> pd.Series:
+    """VIX3M de CBOE (desde 09/2009) y, antes, el ^VIX3M de baro_history
+    (yfinance, desde 07/2006). Solo rellena fechas anteriores al primer dato de CBOE."""
+    baro = Path("data/baro_history.parquet")
+    if vix3m.empty or not baro.exists():
+        return vix3m
+    try:
+        b = pd.read_parquet(baro, columns=["VIX3M"])["VIX3M"].dropna()
+    except Exception as e:                       # noqa: BLE001
+        log.warning("baro_history ilegible (%s): VIX3M solo desde CBOE", e)
+        return vix3m
+    b.index = pd.DatetimeIndex(b.index).normalize()
+    previo = b[b.index < vix3m.index.min()]
+    return pd.concat([previo, vix3m]).sort_index()
 
 
 def build_curve(contracts: pd.DataFrame) -> pd.DataFrame:
@@ -204,6 +271,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     ap.add_argument("--full", action="store_true")
+    ap.add_argument("--archive", action="store_true",
+                    help="añade 2004-2013 desde el archivo histórico de CFE (incluido en --full)")
     a = ap.parse_args()
 
     today = pd.Timestamp.now().normalize()
@@ -271,6 +340,24 @@ def main() -> None:
     else:
         combined = new
 
+    if a.full or a.archive:
+        try:
+            arch, arch_exps = fetch_archive()
+        except TransientError as e:
+            log.error("Fallo de red en el archivo CFE — abortando SIN escribir: %s", e)
+            sys.exit(2)
+        if arch.empty:
+            log.error("Archivo CFE vacío — abortando sin tocar el parquet")
+            sys.exit(1)
+        arch_curve = build_curve(arch)
+        inicio_cdn = combined.dropna(subset=["m1", "m2", "m3", "m4"]).index.min()
+        arch_curve = arch_curve[arch_curve.index < inicio_cdn]
+        combined = combined[combined.index >= inicio_cdn]
+        combined = pd.concat([arch_curve, combined]).sort_index()
+        exps_known = exps_known.append(pd.DatetimeIndex(arch_exps))
+        log.info("Archivo CFE: %s fechas añadidas (%s → %s)", f"{len(arch_curve):,}",
+                 arch_curve.index.min().date(), arch_curve.index.max().date())
+
     # Cierre oficial de los últimos días desde el CSV de settlement (misma tarde)
     exps_sorted = pd.DatetimeIndex(sorted(set(exps_known.dropna())))
     recent = pd.bdate_range(today - pd.Timedelta(days=CATCHUP_DAYS), today)
@@ -288,7 +375,7 @@ def main() -> None:
         combined = combined[~combined.index.duplicated(keep="last")].sort_index()
 
     combined["VIX"] = vix.reindex(combined.index)
-    combined["VIX3M"] = vix3m.reindex(combined.index)
+    combined["VIX3M"] = vix3m_extendido(vix3m).reindex(combined.index)
     combined = add_measures(combined)
     combined["front_ok"] = flag_front(combined, exps_known)
 

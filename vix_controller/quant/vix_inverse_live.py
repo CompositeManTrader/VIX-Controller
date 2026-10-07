@@ -177,6 +177,35 @@ def continuar_historia(hist: pd.DataFrame, nuevos: pd.DataFrame,
 # ──────────────────────────────────────────────────────────────────────
 # Lecturas para el panel
 # ──────────────────────────────────────────────────────────────────────
+def medidas_extendidas(hist: pd.DataFrame, curva: pd.DataFrame | None) -> pd.DataFrame:
+    """
+    Las dos medidas y la posición desde que existen las dos (VIX3M, 07/2006).
+
+    Dentro del backtest se usa la historia tal cual. Antes de su inicio se
+    reconstruyen desde la curva (archivo CFE de CBOE) con la MISMA regla
+    (`vi.señal_posicion`). Ese tramo empieza después del último día con
+    hueco M1→M2 anómalo: en 2004-2006 no se listaban todos los meses y el
+    «M2» podía ser el de tres meses. Columna `backtest` = fila del informe.
+    """
+    out = hist[["ratio_m2m1", "ratio_vix3m", "pos"]].copy()
+    out["pos"] = out["pos"].astype(bool)
+    out["backtest"] = True
+    if curva is None or curva.empty or hist.empty:
+        return out
+    c = curva[curva.index < hist.index[0]]
+    if "gap_ok" in c.columns and (~c["gap_ok"].astype(bool)).any():
+        c = c[c.index > c.index[~c["gap_ok"].astype(bool)].max()]
+    c = c[["ratio_m2m1", "ratio_vix3m"]]
+    completas = c.dropna()
+    if completas.empty:
+        return out
+    c = c[c.index >= completas.index[0]]
+    previo = c.copy()
+    previo["pos"] = vi.señal_posicion(c)
+    previo["backtest"] = False
+    return pd.concat([previo, out])
+
+
 def cartera(hist: pd.DataFrame, peso: float = vi.PESO_SLEEVE) -> pd.DataFrame:
     """Cartera, SPY y SPY apalancado a IGUAL volatilidad realizada."""
     cart = ((1 - peso) * hist["spy_ret"] + peso * hist["sleeve_ret"]).dropna()

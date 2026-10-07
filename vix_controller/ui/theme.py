@@ -295,6 +295,7 @@ def register_plotly_template() -> None:
         hoverlabel=dict(bgcolor=SURFACE, bordercolor=LINE,
                         font=dict(family=FONT_MONO, size=11, color=WHITE)),
         margin=dict(l=48, r=20, t=36, b=36),
+        separators=",.",                       # convención española: 1.234,56
     )
     pio.templates["stc"] = base
     pio.templates.default = "stc"
