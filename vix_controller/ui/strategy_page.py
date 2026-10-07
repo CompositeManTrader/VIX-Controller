@@ -249,32 +249,58 @@ def _chart_capital(c: pd.DataFrame) -> go.Figure:
     return fig
 
 
-def _chart_medidas(hist: pd.DataFrame, dias: int) -> go.Figure:
-    h = hist.tail(dias)
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=h.index, y=h["ratio_m2m1"].tolist(), name="M2/M1 · futuros",
-                             mode="lines", line=dict(color=T.AMBER, width=1.8),
-                             hovertemplate="%{x|%d/%m/%Y}  M2/M1 %{y:.4f}<extra></extra>"))
-    fig.add_trace(go.Scatter(x=h.index, y=h["ratio_vix3m"].tolist(), name="VIX3M/VIX · índices",
-                             mode="lines", line=dict(color=T.WHITE, width=1.3),
-                             hovertemplate="%{x|%d/%m/%Y}  VIX3M/VIX %{y:.4f}<extra></extra>"))
-    # Tramos fuera (las dos invertidas): sombreado DESPUÉS de los traces
-    fuera = ~h["pos"].astype(bool)
-    i, idx = 0, h.index
-    while i < len(idx):
-        if fuera.iloc[i]:
+def _tramos(mask: pd.Series) -> list[tuple]:
+    """(inicio, fin) de cada racha True consecutiva."""
+    out, idx, i = [], mask.index, 0
+    v = mask.to_numpy()
+    while i < len(v):
+        if v[i]:
             j = i
-            while j + 1 < len(idx) and fuera.iloc[j + 1]:
+            while j + 1 < len(v) and v[j + 1]:
                 j += 1
-            fig.add_vrect(x0=idx[i], x1=idx[j], fillcolor="rgba(234,57,67,0.10)", line_width=0,
-                          layer="below")
+            out.append((idx[i], idx[j]))
             i = j + 1
         else:
             i += 1
+    return out
+
+
+def _chart_medidas(m: pd.DataFrame, desde: pd.Timestamp | None) -> go.Figure:
+    h = m[m.index >= desde] if desde is not None else m
+    largo = len(h) > 800
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=h.index, y=h["ratio_vix3m"].tolist(), name="VIX3M/VIX · índices",
+                             mode="lines", line=dict(color=T.WHITE, width=0.8 if largo else 1.1),
+                             opacity=0.55 if largo else 1.0,
+                             hovertemplate="%{x|%d/%m/%Y}  VIX3M/VIX %{y:.3f}<extra></extra>"))
+    fig.add_trace(go.Scatter(x=h.index, y=h["ratio_m2m1"].tolist(), name="M2/M1 · futuros",
+                             mode="lines", line=dict(color=T.AMBER, width=1.0 if largo else 1.5),
+                             hovertemplate="%{x|%d/%m/%Y}  M2/M1 %{y:.3f}<extra></extra>"))
+    # Días fuera como marcas en la base: con años en pantalla, un sombreado de
+    # dos o tres sesiones no se ve
+    fuera = h.index[~h["pos"].astype(bool)]
+    fig.add_trace(go.Scatter(x=fuera, y=[0.63] * len(fuera), name="Fuera de mercado", mode="markers",
+                             marker=dict(symbol="line-ns", size=9, line=dict(color=T.LOSS, width=1.2)),
+                             hoverinfo="skip"))
+    # Tramos fuera de mercado: sombreado DESPUÉS de los traces (plotly ≥ 6)
+    for x0, x1 in _tramos(~h["pos"].astype(bool)):
+        fig.add_vrect(x0=x0, x1=x1, fillcolor="rgba(234,57,67,0.13)", line_width=0, layer="below")
     fig.add_hline(y=1.0, line_color=T.WHITE, line_width=1, line_dash="dash",
                   annotation_text="1,00", annotation_position="right",
                   annotation_font=dict(family=T.FONT_MONO, size=10, color=T.GRAY))
-    fig.update_layout(height=330, hovermode="x unified", margin=dict(l=48, r=40, t=10, b=30),
+    previo = h[~h["backtest"].astype(bool)]
+    if not previo.empty and h["backtest"].any():
+        x_bt = h.index[h["backtest"].astype(bool)][0]
+        fig.add_vline(x=x_bt, line_color=T.GRAY, line_width=1, line_dash="dot")
+        fig.add_annotation(x=x_bt, y=0.06, yref="paper", xanchor="left", yanchor="bottom",
+                           showarrow=False,
+                           text=" inicio del backtest →", font=dict(family=T.FONT_MONO, size=10,
+                                                                    color=T.GRAY))
+        fig.add_annotation(x=previo.index[0], y=0.06, yref="paper", xanchor="left", yanchor="bottom",
+                           showarrow=False, text=" reconstruido con la regla · archivo CBOE",
+                           font=dict(family=T.FONT_MONO, size=10, color=T.MUTED))
+    fig.update_yaxes(range=[0.6, 1.45], tickformat=".2f")
+    fig.update_layout(height=380, hovermode="x unified", margin=dict(l=48, r=40, t=10, b=30),
                       legend=dict(orientation="h", y=1.08, x=0))
     return fig
 
@@ -348,11 +374,24 @@ def render(live: dict | None = None) -> None:
                           "Sombreado: tramos fuera de mercado (las dos invertidas). El aviso vive en "
                           "el frente de la curva: el 2/08/2024 el VIX3M/VIX se invirtió un día antes "
                           "que el M2/M1."), unsafe_allow_html=True)
-    dias = st.segmented_control("Ventana", options=[126, 252, 756, len(hist)], default=252,
-                                format_func=lambda x: {126: "6 meses", 252: "1 año",
-                                                       756: "3 años"}.get(x, "Todo"),
-                                key="vinv_ventana") or 252
-    st.plotly_chart(_chart_medidas(hist, dias), width="stretch", config={"displayModeBar": False})
+    medidas = vl.medidas_extendidas(hist, curva)
+    fin = medidas.index[-1]
+    ventanas = {"1 año": fin - pd.DateOffset(years=1), "3 años": fin - pd.DateOffset(years=3),
+                "5 años": fin - pd.DateOffset(years=5), "Backtest · 2013": hist.index[0],
+                f"Todo · {medidas.index[0].year}": None}
+    v = st.segmented_control("Ventana", options=list(ventanas), default=list(ventanas)[-1],
+                             key="vinv_ventana_m") or list(ventanas)[-1]
+    st.plotly_chart(_chart_medidas(medidas, ventanas[v]), width="stretch",
+                    config={"displayModeBar": False})
+    previo = medidas[~medidas["backtest"]]
+    if not previo.empty:
+        cont = vi.señal_contango(previo)
+        n_prev = f"{len(previo):,}".replace(",", ".")
+        st.markdown(f'<p class="stc-note">Antes del {_fecha(hist.index[0])} la serie se reconstruye con '
+                    f'la liquidación diaria del archivo histórico de CBOE y la misma regla: '
+                    f'{n_prev} sesiones, dentro el {cont.mean() * 100:.0f} % del tiempo. No forma '
+                    f'parte del backtest del informe. Arrastra sobre la gráfica para ampliar; doble '
+                    f'clic para volver.</p>', unsafe_allow_html=True)
 
     # ── Curva de capital ────────────────────────────────────────────
     c = vl.cartera(hist, peso)
