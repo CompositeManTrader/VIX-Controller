@@ -98,10 +98,8 @@ TRANSACTION_COST_BPS = 5         # 0.05% por lado — conservador (SVXY típico)
 # ──────────────────────────────────────────────────────────────
 # GEX
 # ──────────────────────────────────────────────────────────────
-GEX_DEALER_SIGN_CALL = -1        # dealers short calls
-GEX_DEALER_SIGN_PUT  = +1        # dealers long puts
-GEX_CONTRACT_MULT    = 100       # 1 contrato = 100 shares
-GEX_POINT_MULT       = 0.01      # GEX por 1% movimiento
+# Convención y cálculo en vix_controller/quant/options_desk.py (calls +, puts −,
+# la estándar del mercado).
 
 # ──────────────────────────────────────────────────────────────
 # HAR-RV

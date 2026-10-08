@@ -1,0 +1,56 @@
+name: Opciones · foto diaria
+
+# Una foto por sesión a media jornada (13:00-14:00 de Nueva York según el
+# horario de verano): IV a 30 días, sesgo, gamma de los dealers y opciones del
+# VIX → data/options_history.parquet. Fuera de horario el script no escribe.
+on:
+  schedule:
+    - cron: '0 18 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: data-commit
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install "pandas>=2.2" "numpy>=1.26" "scipy>=1.11" "pyarrow>=14" "yfinance>=0.2.48" "curl_cffi>=0.6"
+
+      - name: Foto de opciones
+        timeout-minutes: 8
+        run: python scripts/update_options_snapshot.py
+        env:
+          PYTHONUNBUFFERED: '1'
+
+      - name: Commit de datos
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add data/options_history.parquet 2>/dev/null || true
+          if git diff --staged --quiet; then
+            echo "Sin cambios"
+            exit 0
+          fi
+          git commit -m "Auto: foto de opciones [$(date -u +%F)]"
+          for attempt in 1 2 3; do
+            if git push; then exit 0; fi
+            git pull --rebase origin main || true
+            sleep 5
+          done
+          exit 1
