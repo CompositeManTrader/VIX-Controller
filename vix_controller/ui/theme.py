@@ -170,7 +170,13 @@ header[data-testid="stHeader"]{background:var(--black);border-bottom:1px solid v
   border-bottom:1px solid var(--line);font-family:var(--mono);font-size:0.8rem;}
 .stc-row:last-child{border-bottom:none;}
 .stc-row .k{color:var(--gray);font-family:var(--body);font-size:0.84rem;}
-.stc-row .v{color:var(--white);font-variant-numeric:tabular-nums;text-align:right;}
+.stc-row .v{color:var(--white);font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap;}
+/* Rejilla de tarjetas: 4, 2 o 1 por fila según el ancho (las columnas de Streamlit no se adaptan) */
+.stc-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:0.85rem;align-items:stretch;}
+@media (max-width:1250px){.stc-grid{grid-template-columns:repeat(2,1fr);}}
+@media (max-width:640px){.stc-grid{grid-template-columns:1fr;}}
+.stc-grid .stc-card{min-height:0;height:100%;margin:0;}
+.stc-grid .stc-big{font-size:2.15rem;}
 .up{color:var(--profit)!important;} .dn{color:var(--loss)!important;} .am{color:var(--amber)!important;} .mu{color:var(--gray)!important;}
 
 /* Medida contra 1,00 */

@@ -80,7 +80,8 @@ def render() -> None:
          "Señal (VIX3M/VIX), página Volatilidad"],
         ["VXX, SPY, HYG, IEF", "yfinance (precios ajustados)",
          "Curva de capital, volatilidad realizada, crédito"],
-        ["Opciones SPY", "Yahoo Finance", "Skew, superficie, GEX"],
+        ["Opciones de SPY y del VIX", "Yahoo Finance (yfinance, ~15 min de retraso)",
+         "IV, sesgo 25Δ, gamma de los dealers, precio del salto del VIX; foto diaria"],
     ]), unsafe_allow_html=True)
     st.markdown("""<p class="stc-note" style="margin-top:0.8rem">
         <b style="color:var(--white)">Vencimientos desplazados por festivos.</b> El vencimiento del VIX es el
@@ -107,7 +108,15 @@ def render() -> None:
         después. El régimen se fija con el cierre del día y lo que se mide después usa solo días
         posteriores. El VXX se reconstruye con la liquidación de CBOE siguiendo la metodología del
         índice de futuros a un mes (reparto diario entre el primer y el segundo vencimiento); cuadra
-        con el VXX real año a año (2019: −68,3 % frente a −67,8 %).</p>""", unsafe_allow_html=True)
+        con el VXX real año a año (2019: −68,3 % frente a −67,8 %).</p>
+        <p class="stc-note"><b style="color:var(--white)">Página Opciones.</b> Solo opciones con
+        compra y venta activas (horquilla &lt; 50 %, interés abierto ≥ 10); precio medio. IV de SPY por
+        Black-Scholes con el tipo a 3 meses y el dividendo del SPY, tiempo en sesiones hábiles; cerca del
+        forward se promedian put y call (las opciones de SPY son americanas). 25Δ = IV donde la delta vale
+        ±0,25. Gamma de los dealers con la convención estándar (calls +, puts −), en miles de millones de
+        dólares por 1 % de movimiento; el nivel de giro recalcula la gamma a cada precio hipotético. Las
+        opciones del VIX se valoran con Black-76 contra el futuro implícito por paridad put-call. Una tarea
+        diaria guarda la foto en data/options_history.parquet.</p>""", unsafe_allow_html=True)
 
     st.markdown(T.section("Aviso", "Herramienta de seguimiento"), unsafe_allow_html=True)
     st.markdown('<p class="stc-note">Contenido educativo y de seguimiento de una estrategia propia. No es '

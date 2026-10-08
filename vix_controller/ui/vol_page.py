@@ -21,6 +21,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
+from vix_controller import calendario as cal
 from vix_controller.quant import vix_inverse as vi
 from vix_controller.quant import vix_inverse_live as vl
 from vix_controller.quant import vol_desk as vd
@@ -32,15 +33,6 @@ HIST_PATH = Path("data/vix_inverse_history.parquet")
 
 ne, pe = vi.num_es, vi.pct_es
 
-# Calendario macro (fechas oficiales publicadas por la Fed y el BLS)
-EVENTOS = {
-    "FOMC": ["2026-01-28", "2026-03-18", "2026-05-06", "2026-06-17", "2026-07-29",
-             "2026-09-16", "2026-10-28", "2026-12-16"],
-    "CPI": ["2026-01-14", "2026-02-12", "2026-03-11", "2026-04-14", "2026-05-13", "2026-06-10",
-            "2026-07-15", "2026-08-12", "2026-09-10", "2026-10-13", "2026-11-12", "2026-12-10"],
-    "Empleo": ["2026-01-09", "2026-02-06", "2026-03-06", "2026-04-03", "2026-05-08", "2026-06-05",
-               "2026-07-02", "2026-08-07", "2026-09-04", "2026-10-02", "2026-11-06", "2026-12-04"],
-}
 VENTANAS = {"1 año": 1, "3 años": 3, "5 años": 5, "10 años": 10, "Todo": None}
 
 
@@ -212,8 +204,8 @@ def _card(label: str, big: str, cls: str, filas: list[tuple[str, str]], nota: st
     rows = "".join(f'<div class="stc-row"><span class="k">{k}</span><span class="v">{v}</span></div>'
                    for k, v in filas)
     nota = f'<div class="stc-sub" style="margin-top:0.55rem;font-size:0.78rem">{nota}</div>' if nota else ""
-    return (f'<div class="stc-card hero"><div class="stc-label">{label}</div>'
-            f'<div class="stc-big {cls}" style="font-size:2.3rem">{big}</div>{rows}{nota}</div>')
+    return (f'<div class="stc-card"><div class="stc-label">{label}</div>'
+            f'<div class="stc-big {cls}">{big}</div>{rows}{nota}</div>')
 
 
 def _tabla_nivel(t: pd.DataFrame, actual: str | None) -> str:
@@ -287,16 +279,11 @@ def _tabla_termometros(filas: list[tuple[str, dict, int, str]]) -> str:
 
 
 def _eventos(hoy: pd.Timestamp) -> str:
-    chips = []
-    for nombre, fechas in EVENTOS.items():
-        for f in fechas:
-            dias = (pd.Timestamp(f) - hoy).days
-            if 0 <= dias <= 14:
-                chips.append((dias, nombre, pd.Timestamp(f)))
+    chips = cal.proximos(hoy, 14)
     if not chips:
         return T.badge("Sin datos macro relevantes en los próximos 14 días")
     out = []
-    for dias, nombre, f in sorted(chips):
+    for dias, nombre, f in chips:
         kind = "loss" if dias <= 2 else ("amber" if dias <= 5 else "")
         cuando = "hoy" if dias == 0 else ("mañana" if dias == 1 else f"en {dias} días")
         out.append(T.badge(f"{nombre} · {f.strftime('%d/%m')} · {cuando}", kind))
@@ -339,37 +326,34 @@ def render() -> None:
     fila_reg = reg[reg["regimen"] == reg_hoy].iloc[0] if (reg["regimen"] == reg_hoy).any() else None
 
     st.markdown(T.section("Hoy", "Lectura de hoy"), unsafe_allow_html=True)
-    c1, c2, c3, c4 = st.columns(4, gap="small")
-    with c1:
-        st.markdown(_card("VIX · implícita a 30 días", ne(hoy_v, 2), "amber",
-                          [("Percentil desde 1990", _pctl(vd.percentil(vix))),
-                           ("Percentil 1 año", _pctl(vd.percentil(vix.tail(vd.ANUAL)))),
-                           ("Mediana histórica", ne(float(vix.median()), 1))]),
-                    unsafe_allow_html=True)
-    with c2:
-        st.markdown(_card("Realizada · SPY, 21 sesiones", ne(float(ult["rv"]), 1), "white",
-                          [("VIX − realizada", f'{ne(float(ult["prima_hoy"]), 1, signo=True)} pts'),
-                           ("Percentil de la realizada", _pctl(vd.percentil(prima["rv"])))],
-                          "Lo que ya pasó. La prima que se cobra de verdad es contra la realizada "
-                          "del mes que viene."), unsafe_allow_html=True)
-    with c3:
-        if niv is not None:
-            st.markdown(_card(f"Prima histórica con VIX {tramo}", f'{ne(niv["prima"], 1, signo=True)}',
-                              "amber" if niv["prima"] > 0 else "loss",
-                              [("Veces con VIX > realizada", f'{ne(niv["gana"], 0)} %'),
-                               ("Peor 10 % de los casos", f'{ne(niv["p10"], 1, signo=True)} pts'),
-                               ("Días con este nivel", f'{int(niv["dias"]):,}'.replace(",", "."))],
-                              "Puntos de volatilidad: VIX menos la realizada de las 21 sesiones "
-                              "siguientes."), unsafe_allow_html=True)
-    with c4:
-        if fila_reg is not None:
-            tramo_r, curva_r = reg_hoy.split(" · ")
-            st.markdown(_card(f"Entorno de hoy · {curva_r}", T.esc(tramo_r), "white",
-                [("Corto VXX · media 21 s", pe(fila_reg["siempre_media"], 1)),
-                 ("Corto VXX · peor 5 %", pe(fila_reg["siempre_p5"], 1)),
-                 ("Con la regla · peor 5 %", pe(fila_reg["regla_p5"], 1))],
-                "Lo que hizo un corto en VXX en las 21 sesiones siguientes a días como hoy."),
-                unsafe_allow_html=True)
+    tarjetas = [
+        _card("VIX · implícita a 30 días", ne(hoy_v, 2), "amber",
+              [("Percentil desde 1990", _pctl(vd.percentil(vix))),
+               ("Percentil 1 año", _pctl(vd.percentil(vix.tail(vd.ANUAL)))),
+               ("Mediana histórica", ne(float(vix.median()), 1))]),
+        _card("Realizada · SPY, 21 sesiones", ne(float(ult["rv"]), 1), "white",
+              [("VIX − realizada", f'{ne(float(ult["prima_hoy"]), 1, signo=True)} pts'),
+               ("Percentil de la realizada", _pctl(vd.percentil(prima["rv"])))],
+              "Lo que ya pasó. La prima que se cobra de verdad es contra la realizada "
+              "del mes que viene."),
+    ]
+    if niv is not None:
+        tarjetas.append(_card(
+            f"Prima histórica con VIX {tramo}", f'{ne(niv["prima"], 1, signo=True)}',
+            "amber" if niv["prima"] > 0 else "loss",
+            [("Veces con VIX > realizada", f'{ne(niv["gana"], 0)} %'),
+             ("Peor 10 % de los casos", f'{ne(niv["p10"], 1, signo=True)} pts'),
+             ("Días con este nivel", f'{int(niv["dias"]):,}'.replace(",", "."))],
+            "Puntos de volatilidad: VIX menos la realizada de las 21 sesiones siguientes."))
+    if fila_reg is not None:
+        tramo_r, curva_r = reg_hoy.split(" · ")
+        tarjetas.append(_card(
+            f"Entorno de hoy · {curva_r}", T.esc(tramo_r), "white",
+            [("Corto VXX · media 21 s", pe(fila_reg["siempre_media"], 1)),
+             ("Corto VXX · peor 5 %", pe(fila_reg["siempre_p5"], 1)),
+             ("Con la regla · peor 5 %", pe(fila_reg["regla_p5"], 1))],
+            "Lo que hizo un corto en VXX en las 21 sesiones siguientes a días como hoy."))
+    st.markdown(f'<div class="stc-grid">{"".join(tarjetas)}</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="stc-badges" style="margin-top:0.9rem">'
                 f'<span class="stc-label" style="margin-right:0.4rem">Datos macro</span>'
                 f'{_eventos(pd.Timestamp.now().normalize())}</div>', unsafe_allow_html=True)
