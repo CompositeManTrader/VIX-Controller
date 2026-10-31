@@ -1,5 +1,5 @@
 {
-  "evaluado": "2026-10-29",
+  "evaluado": "2026-10-30",
   "eventos": [
     {
       "clave": "AVISO:2026-10-16",
@@ -26,8 +26,21 @@
       "enviado": false,
       "intentos": 0,
       "motivo": "correo sin configurar (faltan secretos SMTP)"
+    },
+    {
+      "clave": "AVISO:2026-10-30",
+      "tipo": "AVISO",
+      "fecha_dato": "2026-10-30",
+      "fecha_ejecucion": "2026-11-02",
+      "r1": 0.971930668998001,
+      "r2": 1.070030895983522,
+      "detalle": "M2/M1 ha cerrado bajo 1,00; la otra sigue en 1,070.",
+      "asunto": "VIX Inverse · AVISO — M2/M1 bajo 1,00 (aún dentro)",
+      "enviado": false,
+      "intentos": 0,
+      "motivo": "correo sin configurar (faltan secretos SMTP)"
     }
   ],
   "correo": "sin configurar",
-  "ultima_pasada": "2026-10-30T17:05:28+00:00"
+  "ultima_pasada": "2026-10-31T01:35:49+00:00"
 }
