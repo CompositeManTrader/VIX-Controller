@@ -1,5 +1,5 @@
 {
-  "evaluado": "2026-11-04",
+  "evaluado": "2026-11-05",
   "eventos": [
     {
       "clave": "AVISO:2026-10-16",
@@ -39,8 +39,21 @@
       "enviado": false,
       "intentos": 0,
       "motivo": "correo sin configurar (faltan secretos SMTP)"
+    },
+    {
+      "clave": "SALIDA:2026-11-05",
+      "tipo": "SALIDA",
+      "fecha_dato": "2026-11-05",
+      "fecha_ejecucion": "2026-11-06",
+      "r1": 0.9044771861180739,
+      "r2": 0.9066713981547196,
+      "detalle": "Las dos medidas han cerrado en backwardation.",
+      "asunto": "VIX Inverse · SALIDA — recomprar VXX en la apertura del vie 06/11/2026",
+      "enviado": false,
+      "intentos": 0,
+      "motivo": "correo sin configurar (faltan secretos SMTP)"
     }
   ],
   "correo": "sin configurar",
-  "ultima_pasada": "2026-11-06T02:25:31+00:00"
+  "ultima_pasada": "2026-11-06T07:54:10+00:00"
 }
