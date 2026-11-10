@@ -1,5 +1,5 @@
 {
-  "evaluado": "2026-11-06",
+  "evaluado": "2026-11-09",
   "eventos": [
     {
       "clave": "AVISO:2026-10-16",
@@ -52,8 +52,21 @@
       "enviado": false,
       "intentos": 0,
       "motivo": "correo sin configurar (faltan secretos SMTP)"
+    },
+    {
+      "clave": "ENTRADA:2026-11-09",
+      "tipo": "ENTRADA",
+      "fecha_dato": "2026-11-09",
+      "fecha_ejecucion": "2026-11-10",
+      "r1": 0.9742817018256692,
+      "r2": 1.0466867469879517,
+      "detalle": "Vuelve el contango en al menos una medida.",
+      "asunto": "VIX Inverse · ENTRADA — vender VXX en la apertura del mar 10/11/2026",
+      "enviado": false,
+      "intentos": 0,
+      "motivo": "correo sin configurar (faltan secretos SMTP)"
     }
   ],
   "correo": "sin configurar",
-  "ultima_pasada": "2026-11-07T16:56:27+00:00"
+  "ultima_pasada": "2026-11-10T04:07:16+00:00"
 }
